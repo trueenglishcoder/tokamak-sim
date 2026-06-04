@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+
+# Virtual environments
+.venv/
+.venv*/
+.env/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+.coverage
+htmlcov/
+
+
+# Local project inputs and generated artifacts
+configs/
+data/
+runs/
+output/
+synthetic_iter/
+_local_archive/
+.pytest_cache/
+
+# Local agent/editor metadata
+.agents/
+.codex/
+
+# IDEs/editors
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

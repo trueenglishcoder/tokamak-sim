@@ -1,0 +1,16 @@
+services:
+  tokamak-sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tokamak-sim:latest
+    working_dir: /app
+    environment:
+      MPLCONFIGDIR: /tmp/matplotlib
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data:ro
+      - ./runs:/app/runs
+      - ./output:/app/output
+    command: ["python", "scripts/run_simulation_artifacts.py", "--help"]

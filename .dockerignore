@@ -1,0 +1,36 @@
+# Local Python state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.venv*/
+.env/
+env/
+
+# Git and local agent metadata
+.git/
+.agents/
+.codex/
+
+# Local ignored project inputs and outputs
+configs/
+data/
+runs/
+output/
+synthetic_iter/
+_local_archive/
+
+# Build/test artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+.coverage
+htmlcov/
+
+# Editor/OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,122 @@
+Plasma Boundary Calculation In This Project
+===========================================
+
+This document describes the current plasma-boundary calculation rule.
+
+The main code paths are:
+
+- tokamak_control/geometry/boundary.py
+- tokamak_control/geometry/xpoints.py
+- tokamak_control/cli/run_simulation.py
+- tokamak_control/viz/plotting.py
+- scripts/run_simulation_artifacts.py
+
+
+1. Boundary definition
+----------------------
+
+The project supports two physical boundary modes:
+
+- limited
+- diverted
+
+The default mode is limited.
+
+In limited mode, the boundary is the closed flux surface that first contacts the configured limiter. The limiter is the magenta machine contour shown on T15MD output plots.
+
+In diverted mode, the boundary is the separatrix:
+
+    psi(R, Z) = psi_X
+
+where psi_X is the flux value at an X-point, and the returned contour is the closed contour at that level that encloses the magnetic axis.
+
+The boundary finder does not use a largest-contour drawing heuristic as a valid plasma boundary.
+
+
+2. Algorithm
+------------
+
+The public entry point is:
+
+- find_plasma_boundary_with_status(...)
+
+The common setup is:
+
+1. Validate that the psi array shape matches the grid.
+2. Prepare the optional limiter polygon.
+3. Find the magnetic axis as the nearest local psi extremum to the configured center.
+
+In limited mode:
+
+1. Sample psi along the limiter.
+2. Order the limiter psi levels from the magnetic axis outward:
+   - for a maximum-axis equilibrium, higher limiter psi levels are tested first
+   - for a minimum-axis equilibrium, lower limiter psi levels are tested first
+3. Extract contours at each candidate contact level in that physical order.
+4. Keep only contours that:
+   - are closed
+   - enclose the magnetic axis
+   - touch the limiter
+   - stay inside or on the limiter polygon
+5. Return the first valid limiter-contact contour.
+
+In diverted mode:
+
+1. Find candidate X-points in the sampled psi field.
+2. For each X-point, extract contours at that X-point's nearest-grid psi value.
+3. Keep only contours that:
+   - are closed
+   - enclose the magnetic axis
+   - pass near the X-point
+   - fit inside the limiter polygon when a limiter is configured
+4. Return the valid separatrix candidate.
+
+Success statuses are:
+
+- limited_success
+- separatrix_success
+
+If the selected physical rule cannot find a valid candidate, the finder raises `BoundaryNotFoundError`.
+
+
+3. No runtime substitute
+-----------------------
+
+The simulation does not invent a boundary when the selected physical rule cannot find one. It does not create a circle, reuse a cached contour, or draw any other non-physical contour.
+
+When boundary loss happens during a run, `run_simulation` stops the loop cleanly, records a `boundary_missing` event, finalizes partial artifacts, and reports the step/reason. This is a physical stop condition, not a Python crash.
+
+
+4. Limiter role
+---------------
+
+The magenta geometry in T15MD plots is the limiter. Configurations should use:
+
+    [limiter]
+    name = "T15MD"
+
+The limiter is a physical input to limited mode and an admissibility constraint for diverted mode.
+
+
+5. Stored boundaries
+--------------------
+
+Run artifacts store the physical boundary polylines found during simulation:
+
+- boundary_poly_true
+- boundary_poly_meas
+
+These are NaN-padded numeric arrays in `run*.npz`. Plotting and frame rendering consume these stored boundaries instead of recomputing a separate plotting boundary.
+
+
+6. What is not used
+-------------------
+
+The boundary finder does not use:
+
+- largest closed contour inside the limiter
+- longest closed contour on the grid
+- previous boundary continuity as a success criterion
+- target reference radius as an optimization target
+
+Previous boundary information may still be passed through existing call sites, but it does not define a successful boundary.

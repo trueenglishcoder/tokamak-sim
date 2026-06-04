@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tokamak-sim"
+version = "0.1.0"
+description = "Pure-Python tokamak plasma simulation and control toolkit."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["tokamak", "plasma", "control", "lqr", "h-infinity", "simulation"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+# Core runtime deps.
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.12",
+  "matplotlib>=3.8",
+  "contourpy>=1.2",
+  "tomli-w>=1.0.0",
+]
+
+# NOTE: Video generation requires the system 'ffmpeg' binary to be installed.
+#       This is not a Python package; install it via your OS package manager
+#       (e.g. apt, brew, choco) so matplotlib's FFMpegWriter can find it.
+
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+]
+
+# Console script entry point — must come AFTER all [project] keys above
+[project.scripts]
+tokamakctl = "tokamak_control.cli.main:main"
+
+# Explicit build targets so Hatch knows what to ship
+[tool.hatch.build.targets.wheel]
+packages = ["tokamak_control"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "tokamak_control",
+  "README.md",
+  "pyproject.toml",
+]
