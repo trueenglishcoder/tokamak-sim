@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 
-from tokamak_control.bridge.types import DerivativeAction, MachineSpec, ReferenceFrame, ResetResult, StepResult, StepSnapshot
+from tokamak_control.bridge.types import DerivativeAction, InitialStateOverride, MachineSpec, ReferenceFrame, ResetResult, StepResult, StepSnapshot
+from tokamak_control.core.coils import CoilGroup
 from tokamak_control.config.scenarios import Scenario, ScenarioName, make_scenario
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.geometry.boundary import BoundaryMode, BoundaryNotFoundError, find_plasma_boundary_with_status
 from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
 from tokamak_control.io.config_io import LoadedConfig, load_config
 from tokamak_control.metrics import current_limit_margin, derivative_limit_margin
+from tokamak_control.realism import RealismRuntime, RealismSettings
 
 
 class SimulationSession:
@@ -26,6 +29,9 @@ class SimulationSession:
         scenario_args: Mapping[str, object],
         angles: int,
         steps: int,
+        realism_enabled: bool = False,
+        realism_settings: RealismSettings | None = None,
+        initial_state_override: InitialStateOverride | None = None,
     ) -> None:
         """Создать описание сессии; модель строится при ``reset``."""
         if int(angles) <= 0:
@@ -38,11 +44,15 @@ class SimulationSession:
         self.scenario_args = dict(scenario_args)
         self.angle_count = int(angles)
         self.steps = int(steps)
+        self.realism_enabled = bool(realism_enabled)
+        self.realism_settings = realism_settings
+        self.initial_state_override = initial_state_override
 
         self._cfg: LoadedConfig | None = None
         self._model: PlasmaModel | None = None
         self._machine: MachineSpec | None = None
         self._scenario: Scenario | None = None
+        self._realism: RealismRuntime | None = None
         self._angles_rad: np.ndarray | None = None
         self._boundary_poly: np.ndarray | None = None
         self._boundary_level: float | None = None
@@ -62,6 +72,9 @@ class SimulationSession:
         angles: int,
         steps: int,
         seed: int | None = None,
+        realism_enabled: bool = False,
+        realism_settings: RealismSettings | None = None,
+        initial_state_override: InitialStateOverride | None = None,
     ) -> SimulationSession:
         """Собрать сессию из путей без запуска шага модели."""
         _ = seed
@@ -72,6 +85,9 @@ class SimulationSession:
             scenario_args={} if scenario_args is None else dict(scenario_args),
             angles=int(angles),
             steps=int(steps),
+            realism_enabled=bool(realism_enabled),
+            realism_settings=realism_settings,
+            initial_state_override=initial_state_override,
         )
 
     def reset(
@@ -79,28 +95,44 @@ class SimulationSession:
         *,
         initial_currents_path: str | Path | None = None,
         seed: int | None = None,
+        realism_settings: RealismSettings | None = None,
+        initial_state_override: InitialStateOverride | None = None,
     ) -> ResetResult:
         """Перезагрузить конфигурацию, модель, сценарий и начальную границу."""
-        _ = seed
         active_initial_path = (
             self.initial_currents_path
             if initial_currents_path is None
             else Path(initial_currents_path)
         )
+        active_initial_override = initial_state_override if initial_state_override is not None else self.initial_state_override
         cfg = load_config(self.config_path, initial_currents_path=active_initial_path)
+        cfg = _apply_initial_state_override(cfg, active_initial_override)
         model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+        active_realism_settings = realism_settings if realism_settings is not None else (self.realism_settings if self.realism_settings is not None else cfg.realism)
+        active_realism_settings.validate()
+        realism = RealismRuntime(active_realism_settings, seed=seed) if (self.realism_enabled or active_realism_settings.enabled) and RealismRuntime.has_any_effect(active_realism_settings) else None
         angles_rad = np.linspace(-np.pi, np.pi, self.angle_count, endpoint=False, dtype=float)
         center = (model.R0, model.Z0)
         psi0 = model.compute_psi()
-        boundary_poly, boundary_level, boundary_status = find_plasma_boundary_with_status(
-            psi0,
-            model.grid,
-            center,
-            n_levels=80 if cfg.limiter_shape is not None else 10,
-            limiter_shape=cfg.limiter_shape,
-            boundary_mode=cfg.boundary_mode,
-        )
-        base_radii = radii_from_polyline_ray_intersections(boundary_poly, center, angles_rad)
+        boundary_found = True
+        boundary_reason = None
+        try:
+            boundary_poly, boundary_level, boundary_status = find_plasma_boundary_with_status(
+                psi0,
+                model.grid,
+                center,
+                n_levels=80 if cfg.limiter_shape is not None else 10,
+                limiter_shape=cfg.limiter_shape,
+                boundary_mode=cfg.boundary_mode,
+            )
+            base_radii = radii_from_polyline_ray_intersections(boundary_poly, center, angles_rad)
+        except BoundaryNotFoundError as exc:
+            boundary_found = False
+            boundary_reason = str(exc)
+            boundary_poly = None
+            boundary_level = None
+            boundary_status = "not_found"
+            base_radii = np.zeros_like(angles_rad, dtype=float)
         scenario = make_scenario(
             self.scenario_name,
             base_radii,
@@ -113,6 +145,7 @@ class SimulationSession:
             model=model,
             config_path=self.config_path,
             initial_currents_path=active_initial_path,
+            initial_state_override=active_initial_override,
             angles_rad=angles_rad,
             base_radii=base_radii,
         )
@@ -121,9 +154,10 @@ class SimulationSession:
         self._model = model
         self._machine = machine
         self._scenario = scenario
+        self._realism = realism
         self._angles_rad = angles_rad
-        self._boundary_poly = np.asarray(boundary_poly, dtype=float)
-        self._boundary_level = float(boundary_level)
+        self._boundary_poly = None if boundary_poly is None else np.asarray(boundary_poly, dtype=float)
+        self._boundary_level = None if boundary_level is None else float(boundary_level)
         self._boundary_status = str(boundary_status)
         self._last_commanded = np.zeros((machine.n_active_total,), dtype=float)
         self._last_applied = np.zeros((machine.n_active_total,), dtype=float)
@@ -133,8 +167,8 @@ class SimulationSession:
         snapshot = self._snapshot(
             commanded_active_derivatives=self._last_commanded,
             previous_applied_active_derivatives=self._last_applied,
-            boundary_found=True,
-            boundary_reason=None,
+            boundary_found=boundary_found,
+            boundary_reason=boundary_reason,
         )
         return ResetResult(
             observation_snapshot=snapshot,
@@ -143,6 +177,9 @@ class SimulationSession:
                 "scenario_name": str(self.scenario_name),
                 "scenario_args": dict(self.scenario_args),
                 "boundary_status": self._boundary_status,
+                "initial_state_override": _initial_state_override_metadata(active_initial_override),
+                "realism_active": realism is not None,
+                "realism_settings": _realism_settings_metadata(active_realism_settings),
             },
         )
 
@@ -150,7 +187,7 @@ class SimulationSession:
         """Применить физические производные токов активных актуаторов на один шаг."""
         if self._terminated:
             raise RuntimeError(f"SimulationSession is terminated: {self._termination_reason}")
-        cfg, model, machine, scenario, angles_rad = self._require_ready()
+        cfg, model, machine, scenario, angles_rad, realism = self._require_ready()
         active_derivs = np.asarray(action.active_current_derivatives, dtype=float).reshape(-1)
         if active_derivs.shape != (machine.n_active_total,):
             raise ValueError(
@@ -162,6 +199,10 @@ class SimulationSession:
         prev_applied = _active_derivatives(model).copy()
         pfc_derivs = active_derivs[: machine.n_active_pfc]
         sol_derivs = active_derivs[machine.n_active_pfc :]
+        if realism is not None:
+            actuation = realism.apply_actuation(pfc_derivs, sol_derivs)
+            pfc_derivs = actuation.pfc_applied
+            sol_derivs = actuation.sol_applied
         state = model.step(pfc_current_derivs=pfc_derivs, sol_current_derivs=sol_derivs)
         psi_true = model.compute_psi()
         model.state.psi = psi_true
@@ -191,8 +232,6 @@ class SimulationSession:
             self._boundary_poly = None
             self._boundary_level = None
             self._boundary_status = None
-            self._terminated = True
-            self._termination_reason = boundary_reason
 
         applied = _active_derivatives(model).copy()
         self._last_commanded = active_derivs.copy()
@@ -211,12 +250,18 @@ class SimulationSession:
             termination_reason=self._termination_reason,
         )
 
+    def reference_at_time(self, time_s: float) -> ReferenceFrame:
+        """Return the active scenario reference at a requested time without stepping."""
+        _cfg, _model, _machine, scenario, angles_rad, _realism = self._require_ready()
+        return _reference_frame(scenario, angles_rad, float(time_s))
+
     def close(self) -> None:
         """Освободить ссылки на runtime-состояние сессии."""
         self._cfg = None
         self._model = None
         self._machine = None
         self._scenario = None
+        self._realism = None
         self._angles_rad = None
         self._boundary_poly = None
         self._boundary_level = None
@@ -233,7 +278,7 @@ class SimulationSession:
         boundary_reason: str | None,
     ) -> StepSnapshot:
         """Собрать публичный снимок текущего состояния модели."""
-        _cfg, model, machine, scenario, angles_rad = self._require_ready()
+        cfg, model, machine, scenario, angles_rad, realism = self._require_ready()
         state = model.snapshot_state()
         reference = _reference_frame(scenario, angles_rad, float(state.t))
         currents = _active_currents(model)
@@ -242,6 +287,28 @@ class SimulationSession:
         radii = None
         if boundary_poly is not None:
             radii = radii_from_polyline_ray_intersections(boundary_poly, (model.R0, model.Z0), angles_rad)
+        if realism is None:
+            measured_ip = float(state.Ip)
+            measured_currents = currents.copy()
+            measured_boundary_poly = None if boundary_poly is None else boundary_poly.copy()
+            measured_radii = None if radii is None else np.asarray(radii, dtype=float).copy()
+        else:
+            sensors = realism.measure(
+                true_ip=float(state.Ip),
+                true_active_currents=currents,
+                true_boundary_poly=boundary_poly,
+                true_radii=radii,
+                true_psi=np.asarray(state.psi, dtype=float),
+                model=model,
+                center=(model.R0, model.Z0),
+                angles_rad=angles_rad,
+                limiter_shape=cfg.limiter_shape,
+                boundary_mode=cfg.boundary_mode,
+            )
+            measured_ip = sensors.measured_ip
+            measured_currents = sensors.measured_active_currents
+            measured_boundary_poly = sensors.measured_boundary_poly
+            measured_radii = sensors.measured_radii
         current_margin = _safe_current_margin(currents, machine.current_limits)
         derivative_margin = _safe_derivative_margin(applied, machine.derivative_limits)
         return StepSnapshot(
@@ -249,12 +316,16 @@ class SimulationSession:
             time_s=float(state.t),
             reference=reference,
             true_ip=float(state.Ip),
+            measured_ip=float(measured_ip),
             true_active_currents=currents,
+            measured_active_currents=np.asarray(measured_currents, dtype=float).copy(),
             commanded_active_derivatives=np.asarray(commanded_active_derivatives, dtype=float).copy(),
             applied_active_derivatives=applied,
             previous_applied_active_derivatives=np.asarray(previous_applied_active_derivatives, dtype=float).copy(),
             true_boundary_poly=boundary_poly,
+            measured_boundary_poly=None if measured_boundary_poly is None else np.asarray(measured_boundary_poly, dtype=float).copy(),
             true_radii=None if radii is None else np.asarray(radii, dtype=float).copy(),
+            measured_radii=None if measured_radii is None else np.asarray(measured_radii, dtype=float).copy(),
             psi_boundary_value=None if self._boundary_level is None else float(self._boundary_level),
             boundary_found=bool(boundary_found),
             boundary_reason=boundary_reason,
@@ -262,11 +333,35 @@ class SimulationSession:
             derivative_limit_margin=derivative_margin,
         )
 
-    def _require_ready(self) -> tuple[LoadedConfig, PlasmaModel, MachineSpec, Scenario, np.ndarray]:
+    def _require_ready(self) -> tuple[LoadedConfig, PlasmaModel, MachineSpec, Scenario, np.ndarray, RealismRuntime | None]:
         """Вернуть runtime-объекты после успешного reset."""
         if self._cfg is None or self._model is None or self._machine is None or self._scenario is None or self._angles_rad is None:
             raise RuntimeError("SimulationSession.reset() must be called before stepping")
-        return self._cfg, self._model, self._machine, self._scenario, self._angles_rad
+        return self._cfg, self._model, self._machine, self._scenario, self._angles_rad, self._realism
+
+
+def _apply_initial_state_override(cfg: LoadedConfig, override: InitialStateOverride | None) -> LoadedConfig:
+    """Apply explicit bridge-only initial Ip/current overrides to a loaded config."""
+    if override is None:
+        return cfg
+    physics = cfg.physics if override.ip is None else replace(cfg.physics, Ip0=float(override.ip))
+    pfc = cfg.pfc
+    sol = cfg.sol
+    if override.coil_currents == "zero":
+        pfc = CoilGroup(name=cfg.pfc.name, coils=list(cfg.pfc.coils), currents=np.zeros((cfg.pfc.n_coils,), dtype=float))
+        sol = CoilGroup(name=cfg.sol.name, coils=list(cfg.sol.coils), currents=np.zeros((cfg.sol.n_coils,), dtype=float))
+    return replace(cfg, physics=physics, pfc=pfc, sol=sol)
+
+
+def _initial_state_override_metadata(override: InitialStateOverride | None) -> dict[str, object]:
+    if override is None:
+        return {"enabled": False, "ip": None, "coil_currents": "config", "ip_scale": None}
+    return {
+        "enabled": bool(override.ip is not None or override.coil_currents != "config" or override.ip_scale is not None),
+        "ip": None if override.ip is None else float(override.ip),
+        "coil_currents": str(override.coil_currents),
+        "ip_scale": None if override.ip_scale is None else float(override.ip_scale),
+    }
 
 
 def _build_machine_spec(
@@ -275,6 +370,7 @@ def _build_machine_spec(
     model: PlasmaModel,
     config_path: Path,
     initial_currents_path: Path | None,
+    initial_state_override: InitialStateOverride | None,
     angles_rad: np.ndarray,
     base_radii: np.ndarray,
 ) -> MachineSpec:
@@ -301,16 +397,33 @@ def _build_machine_spec(
         n_active_sol=n_sol,
         n_active_total=n_pfc + n_sol,
         active_order=tuple([f"pfc_{i}" for i in range(n_pfc)] + [f"sol_{i}" for i in range(n_sol)]),
+        center=(float(model.R0), float(model.Z0)),
         pfc_active_mask=np.asarray(cfg.pfc_active_mask, dtype=bool).copy() if cfg.pfc_active_mask is not None else np.ones((n_pfc,), dtype=bool),
         sol_active_mask=np.asarray(cfg.sol_active_mask, dtype=bool).copy() if cfg.sol_active_mask is not None else np.ones((n_sol,), dtype=bool),
         current_limits=current_limits,
         derivative_limits=derivative_limits,
         angles_rad=np.asarray(angles_rad, dtype=float).copy(),
         radius_scale=radius_scale,
-        ip_scale=max(abs(float(model.Ip0)), 1.0),
+        ip_scale=_ip_scale(model=model, initial_state_override=initial_state_override),
         current_scale=_scale_from_limits_or_values(current_limits, currents),
         derivative_scale=_scale_from_limits_or_values(derivative_limits, np.ones((n_pfc + n_sol,), dtype=float)),
     )
+
+
+def _ip_scale(*, model: PlasmaModel, initial_state_override: InitialStateOverride | None) -> float:
+    if initial_state_override is not None and initial_state_override.ip_scale is not None:
+        return float(initial_state_override.ip_scale)
+    return max(abs(float(model.Ip0)), 1.0)
+
+
+def _realism_settings_metadata(settings: RealismSettings) -> dict[str, object]:
+    data = asdict(settings)
+    return {
+        "enabled": bool(data["enabled"]),
+        "seed": data["seed"],
+        "actuators": dict(data["actuators"]),
+        "sensors": dict(data["sensors"]),
+    }
 
 
 def _bank_limit_vector(limit: float | None, size: int) -> np.ndarray:

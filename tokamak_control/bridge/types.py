@@ -20,6 +20,7 @@ class MachineSpec:
     n_active_sol: int
     n_active_total: int
     active_order: tuple[str, ...]
+    center: tuple[float, float]
     pfc_active_mask: np.ndarray
     sol_active_mask: np.ndarray
     current_limits: np.ndarray
@@ -29,6 +30,25 @@ class MachineSpec:
     ip_scale: float
     current_scale: np.ndarray
     derivative_scale: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class InitialStateOverride:
+    """Runtime initial-state override for bridge sessions."""
+
+    ip: float | None = None
+    coil_currents: str = "config"
+    ip_scale: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.ip is not None and not np.isfinite(float(self.ip)):
+            raise ValueError("initial override ip must be finite when provided")
+        if str(self.coil_currents) not in {"config", "zero"}:
+            raise ValueError("initial override coil_currents must be 'config' or 'zero'")
+        if self.ip_scale is not None:
+            scale = float(self.ip_scale)
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise ValueError("initial override ip_scale must be finite and > 0 when provided")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,12 +76,16 @@ class StepSnapshot:
     time_s: float
     reference: ReferenceFrame
     true_ip: float
+    measured_ip: float
     true_active_currents: np.ndarray
+    measured_active_currents: np.ndarray
     commanded_active_derivatives: np.ndarray
     applied_active_derivatives: np.ndarray
     previous_applied_active_derivatives: np.ndarray
     true_boundary_poly: np.ndarray | None
+    measured_boundary_poly: np.ndarray | None
     true_radii: np.ndarray | None
+    measured_radii: np.ndarray | None
     psi_boundary_value: float | None
     boundary_found: bool
     boundary_reason: str | None

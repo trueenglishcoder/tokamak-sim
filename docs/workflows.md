@@ -92,6 +92,24 @@ Each generated table is a two-column semicolon-separated file:
 time_s;Ip
 ```
 
+The reusable implementation lives in `tokamak_control.config.ip_trajectories`, so the same seeded template perturbation can be used by the CLI generator and by `t15_synthetic_follow` directly:
+
+```bash
+python scripts/run_simulation_artifacts.py \
+  --config configs/T15MD_new_data.toml \
+  --initial-currents configs/initial_currents/T15MD_new_data_3864.toml \
+  --steps 500 \
+  --controller lqr_joint \
+  --angles 32 \
+  --scenario t15_synthetic_follow \
+  --scenario-arg seed=11 \
+  --scenario-arg ip_template_dir=data/t15_data_new_split/ip \
+  --scenario-arg ip_seed=101 \
+  --scenario-arg amplitude_jitter=0.05 \
+  --scenario-arg duration_jitter=0.05 \
+  --scenario-arg shape_jitter=0.02
+```
+
 Example closed-loop run with an algorithmic current controller:
 
 ```bash

@@ -43,22 +43,6 @@ class PhysicsSettings:
     pfc_deriv_limit: float | None = None
     sol_deriv_limit: float | None = None
 
-    pfc_cmd_delay_steps: int = 0
-    sol_cmd_delay_steps: int = 0
-
-    pfc_gain_sigma: float = 0.0
-    sol_gain_sigma: float = 0.0
-    pfc_bias_sigma: float = 0.0
-    sol_bias_sigma: float = 0.0
-    pfc_cmd_noise_sigma: float = 0.0
-    sol_cmd_noise_sigma: float = 0.0
-
-    boundary_xy_noise_sigma: float = 0.0
-    boundary_delay_steps: int = 0
-    psi_noise_sigma: float = 0.0
-
-    realism_seed: int | None = None
-
     def validate(self) -> None:
         for name, value in (
             ("mu0", self.mu0),
@@ -119,30 +103,3 @@ class PhysicsSettings:
                 raise ValueError(f"{name} must be finite if set, got {lim!r}")
             if float(lim) < 0.0:
                 raise ValueError(f"{name} must be >= 0 if set, got {lim!r}")
-
-        for name, steps in (("pfc_cmd_delay_steps", self.pfc_cmd_delay_steps), ("sol_cmd_delay_steps", self.sol_cmd_delay_steps), ("boundary_delay_steps", self.boundary_delay_steps)):
-            if int(steps) != steps:
-                raise ValueError(f"{name} must be an int, got {steps!r}")
-            if steps < 0:
-                raise ValueError(f"{name} must be >= 0, got {steps!r}")
-
-        for name, s in (
-            ("pfc_gain_sigma", self.pfc_gain_sigma),
-            ("sol_gain_sigma", self.sol_gain_sigma),
-            ("pfc_bias_sigma", self.pfc_bias_sigma),
-            ("sol_bias_sigma", self.sol_bias_sigma),
-            ("pfc_cmd_noise_sigma", self.pfc_cmd_noise_sigma),
-            ("sol_cmd_noise_sigma", self.sol_cmd_noise_sigma),
-            ("boundary_xy_noise_sigma", self.boundary_xy_noise_sigma),
-            ("psi_noise_sigma", self.psi_noise_sigma),
-        ):
-            if not math.isfinite(float(s)):
-                raise ValueError(f"{name} must be finite, got {s!r}")
-            if float(s) < 0.0:
-                raise ValueError(f"{name} must be >= 0, got {s!r}")
-
-        if self.realism_seed is not None:
-            if int(self.realism_seed) != self.realism_seed:
-                raise ValueError(f"realism_seed must be an int if set, got {self.realism_seed!r}")
-            if self.realism_seed < 0:
-                raise ValueError(f"realism_seed must be >= 0 if set, got {self.realism_seed!r}")

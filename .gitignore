@@ -42,3 +42,4 @@ _local_archive/
 # OS
 .DS_Store
 Thumbs.db
+*:Zone.Identifier

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime
 import json
 import logging
@@ -35,7 +35,6 @@ from tokamak_control.experiments.disturbances import (
     prepare_disturbances,
     IpCrash,
 )
-from tokamak_control.experiments.realism import RealismInjector
 from tokamak_control.geometry.boundary import (
     BoundaryMode,
     BoundaryNotFoundError,
@@ -48,6 +47,7 @@ from tokamak_control.io.config_io import LoadedConfig, load_config
 from tokamak_control.io.data_io import RunWriter
 from tokamak_control.io.logger import configure_logging, get_logger
 from tokamak_control.io.profiling import Profiler
+from tokamak_control.realism import RealismRuntime, SensorRealismResult
 
 try:
     from tqdm.auto import tqdm
@@ -64,7 +64,9 @@ LaunchScenarioName = Literal[
     "boundary_pulse",
     "joint_disturbance",
     "shot_follow",
+    "ip_table",
     "ip_follow",
+    "t15_synthetic_follow",
     "ip_crash",
 ]
 
@@ -133,9 +135,7 @@ class _StepRecord:
     refs: _StepRefs
     ref_radii_log: np.ndarray
     ip_ref_log: float
-    radii_true: np.ndarray
-    radii_meas: np.ndarray
-    boundary_meas_post: np.ndarray
+    sensors: SensorRealismResult
     disturbances_applied: list[str]
 
 
@@ -276,6 +276,7 @@ def _build_run_metadata(
             _serialize_disturbance_template(d) for d in (disturbances or ())
         ],
         "realism_enabled": bool(realism_enabled),
+        "realism": _json_safe(cfg.realism),
         "profiling_enabled": bool(profiling_enabled),
         "runtime_overrides": dict(runtime_overrides or {}),
         "grid": {
@@ -317,6 +318,8 @@ def _json_safe(value: object) -> object:
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if is_dataclass(value):
+        return _json_safe(asdict(value))
     if isinstance(value, Mapping):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -570,30 +573,52 @@ def _scenario_refs(scenario: Scenario, angles: np.ndarray, t_now: float) -> _Ste
     )
 
 
-def _measured_boundary_inputs(
+def _sensor_measurements(
     *,
-    injector: RealismInjector | None,
+    realism: RealismRuntime | None,
     model: PlasmaModel,
     psi_true: np.ndarray,
     boundary_poly: np.ndarray,
+    radii_true: np.ndarray,
     center: tuple[float, float],
+    angles: np.ndarray,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
     run_profiler: Profiler,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Подготовить измеренные psi и контур для входа регулятора."""
-    if injector is None:
-        return psi_true, boundary_poly
-    with run_profiler.time_block("step_measurements_pre"):
-        psi_meas, boundary_meas = injector.measurements(
+    profile_key: str,
+) -> SensorRealismResult:
+    """Подготовить true/measured channels для регулятора или записи."""
+    state = model.snapshot_state()
+    true_currents = np.concatenate([
+        np.asarray(state.pfc_currents, dtype=float).reshape(-1),
+        np.asarray(state.sol_currents, dtype=float).reshape(-1),
+    ])
+    if realism is None:
+        return SensorRealismResult(
+            true_ip=float(state.Ip),
+            measured_ip=float(state.Ip),
+            true_active_currents=true_currents,
+            measured_active_currents=true_currents.copy(),
+            true_boundary_poly=np.asarray(boundary_poly, dtype=float).copy(),
+            measured_boundary_poly=np.asarray(boundary_poly, dtype=float).copy(),
+            true_radii=np.asarray(radii_true, dtype=float).reshape(-1).copy(),
+            measured_radii=np.asarray(radii_true, dtype=float).reshape(-1).copy(),
+            true_psi=np.asarray(psi_true, dtype=float).copy(),
+            measured_psi=np.asarray(psi_true, dtype=float).copy(),
+        )
+    with run_profiler.time_block(profile_key):
+        return realism.measure(
+            true_ip=float(state.Ip),
+            true_active_currents=true_currents,
+            true_boundary_poly=boundary_poly,
+            true_radii=radii_true,
+            true_psi=psi_true,
             model=model,
-            psi=psi_true,
-            boundary_poly=boundary_poly,
             center=center,
+            angles_rad=angles,
             limiter_shape=limiter_shape,
             boundary_mode=boundary_mode,
         )
-    return psi_meas, boundary_poly if boundary_meas is None else boundary_meas
 
 
 def _compute_controller_commands(
@@ -628,17 +653,17 @@ def _compute_controller_commands(
 
 def _effective_commands(
     *,
-    injector: RealismInjector | None,
+    realism: RealismRuntime | None,
     pfc_cmd: np.ndarray,
     sol_cmd: np.ndarray,
     run_profiler: Profiler,
 ) -> _StepCommands:
     """Применить реализм исполнительных устройств к командам регулятора."""
-    if injector is None:
+    if realism is None:
         return _StepCommands(pfc_cmd=pfc_cmd, sol_cmd=sol_cmd, pfc_eff=pfc_cmd, sol_eff=sol_cmd)
     with run_profiler.time_block("step_actuation_realism"):
-        pfc_eff, sol_eff = injector.actuation(pfc_cmd, sol_cmd)
-    return _StepCommands(pfc_cmd=pfc_cmd, sol_cmd=sol_cmd, pfc_eff=pfc_eff, sol_eff=sol_eff)
+        result = realism.apply_actuation(pfc_cmd, sol_cmd)
+    return _StepCommands(pfc_cmd=result.pfc_commanded, sol_cmd=result.sol_commanded, pfc_eff=result.pfc_applied, sol_eff=result.sol_applied)
 
 
 def _advance_model_state(
@@ -708,32 +733,6 @@ def _update_boundary_tracker(
         tracker.found = True
 
 
-def _post_step_measured_boundary(
-    *,
-    injector: RealismInjector | None,
-    model: PlasmaModel,
-    psi_true: np.ndarray,
-    boundary_poly: np.ndarray,
-    center: tuple[float, float],
-    limiter_shape: np.ndarray | None,
-    boundary_mode: BoundaryMode,
-    run_profiler: Profiler,
-) -> np.ndarray:
-    """Вернуть измеренный контур после шага для записи метрик."""
-    if injector is None:
-        return boundary_poly
-    with run_profiler.time_block("step_measurements_post"):
-        _psi_meas_post, boundary_meas_post = injector.measurements(
-            model=model,
-            psi=psi_true,
-            boundary_poly=boundary_poly,
-            center=center,
-            limiter_shape=limiter_shape,
-            boundary_mode=boundary_mode,
-        )
-    return boundary_poly if boundary_meas_post is None else boundary_meas_post
-
-
 def _build_step_record(
     *,
     state: PlasmaState,
@@ -743,15 +742,26 @@ def _build_step_record(
     angles: np.ndarray,
     center: tuple[float, float],
     tracker: _BoundaryTracker,
-    boundary_meas_post: np.ndarray,
+    sensors: SensorRealismResult,
     disturbances_applied: list[str],
     run_profiler: Profiler,
 ) -> _StepRecord:
     """Собрать данные шага перед записью в RunWriter."""
     with run_profiler.time_block("step_radii_true"):
         radii_true = radii_from_polyline_ray_intersections(tracker.poly, center, angles)
-    with run_profiler.time_block("step_radii_meas"):
-        radii_meas = radii_from_polyline_ray_intersections(boundary_meas_post, center, angles)
+    if sensors.true_radii is None or not np.allclose(np.asarray(sensors.true_radii, dtype=float), radii_true, equal_nan=True):
+        sensors = SensorRealismResult(
+            true_ip=sensors.true_ip,
+            measured_ip=sensors.measured_ip,
+            true_active_currents=sensors.true_active_currents,
+            measured_active_currents=sensors.measured_active_currents,
+            true_boundary_poly=sensors.true_boundary_poly,
+            measured_boundary_poly=sensors.measured_boundary_poly,
+            true_radii=radii_true,
+            measured_radii=sensors.measured_radii,
+            true_psi=sensors.true_psi,
+            measured_psi=sensors.measured_psi,
+        )
     with run_profiler.time_block("step_log_refs"):
         t_log = float(state.t)
         ref_radii_log = np.asarray(scenario.ref_radii(angles, t_log), dtype=float)
@@ -762,9 +772,7 @@ def _build_step_record(
         refs=refs,
         ref_radii_log=ref_radii_log,
         ip_ref_log=ip_ref_log,
-        radii_true=radii_true,
-        radii_meas=radii_meas,
-        boundary_meas_post=boundary_meas_post,
+        sensors=sensors,
         disturbances_applied=disturbances_applied,
     )
 
@@ -782,6 +790,9 @@ def _write_step_record(
     """Записать один шаг временных рядов и событий."""
     state = record.state
     commands = record.commands
+    sensors = record.sensors
+    n_pfc = np.asarray(state.pfc_currents, dtype=float).reshape(-1).shape[0]
+    measured_currents = np.asarray(sensors.measured_active_currents, dtype=float).reshape(-1)
     with run_profiler.time_block("step_writer"):
         writer.append(
             t=float(state.t),
@@ -799,10 +810,13 @@ def _write_step_record(
             step=int(state.step),
             Ip_ref=record.ip_ref_log,
             radii_ref=record.ref_radii_log,
-            radii_true=record.radii_true,
-            radii_meas=record.radii_meas,
+            Ip_meas=float(sensors.measured_ip),
+            pfc_currents_meas=measured_currents[:n_pfc],
+            sol_currents_meas=measured_currents[n_pfc:],
+            radii_true=sensors.true_radii,
+            radii_meas=sensors.measured_radii,
             boundary_poly_true=tracker.poly,
-            boundary_poly_meas=record.boundary_meas_post,
+            boundary_poly_meas=sensors.measured_boundary_poly,
         )
         writer.log_event(
             {
@@ -831,7 +845,7 @@ def _run_single_step(
     scenario_name: ScenarioName,
     controller: Controller,
     controller_name: str,
-    injector: RealismInjector | None,
+    realism: RealismRuntime | None,
     tracker: _BoundaryTracker,
     psi_true: np.ndarray,
     center: tuple[float, float],
@@ -848,29 +862,35 @@ def _run_single_step(
     """Выполнить один полный шаг замкнутой симуляции."""
     with run_profiler.time_block("step_scenario"):
         refs = _scenario_refs(scenario, angles, float(model.state.t))
-    psi_meas, boundary_meas = _measured_boundary_inputs(
-        injector=injector,
+    radii_pre = radii_from_polyline_ray_intersections(tracker.poly, center, angles)
+    sensors_pre = _sensor_measurements(
+        realism=realism,
         model=model,
         psi_true=psi_true,
         boundary_poly=tracker.poly,
+        radii_true=radii_pre,
         center=center,
+        angles=angles,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
         run_profiler=run_profiler,
+        profile_key="step_measurements_pre",
     )
+    if sensors_pre.measured_boundary_poly is None:
+        raise BoundaryNotFoundError("Measured plasma boundary unavailable under realism")
     pfc_cmd, sol_cmd = _compute_controller_commands(
         controller=controller,
         controller_name=controller_name,
         model=model,
-        psi_meas=psi_meas,
-        boundary_meas=boundary_meas,
+        psi_meas=np.asarray(sensors_pre.measured_psi if sensors_pre.measured_psi is not None else psi_true, dtype=float),
+        boundary_meas=np.asarray(sensors_pre.measured_boundary_poly, dtype=float),
         center=center,
         angles=angles,
         refs=refs,
         run_profiler=run_profiler,
     )
     commands = _effective_commands(
-        injector=injector,
+        realism=realism,
         pfc_cmd=pfc_cmd,
         sol_cmd=sol_cmd,
         run_profiler=run_profiler,
@@ -897,15 +917,19 @@ def _run_single_step(
         step_index=step_index,
         run_profiler=run_profiler,
     )
-    boundary_meas_post = _post_step_measured_boundary(
-        injector=injector,
+    radii_post = radii_from_polyline_ray_intersections(tracker.poly, center, angles)
+    sensors_post = _sensor_measurements(
+        realism=realism,
         model=model,
         psi_true=psi_next,
         boundary_poly=tracker.poly,
+        radii_true=radii_post,
         center=center,
+        angles=angles,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
         run_profiler=run_profiler,
+        profile_key="step_measurements_post",
     )
     record = _build_step_record(
         state=state,
@@ -915,7 +939,7 @@ def _run_single_step(
         angles=angles,
         center=center,
         tracker=tracker,
-        boundary_meas_post=boundary_meas_post,
+        sensors=sensors_post,
         disturbances_applied=disturbances_applied,
         run_profiler=run_profiler,
     )
@@ -1029,9 +1053,9 @@ def run(
         logger.info("Applying runtime overrides for %s", canonical_controller_name)
 
     realism_active = bool(
-        realism_enabled
+        (realism_enabled or cfg_runtime.realism.enabled)
         and canonical_controller_name != "t15md_replay"
-        and RealismInjector.has_any_effect(cfg_runtime.physics)
+        and RealismRuntime.has_any_effect(cfg_runtime.realism)
     )
     paths = _allocate_paths_for_run(
         output_dir=output_dir,
@@ -1072,7 +1096,7 @@ def run(
     with run_profiler.time_block("prepare_disturbances"):
         active_disturbances = prepare_disturbances(disturbances, int(steps))
     with run_profiler.time_block("setup_realism"):
-        injector = RealismInjector(cfg_runtime.physics) if realism_active else None
+        realism = RealismRuntime(cfg_runtime.realism) if realism_active else None
 
     if realism_active:
         logger.info("Realism is active")
@@ -1130,7 +1154,7 @@ def run(
                         scenario_name=scenario_name,
                         controller=controller,
                         controller_name=canonical_controller_name,
-                        injector=injector,
+                        realism=realism,
                         tracker=tracker,
                         psi_true=psi_true,
                         center=center,
@@ -1159,7 +1183,7 @@ def run(
                         "reason": stop_reason,
                     }
                 )
-                logger.warning("No physical plasma boundary at step=%d/%d reason=%s", boundary_missing_step, int(steps), stop_reason)
+                logger.warning("No usable plasma boundary at step=%d/%d reason=%s", boundary_missing_step, int(steps), stop_reason)
                 break
             completed_steps += 1
             _log_step_profile(run_profiler)

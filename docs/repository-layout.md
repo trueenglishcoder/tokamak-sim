@@ -64,10 +64,11 @@ For Docker/server use, these files should be provided through a mounted volume o
 - `config/`: settings dataclasses and scenario definitions.
 - `control/`: controllers, replay tables, linearization, and controller registry.
 - `core/`: grid, coils, Green functions, plasma state, and plasma model.
-- `experiments/`: disturbances and realism injection.
+- `experiments/`: runtime plant disturbances.
 - `geometry/`: boundary finding, limiter polygons, X-point detection, and coordinate utilities.
 - `io/`: config loading, artifact IO, logging, profiling.
 - `metrics/`: pure tracking, boundary, and actuator diagnostics.
+- `realism/`: neutral actuator and sensor nonidealities shared by CLI runs and bridge sessions.
 - `viz/`: plotting, frames, and video helpers.
 
 ## Current Cleanup State

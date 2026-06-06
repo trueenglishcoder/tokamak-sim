@@ -23,7 +23,10 @@ _SCENARIO_CHOICES = (
     "ip_jet_like",
     "boundary_pulse",
     "joint_disturbance",
+    "shot_follow",
     "ip_table",
+    "ip_follow",
+    "t15_synthetic_follow",
     "ip_crash",
 )
 

@@ -206,7 +206,9 @@ Boundary extraction supports two physical modes:
 
 The magenta T15MD geometry in plots is the limiter. The boundary finder is not an optimization target and does not use largest-contour drawing as a physical boundary rule.
 
-Run artifacts store the physical boundary polylines found during the simulation in `boundary_poly_true` and `boundary_poly_meas`. Plotting and frame rendering consume those stored polylines instead of recomputing a separate plotting boundary.
+Run artifacts store true and measured boundary channels in `boundary_poly_true`/`boundary_poly_meas` and `radii_true`/`radii_meas`. When neutral realism is enabled, measured channels can include actuator and sensor nonidealities; plotting and frame rendering consume the stored polylines instead of recomputing a separate plotting boundary.
+
+`tokamak_control.geometry.parametric_boundary` provides the T15 reference-boundary primitive used for synthetic training references. It validates the analytic `(R0, Z0, A0, kappa, delta)` boundary, includes replay-derived robust T15 bounds and smooth rate limits, generates deterministic rate-limited parameter trajectories, and converts generated shapes into `radii_ref`. `tokamak_control.config.ip_trajectories` provides the matching Ip reference primitive: it loads real `time;Ip` tables, generates seeded template perturbations with amplitude/duration/shape jitter, writes generated tables, and exposes clamped interpolation. The `t15_synthetic_follow` scenario combines these through the standard scenario interface using an explicit Ip ramp, a direct `ip_csv`, `ip_template_csv`, or `ip_template_dir`.
 
 ## Documentation
 

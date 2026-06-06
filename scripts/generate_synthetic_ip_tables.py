@@ -21,30 +21,12 @@ def _ensure_repo_root_on_path() -> None:
 
 _ensure_repo_root_on_path()
 
-
-@dataclass(frozen=True, slots=True, repr=True)
-class SourceIpShot:
-    """Исходная таблица Ip, используемая как шаблон формы сигнала."""
-
-    shot_id: str
-    path: Path
-    time_s: np.ndarray
-    ip_a: np.ndarray
-
-    @property
-    def rows(self) -> int:
-        """Вернуть число строк в таблице."""
-        return int(self.time_s.size)
-
-    @property
-    def duration_s(self) -> float:
-        """Вернуть длительность таблицы в секундах."""
-        return float(self.time_s[-1] - self.time_s[0])
-
-    @property
-    def peak_abs_ip(self) -> float:
-        """Вернуть максимальный модуль тока плазмы."""
-        return float(np.max(np.abs(self.ip_a)))
+from tokamak_control.config.ip_trajectories import (  # noqa: E402
+    SyntheticIpConfig,
+    discover_ip_templates,
+    generate_ip_reference_from_template,
+    write_semicolon_ip_table,
+)
 
 
 @dataclass(frozen=True, slots=True, repr=True)
@@ -62,90 +44,12 @@ class SyntheticIpSummary:
     initial_currents_toml: str
 
 
-def _finite_positive(name: str, value: float) -> float:
-    """Проверить, что аргумент конечен и строго положителен."""
-    out = float(value)
-    if not np.isfinite(out) or out <= 0.0:
-        raise ValueError(f"{name} must be finite and > 0, got {value!r}")
-    return out
-
-
 def _finite_nonnegative(name: str, value: float) -> float:
     """Проверить, что аргумент конечен и неотрицателен."""
     out = float(value)
     if not np.isfinite(out) or out < 0.0:
         raise ValueError(f"{name} must be finite and >= 0, got {value!r}")
     return out
-
-
-def _extract_shot_id(path: Path) -> str:
-    """Вытащить номер shot из имени файла формата t15md_<shot>_ip.csv."""
-    stem = path.stem.lower()
-    prefix = "t15md_"
-    suffix = "_ip"
-    if not stem.startswith(prefix) or not stem.endswith(suffix):
-        raise ValueError(f"Unsupported Ip filename: {path.name}")
-    shot_id = stem[len(prefix) : -len(suffix)]
-    if not shot_id.isdigit():
-        raise ValueError(f"Could not parse shot id from filename: {path.name}")
-    return shot_id
-
-
-def _load_semicolon_ip_table(path: Path) -> SourceIpShot:
-    """Прочитать двухколоночную таблицу time;Ip в каноническом формате сценариев."""
-    rows: list[list[float]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line:
-                continue
-            parts = [part for part in line.split(";") if part != ""]
-            if len(parts) != 2:
-                raise ValueError(f"Expected 2 semicolon-separated columns in {path}, got {len(parts)}")
-            rows.append([float(parts[0]), float(parts[1])])
-
-    if len(rows) < 2:
-        raise ValueError(f"Ip table must contain at least 2 rows: {path}")
-
-    arr = np.asarray(rows, dtype=float)
-    time_s = np.asarray(arr[:, 0], dtype=float)
-    ip_a = np.asarray(arr[:, 1], dtype=float)
-
-    if not np.all(np.isfinite(time_s)):
-        raise ValueError(f"Ip table contains non-finite timestamps: {path}")
-    if not np.all(np.isfinite(ip_a)):
-        raise ValueError(f"Ip table contains non-finite Ip values: {path}")
-    if np.any(np.diff(time_s) < 0.0):
-        raise ValueError(f"Ip table timestamps must be nondecreasing: {path}")
-
-    time_s = time_s - float(time_s[0])
-    if float(time_s[-1]) <= 0.0:
-        raise ValueError(f"Ip table duration must be positive: {path}")
-    if not np.any(np.abs(ip_a) > 0.0):
-        raise ValueError(f"Ip table must contain at least one nonzero Ip sample: {path}")
-
-    return SourceIpShot(
-        shot_id=_extract_shot_id(path),
-        path=path,
-        time_s=time_s,
-        ip_a=ip_a,
-    )
-
-
-def _discover_source_shots(source_ip_dir: Path) -> list[SourceIpShot]:
-    """Собрать и проверить все шаблонные Ip-таблицы из директории."""
-    if not source_ip_dir.exists():
-        raise FileNotFoundError(f"Source Ip directory not found: {source_ip_dir}")
-    if not source_ip_dir.is_dir():
-        raise NotADirectoryError(f"Source Ip path is not a directory: {source_ip_dir}")
-
-    shots: list[SourceIpShot] = []
-    for path in sorted(source_ip_dir.glob("t15md_*_ip.csv")):
-        shots.append(_load_semicolon_ip_table(path))
-
-    if not shots:
-        raise FileNotFoundError(f"No t15md_*_ip.csv files found in {source_ip_dir}")
-    return shots
 
 
 def _source_initial_currents_path(
@@ -179,66 +83,6 @@ def _copy_initial_currents_toml(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
     return out_path
-
-
-def _sample_scale(rng: np.random.Generator, *, jitter: float) -> float:
-    """Сэмплировать положительный масштаб около 1.0."""
-    if float(jitter) <= 0.0:
-        return 1.0
-    scale = 1.0 + float(rng.normal(0.0, float(jitter)))
-    return max(scale, 0.05)
-
-
-def _shape_envelope(
-    n_rows: int,
-    rng: np.random.Generator,
-    *,
-    shape_jitter: float,
-    n_anchors: int = 5,
-) -> np.ndarray:
-    """Собрать гладкую мультипликативную огибающую формы сигнала."""
-    if n_rows < 2:
-        raise ValueError(f"n_rows must be >= 2, got {n_rows}")
-    if float(shape_jitter) <= 0.0:
-        return np.ones((n_rows,), dtype=float)
-
-    anchors_x = np.linspace(0.0, 1.0, int(n_anchors), dtype=float)
-    anchors_y = rng.normal(0.0, float(shape_jitter), size=int(n_anchors))
-    anchors_y[0] = 0.0
-    anchors_y[-1] = 0.0
-    query_x = np.linspace(0.0, 1.0, n_rows, dtype=float)
-    envelope = 1.0 + np.interp(query_x, anchors_x, anchors_y)
-    return np.clip(envelope, 0.1, None)
-
-
-def _synthesize_ip_from_template(
-    template: SourceIpShot,
-    rng: np.random.Generator,
-    *,
-    amplitude_jitter: float,
-    duration_jitter: float,
-    shape_jitter: float,
-) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """Построить новую таблицу Ip, сохранив базовую форму и единицы шаблона."""
-    rows = template.rows
-    duration_scale = _sample_scale(rng, jitter=duration_jitter)
-    amplitude_scale = _sample_scale(rng, jitter=amplitude_jitter)
-
-    source_duration = template.duration_s
-    target_duration = float(source_duration * duration_scale)
-    query_phase = np.linspace(0.0, 1.0, rows, dtype=float)
-    source_phase = template.time_s / float(source_duration)
-    ip_base = np.interp(query_phase, source_phase, template.ip_a)
-    envelope = _shape_envelope(rows, rng, shape_jitter=shape_jitter)
-    ip_out = amplitude_scale * ip_base * envelope
-    t_out = np.linspace(0.0, target_duration, rows, dtype=float)
-    return t_out, ip_out, amplitude_scale, duration_scale
-
-
-def _write_semicolon_csv(path: Path, arr: np.ndarray) -> None:
-    """Записать массив в headerless CSV с разделителем `;`."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savetxt(path, np.asarray(arr, dtype=float), delimiter=";", fmt="%.16g")
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -298,24 +142,22 @@ def main() -> int:
     out_ip_dir.mkdir(parents=True, exist_ok=True)
     out_initial_currents_dir.mkdir(parents=True, exist_ok=True)
 
-    source_shots = _discover_source_shots(source_ip_dir)
+    templates = discover_ip_templates(source_ip_dir)
     rng = np.random.default_rng(int(args.seed))
+    config = SyntheticIpConfig(
+        amplitude_jitter=float(args.amplitude_jitter),
+        duration_jitter=float(args.duration_jitter),
+        shape_jitter=float(args.shape_jitter),
+    )
 
     summaries: list[SyntheticIpSummary] = []
     for index in range(int(args.n_shots)):
         shot_id = str(int(args.shot_start) + index)
-        template = source_shots[int(rng.integers(0, len(source_shots)))]
-        t_out, ip_out, amplitude_scale, duration_scale = _synthesize_ip_from_template(
-            template,
-            rng,
-            amplitude_jitter=float(args.amplitude_jitter),
-            duration_jitter=float(args.duration_jitter),
-            shape_jitter=float(args.shape_jitter),
-        )
+        template = templates[int(rng.integers(0, len(templates)))]
+        trajectory = generate_ip_reference_from_template(template, rng=rng, config=config)
 
-        ip_table = np.column_stack([t_out, ip_out])
         ip_path = out_ip_dir / f"t15md_{shot_id}_ip.csv"
-        _write_semicolon_csv(ip_path, ip_table)
+        write_semicolon_ip_table(ip_path, trajectory)
         initial_currents_path = _copy_initial_currents_toml(
             source_initial_currents_dir,
             out_initial_currents_dir,
@@ -327,11 +169,11 @@ def main() -> int:
         summary = SyntheticIpSummary(
             shot_id=shot_id,
             template_shot_id=template.shot_id,
-            rows=int(ip_table.shape[0]),
-            duration_s=float(t_out[-1] - t_out[0]),
-            peak_abs_ip=float(np.max(np.abs(ip_out))),
-            amplitude_scale=float(amplitude_scale),
-            duration_scale=float(duration_scale),
+            rows=trajectory.rows,
+            duration_s=trajectory.duration_s,
+            peak_abs_ip=trajectory.peak_abs_ip,
+            amplitude_scale=trajectory.amplitude_scale,
+            duration_scale=trajectory.duration_scale,
             ip_csv=str(ip_path),
             initial_currents_toml=str(initial_currents_path),
         )
@@ -355,13 +197,13 @@ def main() -> int:
         "shape_jitter": float(args.shape_jitter),
         "source_shots": [
             {
-                "shot_id": shot.shot_id,
-                "path": str(shot.path),
-                "rows": shot.rows,
-                "duration_s": shot.duration_s,
-                "peak_abs_ip": shot.peak_abs_ip,
+                "shot_id": template.shot_id,
+                "path": "" if template.path is None else str(template.path),
+                "rows": template.rows,
+                "duration_s": template.duration_s,
+                "peak_abs_ip": template.peak_abs_ip,
             }
-            for shot in source_shots
+            for template in templates
         ],
         "generated_shots": [asdict(summary) for summary in summaries],
     }

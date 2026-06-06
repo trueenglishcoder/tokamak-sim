@@ -154,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
             "shot_follow",
             "ip_table",
             "ip_follow",
+            "t15_synthetic_follow",
             "ip_crash",
         ],
         help="Scenario to run.",

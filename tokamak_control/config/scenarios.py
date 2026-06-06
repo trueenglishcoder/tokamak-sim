@@ -6,7 +6,25 @@ from typing import Callable, Mapping, Literal
 
 import numpy as np
 
+from tokamak_control.config.ip_trajectories import (
+    SegmentedIpConfig,
+    SyntheticIpConfig,
+    discover_ip_templates,
+    generate_segmented_ip_reference,
+    generate_ip_reference_from_template,
+    generate_ip_reference_from_templates,
+    load_semicolon_ip_table,
+    make_ip_reference_from_table,
+)
 from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
+from tokamak_control.geometry.parametric_boundary import (
+    BoundaryParameterBounds,
+    BoundaryParameterRateLimits,
+    BoundaryParameters,
+    generate_boundary_parameter_trajectory,
+    reference_radii_from_parameters,
+    validate_boundary_parameters,
+)
 
 
 ScenarioName = Literal[
@@ -20,6 +38,7 @@ ScenarioName = Literal[
     "shot_follow",
     "ip_table",
     "ip_follow",
+    "t15_synthetic_follow",
 ]
 
 
@@ -529,6 +548,219 @@ def make_ip_table(
     return Scenario("ip_table", _r, _ip)
 
 
+
+def make_t15_synthetic_follow(
+    base_radii: np.ndarray,
+    Ip0: float,
+    *,
+    center: tuple[float, float] | None,
+    reference_preset: str | None = None,
+    seed: int = 0,
+    duration_s: float = 1.0,
+    t_step: float = 1.0e-3,
+    target_update_s: float = 0.20,
+    theta_count: int = 512,
+    ip_csv: str | Path | None = None,
+    time_offset: float | None = None,
+    ip_template_csv: str | Path | None = None,
+    ip_template_dir: str | Path | None = None,
+    ip_seed: int | None = None,
+    amplitude_jitter: float = 0.05,
+    duration_jitter: float = 0.05,
+    shape_jitter: float = 0.02,
+    ip_segmented: bool = False,
+    ip_min: float | None = None,
+    ip_max: float | None = None,
+    ip_segment_min_steps: int = 50,
+    ip_segment_max_steps: int = 300,
+    ip_segment_count_min: int = 3,
+    ip_segment_count_max: int = 8,
+    ip_max_steps: int | None = None,
+    ip_rate_limit: float | None = None,
+    ip_hold_probability: float = 0.35,
+    ip_start: float | None = None,
+    ip_end: float | None = None,
+    ip_ramp_s: float | None = None,
+    boundary_kind: str = "generated_parameters",
+    boundary_parameters: Mapping[str, object] | None = None,
+    boundary_bounds: Mapping[str, object] | None = None,
+    boundary_rate_limits: Mapping[str, object] | None = None,
+) -> Scenario:
+    """Вернуть T15-like synthetic reference с rate-limited параметрами формы."""
+    del base_radii
+    del reference_preset
+    if center is None:
+        raise ValueError("Scenario 't15_synthetic_follow' requires a non-None center")
+    if not np.all(np.isfinite(np.asarray(center, dtype=float))):
+        raise ValueError("Scenario 't15_synthetic_follow' requires a finite center")
+    if int(theta_count) < 32:
+        raise ValueError("Scenario parameter 'theta_count' must be >= 32")
+    duration = float(duration_s)
+    dt = float(t_step)
+    if not np.isfinite(duration) or duration <= 0.0:
+        raise ValueError("Scenario parameter 'duration_s' must be finite and > 0")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("Scenario parameter 't_step' must be finite and > 0")
+    step_count = int(np.ceil(duration / dt)) + 1
+    boundary_kind_name = str(boundary_kind).strip().lower()
+    static_boundary: BoundaryParameters | None = None
+    shape_trajectory = None
+    if boundary_kind_name == "static_parameters":
+        static_boundary = _boundary_parameters_from_mapping(boundary_parameters, field="boundary_parameters")
+        validate_boundary_parameters(static_boundary)
+    elif boundary_kind_name == "generated_parameters":
+        shape_trajectory = generate_boundary_parameter_trajectory(
+            step_count=step_count,
+            t_step=dt,
+            seed=int(seed),
+            target_update_s=float(target_update_s),
+            bounds=_boundary_bounds_from_mapping(boundary_bounds) if boundary_bounds is not None else BoundaryParameterBounds(
+                R0=(1.3266, 1.4756),
+                Z0=(-0.0496, 0.0137),
+                A0=(0.5200, 0.6641),
+                kappa=(1.1212, 1.4966),
+                delta=(0.1044, 0.3656),
+            ),
+            rate_limits=_boundary_rate_limits_from_mapping(boundary_rate_limits) if boundary_rate_limits is not None else BoundaryParameterRateLimits(
+                R0=0.30,
+                Z0=0.70,
+                A0=0.45,
+                kappa=1.20,
+                delta=0.80,
+            ),
+        )
+    else:
+        raise ValueError("Scenario parameter 'boundary_kind' must be generated_parameters or static_parameters")
+
+    ip_sources = [ip_csv is not None, ip_template_csv is not None, ip_template_dir is not None, bool(ip_segmented)]
+    if sum(1 for enabled in ip_sources if enabled) > 1:
+        raise ValueError(
+            "Scenario 't15_synthetic_follow' accepts only one Ip source: "
+            "ip_csv, ip_template_csv, ip_template_dir, or ip_segmented"
+        )
+
+    if bool(ip_segmented):
+        if time_offset is not None:
+            raise ValueError("Scenario parameter 'time_offset' is only valid with ip_csv")
+        if ip_min is None or ip_max is None:
+            raise ValueError("Segmented Ip generation requires ip_min and ip_max")
+        rng_seed = int(seed) + 1000003 if ip_seed is None else int(ip_seed)
+        ip_trajectory = generate_segmented_ip_reference(
+            seed=rng_seed,
+            config=SegmentedIpConfig(
+                value_bounds=(float(ip_min), float(ip_max)),
+                segment_step_bounds=(int(ip_segment_min_steps), int(ip_segment_max_steps)),
+                segment_count_bounds=(int(ip_segment_count_min), int(ip_segment_count_max)),
+                max_steps=step_count if ip_max_steps is None else int(ip_max_steps),
+                t_step=dt,
+                rate_limit=None if ip_rate_limit is None else float(ip_rate_limit),
+                hold_probability=float(ip_hold_probability),
+                start_value=ip_start,
+            ),
+        )
+
+        def _ip(t: float) -> float:
+            return ip_trajectory.at_time(float(t))
+    elif ip_csv is not None:
+        ip_trajectory = make_ip_reference_from_table(ip_csv, time_offset=time_offset)
+
+        def _ip(t: float) -> float:
+            return ip_trajectory.at_time(float(t))
+    elif ip_template_csv is not None or ip_template_dir is not None:
+        if time_offset is not None:
+            raise ValueError("Scenario parameter 'time_offset' is only valid with ip_csv")
+        rng_seed = int(seed) + 1000003 if ip_seed is None else int(ip_seed)
+        ip_config = SyntheticIpConfig(
+            amplitude_jitter=float(amplitude_jitter),
+            duration_jitter=float(duration_jitter),
+            shape_jitter=float(shape_jitter),
+            start_value=ip_start,
+        )
+        if ip_template_csv is not None:
+            template = load_semicolon_ip_table(ip_template_csv)
+            ip_trajectory = generate_ip_reference_from_template(
+                template,
+                rng=np.random.default_rng(rng_seed),
+                config=ip_config,
+            )
+        else:
+            templates = discover_ip_templates(ip_template_dir if ip_template_dir is not None else "")
+            ip_trajectory = generate_ip_reference_from_templates(
+                templates,
+                seed=rng_seed,
+                config=ip_config,
+            )
+
+        def _ip(t: float) -> float:
+            return ip_trajectory.at_time(float(t))
+    else:
+        ip0 = float(Ip0 if ip_start is None else ip_start)
+        ip1 = float(ip0 if ip_end is None else ip_end)
+        ramp_s = duration if ip_ramp_s is None else float(ip_ramp_s)
+        if not np.all(np.isfinite(np.array([ip0, ip1, ramp_s], dtype=float))):
+            raise ValueError("Ip parameters must be finite")
+        if ramp_s < 0.0:
+            raise ValueError("Scenario parameter 'ip_ramp_s' must be >= 0")
+
+        def _ip(t: float) -> float:
+            if ramp_s <= 0.0:
+                return ip1
+            alpha = float(np.clip(float(t) / ramp_s, 0.0, 1.0))
+            return float((1.0 - alpha) * ip0 + alpha * ip1)
+
+    def _r(angles: np.ndarray, t: float) -> np.ndarray:
+        params = static_boundary if static_boundary is not None else shape_trajectory.at_time(float(t))
+        return reference_radii_from_parameters(
+            params,
+            center=(float(center[0]), float(center[1])),
+            angles=np.asarray(angles, dtype=float),
+            theta_count=int(theta_count),
+        )
+
+    return Scenario("t15_synthetic_follow", _r, _ip)
+
+
+def _boundary_parameters_from_mapping(raw: Mapping[str, object] | None, *, field: str) -> BoundaryParameters:
+    if raw is None:
+        raise ValueError(f"{field} is required")
+    return BoundaryParameters(
+        R0=float(raw["R0"]),
+        Z0=float(raw["Z0"]),
+        A0=float(raw["A0"]),
+        kappa=float(raw["kappa"]),
+        delta=float(raw["delta"]),
+    )
+
+
+def _boundary_bounds_from_mapping(raw: Mapping[str, object]) -> BoundaryParameterBounds:
+    return BoundaryParameterBounds(
+        R0=_interval_from_mapping(raw, "R0"),
+        Z0=_interval_from_mapping(raw, "Z0"),
+        A0=_interval_from_mapping(raw, "A0"),
+        kappa=_interval_from_mapping(raw, "kappa"),
+        delta=_interval_from_mapping(raw, "delta"),
+    )
+
+
+def _boundary_rate_limits_from_mapping(raw: Mapping[str, object]) -> BoundaryParameterRateLimits:
+    return BoundaryParameterRateLimits(
+        R0=float(raw["R0"]),
+        Z0=float(raw["Z0"]),
+        A0=float(raw["A0"]),
+        kappa=float(raw["kappa"]),
+        delta=float(raw["delta"]),
+    )
+
+
+def _interval_from_mapping(raw: Mapping[str, object], name: str) -> tuple[float, float]:
+    value = raw[name]
+    if isinstance(value, Mapping):
+        return (float(value["min"]), float(value["max"]))
+    values = tuple(value)  # type: ignore[arg-type]
+    if len(values) != 2:
+        raise ValueError(f"boundary_bounds.{name} must contain two values")
+    return (float(values[0]), float(values[1]))
+
 def make_ip_follow(
     base_radii: np.ndarray,
     Ip0: float,
@@ -808,6 +1040,89 @@ def make_scenario(
             Ip0,
             ip_csv=ip_csv,
             boundary_mode=boundary_mode,
+        )
+
+
+    if name == "t15_synthetic_follow":
+        _require_params(
+            name,
+            params,
+            required=(),
+            optional=(
+                "reference_preset", "seed", "duration_s", "t_step", "target_update_s", "theta_count", "ip_csv", "time_offset",
+                "ip_template_csv", "ip_template_dir", "ip_seed", "amplitude_jitter", "duration_jitter", "shape_jitter",
+                "ip_segmented", "ip_min", "ip_max", "ip_segment_min_steps", "ip_segment_max_steps",
+                "ip_segment_count_min", "ip_segment_count_max", "ip_max_steps", "ip_rate_limit", "ip_hold_probability",
+                "ip_start", "ip_end", "ip_ramp_s", "boundary_kind", "boundary_parameters", "boundary_bounds",
+                "boundary_rate_limits",
+            ),
+        )
+        seed = 0 if "seed" not in params else int(_coerce_float_param(params, "seed"))
+        reference_preset = None if "reference_preset" not in params else str(params["reference_preset"])
+        duration_s = 1.0 if "duration_s" not in params else _coerce_float_param(params, "duration_s")
+        t_step = 1.0e-3 if "t_step" not in params else _coerce_float_param(params, "t_step")
+        target_update_s = 0.20 if "target_update_s" not in params else _coerce_float_param(params, "target_update_s")
+        theta_count = 512 if "theta_count" not in params else int(_coerce_float_param(params, "theta_count"))
+        ip_csv = None if "ip_csv" not in params else str(params["ip_csv"])
+        time_offset = None if "time_offset" not in params else _coerce_float_param(params, "time_offset")
+        ip_template_csv = None if "ip_template_csv" not in params else str(params["ip_template_csv"])
+        ip_template_dir = None if "ip_template_dir" not in params else str(params["ip_template_dir"])
+        ip_seed = None if "ip_seed" not in params else int(_coerce_float_param(params, "ip_seed"))
+        amplitude_jitter = 0.05 if "amplitude_jitter" not in params else _coerce_float_param(params, "amplitude_jitter")
+        duration_jitter = 0.05 if "duration_jitter" not in params else _coerce_float_param(params, "duration_jitter")
+        shape_jitter = 0.02 if "shape_jitter" not in params else _coerce_float_param(params, "shape_jitter")
+        ip_segmented = bool(params.get("ip_segmented", False))
+        ip_min = None if "ip_min" not in params else _coerce_float_param(params, "ip_min")
+        ip_max = None if "ip_max" not in params else _coerce_float_param(params, "ip_max")
+        ip_segment_min_steps = 50 if "ip_segment_min_steps" not in params else int(_coerce_float_param(params, "ip_segment_min_steps"))
+        ip_segment_max_steps = 300 if "ip_segment_max_steps" not in params else int(_coerce_float_param(params, "ip_segment_max_steps"))
+        ip_segment_count_min = 3 if "ip_segment_count_min" not in params else int(_coerce_float_param(params, "ip_segment_count_min"))
+        ip_segment_count_max = 8 if "ip_segment_count_max" not in params else int(_coerce_float_param(params, "ip_segment_count_max"))
+        ip_max_steps = None if "ip_max_steps" not in params else int(_coerce_float_param(params, "ip_max_steps"))
+        ip_rate_limit = None if "ip_rate_limit" not in params else _coerce_float_param(params, "ip_rate_limit")
+        ip_hold_probability = 0.35 if "ip_hold_probability" not in params else _coerce_float_param(params, "ip_hold_probability")
+        ip_start = None if "ip_start" not in params else _coerce_float_param(params, "ip_start")
+        ip_end = None if "ip_end" not in params else _coerce_float_param(params, "ip_end")
+        ip_ramp_s = None if "ip_ramp_s" not in params else _coerce_float_param(params, "ip_ramp_s")
+        boundary_kind = "generated_parameters" if "boundary_kind" not in params else str(params["boundary_kind"])
+        boundary_parameters = None if "boundary_parameters" not in params else params["boundary_parameters"]
+        boundary_bounds = None if "boundary_bounds" not in params else params["boundary_bounds"]
+        boundary_rate_limits = None if "boundary_rate_limits" not in params else params["boundary_rate_limits"]
+        return make_t15_synthetic_follow(
+            base_radii,
+            Ip0,
+            center=center,
+            reference_preset=reference_preset,
+            seed=seed,
+            duration_s=duration_s,
+            t_step=t_step,
+            target_update_s=target_update_s,
+            theta_count=theta_count,
+            ip_csv=ip_csv,
+            time_offset=time_offset,
+            ip_template_csv=ip_template_csv,
+            ip_template_dir=ip_template_dir,
+            ip_seed=ip_seed,
+            amplitude_jitter=amplitude_jitter,
+            duration_jitter=duration_jitter,
+            shape_jitter=shape_jitter,
+            ip_segmented=ip_segmented,
+            ip_min=ip_min,
+            ip_max=ip_max,
+            ip_segment_min_steps=ip_segment_min_steps,
+            ip_segment_max_steps=ip_segment_max_steps,
+            ip_segment_count_min=ip_segment_count_min,
+            ip_segment_count_max=ip_segment_count_max,
+            ip_max_steps=ip_max_steps,
+            ip_rate_limit=ip_rate_limit,
+            ip_hold_probability=ip_hold_probability,
+            ip_start=ip_start,
+            ip_end=ip_end,
+            ip_ramp_s=ip_ramp_s,
+            boundary_kind=boundary_kind,
+            boundary_parameters=boundary_parameters,
+            boundary_bounds=boundary_bounds,
+            boundary_rate_limits=boundary_rate_limits,
         )
 
     raise ValueError(f"Unknown scenario name: {name}")

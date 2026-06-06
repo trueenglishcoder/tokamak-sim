@@ -17,11 +17,12 @@ construct controller
 loop over steps:
   compute measured inputs from stored current boundary
   call controller
-  apply optional realism
+  apply optional actuator realism
   advance model
   apply disturbances
   recompute psi
   update boundary tracker through the selected physical boundary rule
+  compute optional measured sensor channels
   write state/reference/radii/boundary/event records
   stop cleanly if no physical boundary exists
 finalize RunWriter artifacts
@@ -33,7 +34,7 @@ finalize RunWriter artifacts
 
 `tokamak_control/bridge/` exposes a small reset/step session for external tools that need simulator state without invoking the artifact CLI. `SimulationSession` loads the same TOML configs, builds the same `PlasmaModel`, uses the same scenario system, accepts physical active-coil current derivatives, advances the model, and updates the physical boundary through `tokamak_control/geometry/boundary.py`.
 
-The bridge returns frozen dataclass snapshots with active-coil order, references, true `Ip`, active currents, commanded/applied derivatives, boundary polylines, sampled radii, and boundary-failure status. It does not own training algorithms, neural-network dependencies, policy loaders, plotting, or run-directory management.
+The bridge returns frozen dataclass snapshots with active-coil order, references, true and measured `Ip`, true and measured active currents, commanded/applied derivatives, true and measured boundary polylines, true and measured sampled radii, and boundary-failure status. It does not own training algorithms, neural-network dependencies, policy loaders, plotting, or run-directory management.
 
 `tokamak_control/metrics/` contains pure numerical diagnostics such as plasma-current error, sampled-radii RMSE, and actuator limit margins. These metrics are intentionally separate from rewards or controller objectives.
 
@@ -48,7 +49,7 @@ Important settings groups:
 - optional boundary mode and limiter name for physical boundary extraction
 - physical parameters such as `sigma`, `inductance_L`, `t_step`, `R0`, `Z0`
 - actuator lag and optional current/derivative limits
-- optional realism settings
+- optional neutral `[realism]` settings for actuator and sensor nonidealities
 
 Initial-current files live under `configs/initial_currents/`. They can define, per bank, both `active` masks and initial `currents`. Inactive actuators are removed from the runtime model dimensions, so controllers, replay tables, Green functions, and stored current vectors all see only active coils. If no initial-current file is provided, all configured coils are active with zero initial current.
 
@@ -70,6 +71,8 @@ If the selected rule cannot find a valid boundary, the finder raises `BoundaryNo
 
 `tokamak_control/geometry/coordinates.py` converts boundary polylines into radii sampled at measurement angles. Controllers and metrics use these sampled radii, while artifacts also store the found boundary polylines.
 
+`tokamak_control/geometry/parametric_boundary.py` contains the analytic reference-boundary primitive for `(R0, Z0, A0, kappa, delta)`. It validates generated boundaries, checks self-intersections and limiter containment, stores the robust replay-derived T15 value/rate limits, and generates deterministic rate-limited parameter trajectories for synthetic references. `tokamak_control/config/ip_trajectories.py` is the equivalent primitive for Ip references: real table loading, seeded template perturbation, table writing, and clamped interpolation.
+
 ## Scenarios
 
 `tokamak_control/config/scenarios.py` builds references for supported scenarios such as:
@@ -84,6 +87,7 @@ If the selected rule cannot find a valid boundary, the finder raises `BoundaryNo
 - `shot_follow`
 - `ip_table`
 - `ip_follow`
+- `t15_synthetic_follow`
 
 `ip_crash` is resolved at launch time into a disturbance on top of a normal scenario.
 
@@ -116,7 +120,8 @@ Important NPZ channels include:
 - `psi_final`: latest valid psi field
 - `boundary_poly_true`: physical boundary polylines found during the run
 - `boundary_poly_meas`: measured/noisy boundary polylines when realism is active
+- `Ip`, `Ip_meas`: true and measured plasma current when measured channels are recorded
+- `pfc_currents`, `pfc_currents_meas`, `sol_currents`, `sol_currents_meas`: true and measured active currents when measured channels are recorded
 - `radii_true`, `radii_meas`, `radii_ref`: sampled boundary radii
 
 Plotting helpers in `tokamak_control/viz/plotting.py` consume saved artifacts rather than reconstructing state from live Python objects or recomputing a separate plotting boundary.
-

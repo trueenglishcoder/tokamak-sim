@@ -14,6 +14,7 @@ from tokamak_control.core.coils import Coil, CoilActuator, CoilGroup
 from tokamak_control.config.settings import PhysicsSettings
 from tokamak_control.geometry.boundary import BoundaryMode
 from tokamak_control.geometry.limiters import get_limiter_shape
+from tokamak_control.realism import ActuatorRealismSettings, RealismSettings, SensorRealismSettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,7 @@ class LoadedConfig:
     pfc: CoilGroup
     sol: CoilGroup
     physics: PhysicsSettings
+    realism: RealismSettings = RealismSettings()
     boundary_mode: BoundaryMode = "limited"
     limiter_name: str | None = None
     limiter_shape: np.ndarray | None = None
@@ -71,6 +73,18 @@ def _coerce_int(value: object, name: str) -> int:
         except ValueError as exc:
             raise ValueError(f"{name} must be an integer") from exc
     raise ValueError(f"{name} must be an integer")
+
+
+def _coerce_bool(value: object, name: str) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in {"true", "1", "yes", "on"}:
+            return True
+        if low in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _coerce_boundary_mode(value: object, name: str) -> BoundaryMode:
@@ -212,6 +226,46 @@ def _coerce_actuator_elements(node: dict, name: str) -> list[np.ndarray]:
     return [positions[i : i + 1].copy() for i in range(positions.shape[0])]
 
 
+def _load_realism_settings(cfg: dict) -> RealismSettings:
+    """Read neutral realism settings from the top-level realism table."""
+    defaults = RealismSettings()
+    node = _require_mapping(cfg.get("realism", {}), "realism")
+    actuators_node = _require_mapping(node.get("actuators", {}), "realism.actuators")
+    sensors_node = _require_mapping(node.get("sensors", {}), "realism.sensors")
+
+    actuators = ActuatorRealismSettings(
+        pfc_delay_steps=_coerce_int(actuators_node.get("pfc_delay_steps", defaults.actuators.pfc_delay_steps), "realism.actuators.pfc_delay_steps"),
+        sol_delay_steps=_coerce_int(actuators_node.get("sol_delay_steps", defaults.actuators.sol_delay_steps), "realism.actuators.sol_delay_steps"),
+        pfc_gain_sigma=_coerce_float(actuators_node.get("pfc_gain_sigma", defaults.actuators.pfc_gain_sigma), "realism.actuators.pfc_gain_sigma"),
+        sol_gain_sigma=_coerce_float(actuators_node.get("sol_gain_sigma", defaults.actuators.sol_gain_sigma), "realism.actuators.sol_gain_sigma"),
+        pfc_bias_sigma=_coerce_float(actuators_node.get("pfc_bias_sigma", defaults.actuators.pfc_bias_sigma), "realism.actuators.pfc_bias_sigma"),
+        sol_bias_sigma=_coerce_float(actuators_node.get("sol_bias_sigma", defaults.actuators.sol_bias_sigma), "realism.actuators.sol_bias_sigma"),
+        pfc_command_noise_sigma=_coerce_float(actuators_node.get("pfc_command_noise_sigma", defaults.actuators.pfc_command_noise_sigma), "realism.actuators.pfc_command_noise_sigma"),
+        sol_command_noise_sigma=_coerce_float(actuators_node.get("sol_command_noise_sigma", defaults.actuators.sol_command_noise_sigma), "realism.actuators.sol_command_noise_sigma"),
+    )
+    sensors = SensorRealismSettings(
+        ip_noise_sigma=_coerce_float(sensors_node.get("ip_noise_sigma", defaults.sensors.ip_noise_sigma), "realism.sensors.ip_noise_sigma"),
+        ip_bias=_coerce_float(sensors_node.get("ip_bias", defaults.sensors.ip_bias), "realism.sensors.ip_bias"),
+        ip_bias_sigma=_coerce_float(sensors_node.get("ip_bias_sigma", defaults.sensors.ip_bias_sigma), "realism.sensors.ip_bias_sigma"),
+        ip_delay_steps=_coerce_int(sensors_node.get("ip_delay_steps", defaults.sensors.ip_delay_steps), "realism.sensors.ip_delay_steps"),
+        active_current_noise_sigma=_coerce_float(sensors_node.get("active_current_noise_sigma", defaults.sensors.active_current_noise_sigma), "realism.sensors.active_current_noise_sigma"),
+        active_current_bias_sigma=_coerce_float(sensors_node.get("active_current_bias_sigma", defaults.sensors.active_current_bias_sigma), "realism.sensors.active_current_bias_sigma"),
+        active_current_delay_steps=_coerce_int(sensors_node.get("active_current_delay_steps", defaults.sensors.active_current_delay_steps), "realism.sensors.active_current_delay_steps"),
+        radii_noise_sigma=_coerce_float(sensors_node.get("radii_noise_sigma", defaults.sensors.radii_noise_sigma), "realism.sensors.radii_noise_sigma"),
+        radii_bias_sigma=_coerce_float(sensors_node.get("radii_bias_sigma", defaults.sensors.radii_bias_sigma), "realism.sensors.radii_bias_sigma"),
+        radii_delay_steps=_coerce_int(sensors_node.get("radii_delay_steps", defaults.sensors.radii_delay_steps), "realism.sensors.radii_delay_steps"),
+        boundary_xy_noise_sigma=_coerce_float(sensors_node.get("boundary_xy_noise_sigma", defaults.sensors.boundary_xy_noise_sigma), "realism.sensors.boundary_xy_noise_sigma"),
+        boundary_delay_steps=_coerce_int(sensors_node.get("boundary_delay_steps", defaults.sensors.boundary_delay_steps), "realism.sensors.boundary_delay_steps"),
+        psi_noise_sigma=_coerce_float(sensors_node.get("psi_noise_sigma", defaults.sensors.psi_noise_sigma), "realism.sensors.psi_noise_sigma"),
+    )
+    return RealismSettings(
+        enabled=_coerce_bool(node.get("enabled", defaults.enabled), "realism.enabled"),
+        seed=(None if node.get("seed", defaults.seed) is None else _coerce_int(node.get("seed", defaults.seed), "realism.seed")),
+        actuators=actuators,
+        sensors=sensors,
+    )
+
+
 def load_config(path: str | Path, initial_currents_path: str | Path | None = None) -> LoadedConfig:
     """Load a TOML configuration and construct domain objects."""
     path = Path(path)
@@ -262,20 +316,11 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         ip_coupling_sol=_coerce_optional_tuple_floats(p.get("ip_coupling_sol", defaults.ip_coupling_sol), "physics.ip_coupling_sol"),
         pfc_deriv_limit=_coerce_optional_float(p.get("pfc_deriv_limit", defaults.pfc_deriv_limit), "physics.pfc_deriv_limit"),
         sol_deriv_limit=_coerce_optional_float(p.get("sol_deriv_limit", defaults.sol_deriv_limit), "physics.sol_deriv_limit"),
-        pfc_cmd_delay_steps=_coerce_int(p.get("pfc_cmd_delay_steps", defaults.pfc_cmd_delay_steps), "physics.pfc_cmd_delay_steps"),
-        sol_cmd_delay_steps=_coerce_int(p.get("sol_cmd_delay_steps", defaults.sol_cmd_delay_steps), "physics.sol_cmd_delay_steps"),
-        pfc_gain_sigma=_coerce_float(p.get("pfc_gain_sigma", defaults.pfc_gain_sigma), "physics.pfc_gain_sigma"),
-        sol_gain_sigma=_coerce_float(p.get("sol_gain_sigma", defaults.sol_gain_sigma), "physics.sol_gain_sigma"),
-        pfc_bias_sigma=_coerce_float(p.get("pfc_bias_sigma", defaults.pfc_bias_sigma), "physics.pfc_bias_sigma"),
-        sol_bias_sigma=_coerce_float(p.get("sol_bias_sigma", defaults.sol_bias_sigma), "physics.sol_bias_sigma"),
-        pfc_cmd_noise_sigma=_coerce_float(p.get("pfc_cmd_noise_sigma", defaults.pfc_cmd_noise_sigma), "physics.pfc_cmd_noise_sigma"),
-        sol_cmd_noise_sigma=_coerce_float(p.get("sol_cmd_noise_sigma", defaults.sol_cmd_noise_sigma), "physics.sol_cmd_noise_sigma"),
-        boundary_xy_noise_sigma=_coerce_float(p.get("boundary_xy_noise_sigma", defaults.boundary_xy_noise_sigma), "physics.boundary_xy_noise_sigma"),
-        boundary_delay_steps=_coerce_int(p.get("boundary_delay_steps", defaults.boundary_delay_steps), "physics.boundary_delay_steps"),
-        psi_noise_sigma=_coerce_float(p.get("psi_noise_sigma", defaults.psi_noise_sigma), "physics.psi_noise_sigma"),
-        realism_seed=(None if p.get("realism_seed", defaults.realism_seed) is None else _coerce_int(p.get("realism_seed", defaults.realism_seed), "physics.realism_seed")),
     )
     physics.validate()
+
+    realism = _load_realism_settings(cfg)
+    realism.validate()
 
     c = _require_mapping(cfg.get("coils", {}), "coils")
     pfc_cfg = _require_mapping(_require_key(c, "pfc", "coils"), "coils.pfc")
@@ -368,6 +413,7 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         pfc=pfc,
         sol=sol,
         physics=physics,
+        realism=realism,
         boundary_mode=boundary_mode,
         limiter_name=limiter_name,
         limiter_shape=limiter_shape,
@@ -383,12 +429,15 @@ def dump_config(
     pfc: CoilGroup,
     sol: CoilGroup,
     physics: PhysicsSettings,
+    realism: RealismSettings | None = None,
     limiter_name: str | None = None,
     boundary_mode: BoundaryMode = "limited",
 ) -> None:
     """Записать TOML-конфигурацию текущей расчетной схемы."""
     path = Path(path)
     physics.validate()
+    realism = RealismSettings() if realism is None else realism
+    realism.validate()
 
     data = {
         "version": 1,
@@ -413,18 +462,35 @@ def dump_config(
             "ip_coupling_sol": list(physics.ip_coupling_sol) if physics.ip_coupling_sol is not None else None,
             "pfc_deriv_limit": physics.pfc_deriv_limit,
             "sol_deriv_limit": physics.sol_deriv_limit,
-            "pfc_cmd_delay_steps": physics.pfc_cmd_delay_steps,
-            "sol_cmd_delay_steps": physics.sol_cmd_delay_steps,
-            "pfc_gain_sigma": physics.pfc_gain_sigma,
-            "sol_gain_sigma": physics.sol_gain_sigma,
-            "pfc_bias_sigma": physics.pfc_bias_sigma,
-            "sol_bias_sigma": physics.sol_bias_sigma,
-            "pfc_cmd_noise_sigma": physics.pfc_cmd_noise_sigma,
-            "sol_cmd_noise_sigma": physics.sol_cmd_noise_sigma,
-            "boundary_xy_noise_sigma": physics.boundary_xy_noise_sigma,
-            "boundary_delay_steps": physics.boundary_delay_steps,
-            "psi_noise_sigma": physics.psi_noise_sigma,
-            "realism_seed": physics.realism_seed,
+        },
+        "realism": {
+            "enabled": realism.enabled,
+            "seed": realism.seed,
+            "actuators": {
+                "pfc_delay_steps": realism.actuators.pfc_delay_steps,
+                "sol_delay_steps": realism.actuators.sol_delay_steps,
+                "pfc_gain_sigma": realism.actuators.pfc_gain_sigma,
+                "sol_gain_sigma": realism.actuators.sol_gain_sigma,
+                "pfc_bias_sigma": realism.actuators.pfc_bias_sigma,
+                "sol_bias_sigma": realism.actuators.sol_bias_sigma,
+                "pfc_command_noise_sigma": realism.actuators.pfc_command_noise_sigma,
+                "sol_command_noise_sigma": realism.actuators.sol_command_noise_sigma,
+            },
+            "sensors": {
+                "ip_noise_sigma": realism.sensors.ip_noise_sigma,
+                "ip_bias": realism.sensors.ip_bias,
+                "ip_bias_sigma": realism.sensors.ip_bias_sigma,
+                "ip_delay_steps": realism.sensors.ip_delay_steps,
+                "active_current_noise_sigma": realism.sensors.active_current_noise_sigma,
+                "active_current_bias_sigma": realism.sensors.active_current_bias_sigma,
+                "active_current_delay_steps": realism.sensors.active_current_delay_steps,
+                "radii_noise_sigma": realism.sensors.radii_noise_sigma,
+                "radii_bias_sigma": realism.sensors.radii_bias_sigma,
+                "radii_delay_steps": realism.sensors.radii_delay_steps,
+                "boundary_xy_noise_sigma": realism.sensors.boundary_xy_noise_sigma,
+                "boundary_delay_steps": realism.sensors.boundary_delay_steps,
+                "psi_noise_sigma": realism.sensors.psi_noise_sigma,
+            },
         },
         "boundary": {
             "mode": str(boundary_mode),

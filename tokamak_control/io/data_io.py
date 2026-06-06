@@ -107,6 +107,9 @@ class RunWriter:
     _track_boundary_poly_true: bool = field(default=False, init=False)
     _track_boundary_poly_meas: bool = field(default=False, init=False)
     _track_Ip_ref: bool = field(default=False, init=False)
+    _track_Ip_meas: bool = field(default=False, init=False)
+    _track_pfc_currents_meas: bool = field(default=False, init=False)
+    _track_sol_currents_meas: bool = field(default=False, init=False)
     _track_radii_ref: bool = field(default=False, init=False)
 
     _pfc_dJ_cmd: list[np.ndarray] = field(default_factory=list, init=False)
@@ -120,6 +123,9 @@ class RunWriter:
     _boundary_poly_meas: list[np.ndarray] = field(default_factory=list, init=False)
     _radii_ref: list[np.ndarray] = field(default_factory=list, init=False)
     _Ip_ref: list[float] = field(default_factory=list, init=False)
+    _Ip_meas: list[float] = field(default_factory=list, init=False)
+    _pfc_currents_meas: list[np.ndarray] = field(default_factory=list, init=False)
+    _sol_currents_meas: list[np.ndarray] = field(default_factory=list, init=False)
 
     _n_pfc: int | None = field(default=None, init=False)
     _n_sol: int | None = field(default=None, init=False)
@@ -213,6 +219,9 @@ class RunWriter:
         psi_latest = extra.get("psi_latest", None)
         radii_ref = extra.get("radii_ref", None)
         Ip_ref = extra.get("Ip_ref", None)
+        Ip_meas = extra.get("Ip_meas", None)
+        pfc_currents_meas = extra.get("pfc_currents_meas", None)
+        sol_currents_meas = extra.get("sol_currents_meas", None)
 
         if pfc_cmd is not None and not self._track_pfc_cmd:
             self._track_pfc_cmd = True
@@ -324,6 +333,37 @@ class RunWriter:
         if self._track_Ip_ref:
             self._Ip_ref.append(float(Ip_ref) if Ip_ref is not None else np.nan)
 
+        if Ip_meas is not None and not self._track_Ip_meas:
+            self._track_Ip_meas = True
+            while len(self._Ip_meas) < step_index:
+                self._Ip_meas.append(np.nan)
+        if self._track_Ip_meas:
+            self._Ip_meas.append(float(Ip_meas) if Ip_meas is not None else np.nan)
+
+        if pfc_currents_meas is not None and not self._track_pfc_currents_meas:
+            self._track_pfc_currents_meas = True
+            self._ensure_len(self._pfc_currents_meas, step_index, _nan_vec(self._n_pfc or 0))
+        if self._track_pfc_currents_meas:
+            if pfc_currents_meas is None:
+                self._pfc_currents_meas.append(_nan_vec(self._n_pfc or 0))
+            else:
+                v = np.asarray(pfc_currents_meas, dtype=float).copy()
+                if v.shape != (self._n_pfc,):
+                    raise ValueError(f"pfc_currents_meas shape {v.shape} != ({self._n_pfc},)")
+                self._pfc_currents_meas.append(v)
+
+        if sol_currents_meas is not None and not self._track_sol_currents_meas:
+            self._track_sol_currents_meas = True
+            self._ensure_len(self._sol_currents_meas, step_index, _nan_vec(self._n_sol or 0))
+        if self._track_sol_currents_meas:
+            if sol_currents_meas is None:
+                self._sol_currents_meas.append(_nan_vec(self._n_sol or 0))
+            else:
+                v = np.asarray(sol_currents_meas, dtype=float).copy()
+                if v.shape != (self._n_sol,):
+                    raise ValueError(f"sol_currents_meas shape {v.shape} != ({self._n_sol},)")
+                self._sol_currents_meas.append(v)
+
         if radii_ref is not None and not self._track_radii_ref:
             self._track_radii_ref = True
             v0 = np.asarray(radii_ref, dtype=float).ravel()
@@ -417,6 +457,12 @@ class RunWriter:
 
         if "Ip_ref" in payload:
             columns.append(("Ip_ref", np.asarray(payload["Ip_ref"], dtype=float)))
+        if "Ip_meas" in payload:
+            columns.append(("Ip_meas", np.asarray(payload["Ip_meas"], dtype=float)))
+        if "pfc_currents_meas" in payload:
+            add_vector_matrix("pfc_current_meas", np.asarray(payload["pfc_currents_meas"], dtype=float))
+        if "sol_currents_meas" in payload:
+            add_vector_matrix("sol_current_meas", np.asarray(payload["sol_currents_meas"], dtype=float))
         if "pfc_derivs_cmd" in payload:
             add_vector_matrix("pfc_deriv_cmd", np.asarray(payload["pfc_derivs_cmd"], dtype=float))
         if "sol_derivs_cmd" in payload:
@@ -524,6 +570,12 @@ class RunWriter:
             payload["boundary_poly_meas"] = _stack_list_of_polylines(self._boundary_poly_meas)
         if self._track_Ip_ref:
             payload["Ip_ref"] = np.asarray(self._Ip_ref, dtype=float)
+        if self._track_Ip_meas:
+            payload["Ip_meas"] = np.asarray(self._Ip_meas, dtype=float)
+        if self._track_pfc_currents_meas:
+            payload["pfc_currents_meas"] = _stack_list_of_vectors(self._pfc_currents_meas)
+        if self._track_sol_currents_meas:
+            payload["sol_currents_meas"] = _stack_list_of_vectors(self._sol_currents_meas)
         if self._track_radii_ref:
             payload["radii_ref"] = _stack_list_of_vectors(self._radii_ref)
 
@@ -598,6 +650,9 @@ def load_run(npz_path: str | Path) -> dict[str, object]:
             "boundary_poly_true",
             "boundary_poly_meas",
             "Ip_ref",
+            "Ip_meas",
+            "pfc_currents_meas",
+            "sol_currents_meas",
             "radii_ref",
         ):
             if key in files:
