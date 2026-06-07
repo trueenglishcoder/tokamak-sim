@@ -350,6 +350,15 @@ def _apply_initial_state_override(cfg: LoadedConfig, override: InitialStateOverr
     if override.coil_currents == "zero":
         pfc = CoilGroup(name=cfg.pfc.name, coils=list(cfg.pfc.coils), currents=np.zeros((cfg.pfc.n_coils,), dtype=float))
         sol = CoilGroup(name=cfg.sol.name, coils=list(cfg.sol.coils), currents=np.zeros((cfg.sol.n_coils,), dtype=float))
+    elif override.coil_currents == "explicit":
+        pfc_values = np.asarray(override.pfc_currents, dtype=float).reshape(-1)
+        sol_values = np.asarray(override.sol_currents, dtype=float).reshape(-1)
+        if pfc_values.shape != (cfg.pfc.n_coils,):
+            raise ValueError(f"initial override pfc_currents shape {pfc_values.shape} != ({cfg.pfc.n_coils},)")
+        if sol_values.shape != (cfg.sol.n_coils,):
+            raise ValueError(f"initial override sol_currents shape {sol_values.shape} != ({cfg.sol.n_coils},)")
+        pfc = CoilGroup(name=cfg.pfc.name, coils=list(cfg.pfc.coils), currents=pfc_values.copy())
+        sol = CoilGroup(name=cfg.sol.name, coils=list(cfg.sol.coils), currents=sol_values.copy())
     return replace(cfg, physics=physics, pfc=pfc, sol=sol)
 
 
@@ -361,6 +370,8 @@ def _initial_state_override_metadata(override: InitialStateOverride | None) -> d
         "ip": None if override.ip is None else float(override.ip),
         "coil_currents": str(override.coil_currents),
         "ip_scale": None if override.ip_scale is None else float(override.ip_scale),
+        "pfc_currents": None if override.pfc_currents is None else np.asarray(override.pfc_currents, dtype=float).tolist(),
+        "sol_currents": None if override.sol_currents is None else np.asarray(override.sol_currents, dtype=float).tolist(),
     }
 
 

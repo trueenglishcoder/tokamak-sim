@@ -39,12 +39,24 @@ class InitialStateOverride:
     ip: float | None = None
     coil_currents: str = "config"
     ip_scale: float | None = None
+    pfc_currents: np.ndarray | None = None
+    sol_currents: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.ip is not None and not np.isfinite(float(self.ip)):
             raise ValueError("initial override ip must be finite when provided")
-        if str(self.coil_currents) not in {"config", "zero"}:
-            raise ValueError("initial override coil_currents must be 'config' or 'zero'")
+        if str(self.coil_currents) not in {"config", "zero", "explicit"}:
+            raise ValueError("initial override coil_currents must be 'config', 'zero', or 'explicit'")
+        for name in ("pfc_currents", "sol_currents"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            arr = np.asarray(value, dtype=float).reshape(-1)
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"initial override {name} must contain only finite values")
+            object.__setattr__(self, name, arr.copy())
+        if str(self.coil_currents) == "explicit" and (self.pfc_currents is None or self.sol_currents is None):
+            raise ValueError("explicit initial override coil_currents requires pfc_currents and sol_currents")
         if self.ip_scale is not None:
             scale = float(self.ip_scale)
             if not np.isfinite(scale) or scale <= 0.0:
