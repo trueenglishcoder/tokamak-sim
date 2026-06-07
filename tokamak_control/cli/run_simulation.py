@@ -90,7 +90,7 @@ class RunResult:
 class _BoundaryTracker:
     """Хранит текущий физически найденный контур плазмы во время расчета."""
 
-    poly: np.ndarray
+    poly: np.ndarray | None
     level: float
     status: str
     fail_reason: str | None
@@ -377,15 +377,18 @@ def _prepare(
     psi0 = model.compute_psi()
     center = (model.R0, model.Z0)
 
-    boundary0, _level0, _status0 = find_plasma_boundary_with_status(
-        psi0,
-        model.grid,
-        center,
-        n_levels=80 if cfg.limiter_shape is not None else 10,
-        limiter_shape=cfg.limiter_shape,
-        boundary_mode=cfg.boundary_mode,
-    )
-    base_radii = radii_from_polyline_ray_intersections(boundary0, center, angles)
+    try:
+        boundary0, _level0, _status0 = find_plasma_boundary_with_status(
+            psi0,
+            model.grid,
+            center,
+            n_levels=80 if cfg.limiter_shape is not None else 10,
+            limiter_shape=cfg.limiter_shape,
+            boundary_mode=cfg.boundary_mode,
+        )
+        base_radii = radii_from_polyline_ray_intersections(boundary0, center, angles)
+    except BoundaryNotFoundError:
+        base_radii = np.full((angles.shape[0],), np.nan, dtype=float)
 
     scenario = make_scenario(
         scenario_name,
@@ -545,21 +548,30 @@ def _initial_boundary_tracker(
     """Найти начальный физический контур плазмы."""
     with run_profiler.time_block("initial_boundary"):
         _ = logger
-        poly, level, status = find_plasma_boundary_with_status(
-            psi_true,
-            model.grid,
-            center,
-            n_levels=80 if limiter_shape is not None else 10,
-            target_mean_radius=target_mean_radius,
-            limiter_shape=limiter_shape,
-            boundary_mode=boundary_mode,
-        )
-        return _BoundaryTracker(
-            poly=poly,
-            level=float(level),
-            status=status,
-            fail_reason=None,
-        )
+        try:
+            poly, level, status = find_plasma_boundary_with_status(
+                psi_true,
+                model.grid,
+                center,
+                n_levels=80 if limiter_shape is not None else 10,
+                target_mean_radius=target_mean_radius,
+                limiter_shape=limiter_shape,
+                boundary_mode=boundary_mode,
+            )
+            return _BoundaryTracker(
+                poly=poly,
+                level=float(level),
+                status=status,
+                fail_reason=None,
+            )
+        except BoundaryNotFoundError as exc:
+            return _BoundaryTracker(
+                poly=None,
+                level=float("nan"),
+                status="not_found",
+                fail_reason=str(exc),
+                found=False,
+            )
 
 
 def _scenario_refs(scenario: Scenario, angles: np.ndarray, t_now: float) -> _StepRefs:
@@ -578,7 +590,7 @@ def _sensor_measurements(
     realism: RealismRuntime | None,
     model: PlasmaModel,
     psi_true: np.ndarray,
-    boundary_poly: np.ndarray,
+    boundary_poly: np.ndarray | None,
     radii_true: np.ndarray,
     center: tuple[float, float],
     angles: np.ndarray,
@@ -594,13 +606,14 @@ def _sensor_measurements(
         np.asarray(state.sol_currents, dtype=float).reshape(-1),
     ])
     if realism is None:
+        true_boundary_poly = None if boundary_poly is None else np.asarray(boundary_poly, dtype=float).copy()
         return SensorRealismResult(
             true_ip=float(state.Ip),
             measured_ip=float(state.Ip),
             true_active_currents=true_currents,
             measured_active_currents=true_currents.copy(),
-            true_boundary_poly=np.asarray(boundary_poly, dtype=float).copy(),
-            measured_boundary_poly=np.asarray(boundary_poly, dtype=float).copy(),
+            true_boundary_poly=true_boundary_poly,
+            measured_boundary_poly=None if true_boundary_poly is None else true_boundary_poly.copy(),
             true_radii=np.asarray(radii_true, dtype=float).reshape(-1).copy(),
             measured_radii=np.asarray(radii_true, dtype=float).reshape(-1).copy(),
             true_psi=np.asarray(psi_true, dtype=float).copy(),
@@ -627,7 +640,7 @@ def _compute_controller_commands(
     controller_name: str,
     model: PlasmaModel,
     psi_meas: np.ndarray,
-    boundary_meas: np.ndarray,
+    boundary_meas: np.ndarray | None,
     center: tuple[float, float],
     angles: np.ndarray,
     refs: _StepRefs,
@@ -714,23 +727,30 @@ def _update_boundary_tracker(
     """Обновить найденный контур плазмы после шага модели."""
     with run_profiler.time_block("step_boundary_post"):
         _ = (logger, verbose, step_index)
-        poly, level, status = find_plasma_boundary_with_status(
-            psi_true,
-            model.grid,
-            center,
-            prev_level=tracker.level,
-            prev_poly=tracker.poly,
-            local_n_levels=7,
-            local_span_frac=0.02,
-            target_mean_radius=refs.target_mean_radius,
-            limiter_shape=limiter_shape,
-            boundary_mode=boundary_mode,
-        )
-        tracker.poly = poly
-        tracker.level = float(level)
-        tracker.status = status
-        tracker.fail_reason = None
-        tracker.found = True
+        try:
+            poly, level, status = find_plasma_boundary_with_status(
+                psi_true,
+                model.grid,
+                center,
+                prev_level=tracker.level if np.isfinite(tracker.level) else None,
+                prev_poly=tracker.poly,
+                local_n_levels=7,
+                local_span_frac=0.02,
+                target_mean_radius=refs.target_mean_radius,
+                limiter_shape=limiter_shape,
+                boundary_mode=boundary_mode,
+            )
+            tracker.poly = poly
+            tracker.level = float(level)
+            tracker.status = status
+            tracker.fail_reason = None
+            tracker.found = True
+        except BoundaryNotFoundError as exc:
+            tracker.poly = None
+            tracker.level = float("nan")
+            tracker.status = "not_found"
+            tracker.fail_reason = str(exc)
+            tracker.found = False
 
 
 def _build_step_record(
@@ -748,7 +768,11 @@ def _build_step_record(
 ) -> _StepRecord:
     """Собрать данные шага перед записью в RunWriter."""
     with run_profiler.time_block("step_radii_true"):
-        radii_true = radii_from_polyline_ray_intersections(tracker.poly, center, angles)
+        radii_true = (
+            radii_from_polyline_ray_intersections(tracker.poly, center, angles)
+            if tracker.poly is not None
+            else np.full((angles.shape[0],), np.nan, dtype=float)
+        )
     if sensors.true_radii is None or not np.allclose(np.asarray(sensors.true_radii, dtype=float), radii_true, equal_nan=True):
         sensors = SensorRealismResult(
             true_ip=sensors.true_ip,
@@ -862,7 +886,11 @@ def _run_single_step(
     """Выполнить один полный шаг замкнутой симуляции."""
     with run_profiler.time_block("step_scenario"):
         refs = _scenario_refs(scenario, angles, float(model.state.t))
-    radii_pre = radii_from_polyline_ray_intersections(tracker.poly, center, angles)
+    radii_pre = (
+        radii_from_polyline_ray_intersections(tracker.poly, center, angles)
+        if tracker.poly is not None
+        else np.full((angles.shape[0],), np.nan, dtype=float)
+    )
     sensors_pre = _sensor_measurements(
         realism=realism,
         model=model,
@@ -876,14 +904,13 @@ def _run_single_step(
         run_profiler=run_profiler,
         profile_key="step_measurements_pre",
     )
-    if sensors_pre.measured_boundary_poly is None:
-        raise BoundaryNotFoundError("Measured plasma boundary unavailable under realism")
+    boundary_meas = None if sensors_pre.measured_boundary_poly is None else np.asarray(sensors_pre.measured_boundary_poly, dtype=float)
     pfc_cmd, sol_cmd = _compute_controller_commands(
         controller=controller,
         controller_name=controller_name,
         model=model,
         psi_meas=np.asarray(sensors_pre.measured_psi if sensors_pre.measured_psi is not None else psi_true, dtype=float),
-        boundary_meas=np.asarray(sensors_pre.measured_boundary_poly, dtype=float),
+        boundary_meas=boundary_meas,
         center=center,
         angles=angles,
         refs=refs,
@@ -917,7 +944,11 @@ def _run_single_step(
         step_index=step_index,
         run_profiler=run_profiler,
     )
-    radii_post = radii_from_polyline_ray_intersections(tracker.poly, center, angles)
+    radii_post = (
+        radii_from_polyline_ray_intersections(tracker.poly, center, angles)
+        if tracker.poly is not None
+        else np.full((angles.shape[0],), np.nan, dtype=float)
+    )
     sensors_post = _sensor_measurements(
         realism=realism,
         model=model,

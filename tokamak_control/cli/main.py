@@ -27,6 +27,9 @@ _SCENARIO_CHOICES = (
     "ip_table",
     "ip_follow",
     "t15_synthetic_follow",
+    "t15_training_circle_static",
+    "t15_training_circle_ip_scaled",
+    "t15_training_replay_start_3859",
     "ip_crash",
 )
 

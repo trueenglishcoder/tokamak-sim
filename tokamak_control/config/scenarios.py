@@ -39,6 +39,9 @@ ScenarioName = Literal[
     "ip_table",
     "ip_follow",
     "t15_synthetic_follow",
+    "t15_training_circle_static",
+    "t15_training_circle_ip_scaled",
+    "t15_training_replay_start_3859",
 ]
 
 
@@ -583,6 +586,7 @@ def make_t15_synthetic_follow(
     ip_ramp_s: float | None = None,
     boundary_kind: str = "generated_parameters",
     boundary_parameters: Mapping[str, object] | None = None,
+    boundary_initial_parameters: Mapping[str, object] | None = None,
     boundary_bounds: Mapping[str, object] | None = None,
     boundary_rate_limits: Mapping[str, object] | None = None,
 ) -> Scenario:
@@ -627,6 +631,11 @@ def make_t15_synthetic_follow(
                 A0=0.45,
                 kappa=1.20,
                 delta=0.80,
+            ),
+            initial_parameters=(
+                None
+                if boundary_initial_parameters is None
+                else _boundary_parameters_from_mapping(boundary_initial_parameters, field="boundary_initial_parameters")
             ),
         )
     else:
@@ -718,6 +727,146 @@ def make_t15_synthetic_follow(
         )
 
     return Scenario("t15_synthetic_follow", _r, _ip)
+
+
+
+_T15_REPLAY_START_3859_IP = 124844.69119195438
+_T15_REPLAY_START_3859_BOUNDARY = {
+    "R0": 1.411347297587252,
+    "Z0": -0.0034510165353685133,
+    "A0": 0.6100682302704028,
+    "kappa": 1.1120020187817363,
+    "delta": 0.0993730470809749,
+}
+_T15_REPLAY_OBSERVED_BOUNDS = {
+    "R0": (1.3108, 1.4767),
+    "Z0": (-0.0612, 0.0143),
+    "A0": (0.5045, 0.6649),
+    "kappa": (1.1108, 1.5734),
+    "delta": (0.0992, 0.3989),
+}
+_T15_REPLAY_RATE_LIMITS = {
+    "R0": 0.30,
+    "Z0": 0.70,
+    "A0": 0.45,
+    "kappa": 1.20,
+    "delta": 0.80,
+}
+
+
+def make_t15_training_replay_start_3859(
+    base_radii: np.ndarray,
+    *,
+    center: tuple[float, float],
+    seed: int = 21,
+    ip_seed: int = 202,
+    duration_s: float = 1.0,
+    t_step: float = 1.0e-3,
+    target_update_s: float = 0.20,
+    theta_count: int = 512,
+    ip_hold_probability: float = 0.0,
+) -> Scenario:
+    """T15 training-style reference anchored to replay 3859's initial state."""
+    return make_t15_synthetic_follow(
+        base_radii,
+        _T15_REPLAY_START_3859_IP,
+        center=center,
+        seed=int(seed),
+        duration_s=float(duration_s),
+        t_step=float(t_step),
+        target_update_s=float(target_update_s),
+        theta_count=int(theta_count),
+        ip_segmented=True,
+        ip_seed=int(ip_seed),
+        ip_min=112947.0,
+        ip_max=414434.0,
+        ip_segment_min_steps=80,
+        ip_segment_max_steps=250,
+        ip_segment_count_min=3,
+        ip_segment_count_max=6,
+        ip_max_steps=1439,
+        ip_rate_limit=8000000.0,
+        ip_hold_probability=float(ip_hold_probability),
+        ip_start=_T15_REPLAY_START_3859_IP,
+        boundary_kind="generated_parameters",
+        boundary_initial_parameters=_T15_REPLAY_START_3859_BOUNDARY,
+        boundary_bounds=_T15_REPLAY_OBSERVED_BOUNDS,
+        boundary_rate_limits=_T15_REPLAY_RATE_LIMITS,
+    )
+
+
+def make_t15_training_circle_ip_scaled(
+    *,
+    center: tuple[float, float],
+    seed: int = 21,
+    ip_seed: int = 202,
+    duration_s: float = 1.0,
+    t_step: float = 1.0e-3,
+    ip_min: float = 112947.0,
+    ip_max: float = 414434.0,
+    ip_segment_min_steps: int = 80,
+    ip_segment_max_steps: int = 250,
+    ip_segment_count_min: int = 3,
+    ip_segment_count_max: int = 6,
+    ip_max_steps: int = 1439,
+    ip_rate_limit: float = 8000000.0,
+    ip_hold_probability: float = 0.0,
+    ip_start: float = 0.0,
+    a0_intercept: float = 0.558330912696,
+    a0_slope: float = 2.03086959551e-7,
+    formation_ip: float = 124750.0,
+    a0_floor: float = 1.0e-6,
+) -> Scenario:
+    """T15 training scenario with a circular boundary radius tied to Ip_ref."""
+    del seed
+    if not np.all(np.isfinite(np.asarray(center, dtype=float))):
+        raise ValueError("Scenario 't15_training_circle_ip_scaled' requires a finite center")
+    duration = float(duration_s)
+    dt = float(t_step)
+    if not np.isfinite(duration) or duration <= 0.0:
+        raise ValueError("Scenario parameter 'duration_s' must be finite and > 0")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("Scenario parameter 't_step' must be finite and > 0")
+    step_count = int(np.ceil(duration / dt)) + 1
+    ip_trajectory = generate_segmented_ip_reference(
+        seed=int(ip_seed),
+        config=SegmentedIpConfig(
+            value_bounds=(float(ip_min), float(ip_max)),
+            segment_step_bounds=(int(ip_segment_min_steps), int(ip_segment_max_steps)),
+            segment_count_bounds=(int(ip_segment_count_min), int(ip_segment_count_max)),
+            max_steps=step_count if ip_max_steps is None else int(ip_max_steps),
+            t_step=dt,
+            rate_limit=None if ip_rate_limit is None else float(ip_rate_limit),
+            hold_probability=float(ip_hold_probability),
+            start_value=float(ip_start),
+        ),
+    )
+    intercept = float(a0_intercept)
+    slope = float(a0_slope)
+    threshold = float(formation_ip)
+    floor = float(a0_floor)
+    if not np.all(np.isfinite(np.array([intercept, slope, threshold, floor], dtype=float))):
+        raise ValueError("A0 scaling parameters must be finite")
+    if threshold <= 0.0:
+        raise ValueError("formation_ip must be > 0")
+    if floor <= 0.0:
+        raise ValueError("a0_floor must be > 0")
+
+    def _ip(t: float) -> float:
+        return ip_trajectory.at_time(float(t))
+
+    def _a0_from_ip(ip: float) -> float:
+        ip_nonnegative = max(float(ip), 0.0)
+        formed_a0 = max(intercept + slope * threshold, floor)
+        if ip_nonnegative < threshold:
+            return max(floor, formed_a0 * ip_nonnegative / threshold)
+        return max(floor, intercept + slope * ip_nonnegative)
+
+    def _r(angles: np.ndarray, t: float) -> np.ndarray:
+        a0 = _a0_from_ip(_ip(float(t)))
+        return np.full(np.asarray(angles, dtype=float).shape, a0, dtype=float)
+
+    return Scenario("t15_training_circle_ip_scaled", _r, _ip)
 
 
 def _boundary_parameters_from_mapping(raw: Mapping[str, object] | None, *, field: str) -> BoundaryParameters:
@@ -1053,7 +1202,7 @@ def make_scenario(
                 "ip_template_csv", "ip_template_dir", "ip_seed", "amplitude_jitter", "duration_jitter", "shape_jitter",
                 "ip_segmented", "ip_min", "ip_max", "ip_segment_min_steps", "ip_segment_max_steps",
                 "ip_segment_count_min", "ip_segment_count_max", "ip_max_steps", "ip_rate_limit", "ip_hold_probability",
-                "ip_start", "ip_end", "ip_ramp_s", "boundary_kind", "boundary_parameters", "boundary_bounds",
+                "ip_start", "ip_end", "ip_ramp_s", "boundary_kind", "boundary_parameters", "boundary_initial_parameters", "boundary_bounds",
                 "boundary_rate_limits",
             ),
         )
@@ -1086,6 +1235,7 @@ def make_scenario(
         ip_ramp_s = None if "ip_ramp_s" not in params else _coerce_float_param(params, "ip_ramp_s")
         boundary_kind = "generated_parameters" if "boundary_kind" not in params else str(params["boundary_kind"])
         boundary_parameters = None if "boundary_parameters" not in params else params["boundary_parameters"]
+        boundary_initial_parameters = None if "boundary_initial_parameters" not in params else params["boundary_initial_parameters"]
         boundary_bounds = None if "boundary_bounds" not in params else params["boundary_bounds"]
         boundary_rate_limits = None if "boundary_rate_limits" not in params else params["boundary_rate_limits"]
         return make_t15_synthetic_follow(
@@ -1121,8 +1271,98 @@ def make_scenario(
             ip_ramp_s=ip_ramp_s,
             boundary_kind=boundary_kind,
             boundary_parameters=boundary_parameters,
+            boundary_initial_parameters=boundary_initial_parameters,
             boundary_bounds=boundary_bounds,
             boundary_rate_limits=boundary_rate_limits,
+        )
+
+    if name == "t15_training_circle_static":
+        _require_params(
+            name,
+            params,
+            required=(),
+            optional=("seed", "ip_seed", "duration_s", "t_step", "target_update_s", "theta_count", "ip_hold_probability"),
+        )
+        seed = 21 if "seed" not in params else int(_coerce_float_param(params, "seed"))
+        ip_seed = 202 if "ip_seed" not in params else int(_coerce_float_param(params, "ip_seed"))
+        duration_s = 1.0 if "duration_s" not in params else _coerce_float_param(params, "duration_s")
+        t_step = 1.0e-3 if "t_step" not in params else _coerce_float_param(params, "t_step")
+        target_update_s = 0.20 if "target_update_s" not in params else _coerce_float_param(params, "target_update_s")
+        theta_count = 512 if "theta_count" not in params else int(_coerce_float_param(params, "theta_count"))
+        ip_hold_probability = 0.0 if "ip_hold_probability" not in params else _coerce_float_param(params, "ip_hold_probability")
+        return make_t15_synthetic_follow(
+            base_radii,
+            Ip0,
+            center=center,
+            reference_preset="circle_static_boundary",
+            seed=seed,
+            duration_s=duration_s,
+            t_step=t_step,
+            target_update_s=target_update_s,
+            theta_count=theta_count,
+            ip_segmented=True,
+            ip_seed=ip_seed,
+            ip_min=112947.0,
+            ip_max=414434.0,
+            ip_segment_min_steps=80,
+            ip_segment_max_steps=250,
+            ip_segment_count_min=3,
+            ip_segment_count_max=6,
+            ip_max_steps=1439,
+            ip_rate_limit=8000000.0,
+            ip_hold_probability=ip_hold_probability,
+            ip_start=0.0,
+            boundary_kind="static_parameters",
+            boundary_parameters={"R0": 1.40, "Z0": 0.0, "A0": 0.55, "kappa": 1.0, "delta": 0.0},
+        )
+
+    if name == "t15_training_replay_start_3859":
+        _require_params(
+            name,
+            params,
+            required=(),
+            optional=("seed", "ip_seed", "duration_s", "t_step", "target_update_s", "theta_count", "ip_hold_probability"),
+        )
+        return make_t15_training_replay_start_3859(
+            base_radii,
+            center=center,
+            seed=21 if "seed" not in params else int(_coerce_float_param(params, "seed")),
+            ip_seed=202 if "ip_seed" not in params else int(_coerce_float_param(params, "ip_seed")),
+            duration_s=1.0 if "duration_s" not in params else _coerce_float_param(params, "duration_s"),
+            t_step=1.0e-3 if "t_step" not in params else _coerce_float_param(params, "t_step"),
+            target_update_s=0.20 if "target_update_s" not in params else _coerce_float_param(params, "target_update_s"),
+            theta_count=512 if "theta_count" not in params else int(_coerce_float_param(params, "theta_count")),
+            ip_hold_probability=0.0 if "ip_hold_probability" not in params else _coerce_float_param(params, "ip_hold_probability"),
+        )
+
+    if name == "t15_training_circle_ip_scaled":
+        _require_params(
+            name,
+            params,
+            required=(),
+            optional=(
+                "seed",
+                "ip_seed",
+                "duration_s",
+                "t_step",
+                "ip_hold_probability",
+                "a0_intercept",
+                "a0_slope",
+                "formation_ip",
+                "a0_floor",
+            ),
+        )
+        return make_t15_training_circle_ip_scaled(
+            center=center,
+            seed=21 if "seed" not in params else int(_coerce_float_param(params, "seed")),
+            ip_seed=202 if "ip_seed" not in params else int(_coerce_float_param(params, "ip_seed")),
+            duration_s=1.0 if "duration_s" not in params else _coerce_float_param(params, "duration_s"),
+            t_step=1.0e-3 if "t_step" not in params else _coerce_float_param(params, "t_step"),
+            ip_hold_probability=0.0 if "ip_hold_probability" not in params else _coerce_float_param(params, "ip_hold_probability"),
+            a0_intercept=0.558330912696 if "a0_intercept" not in params else _coerce_float_param(params, "a0_intercept"),
+            a0_slope=2.03086959551e-7 if "a0_slope" not in params else _coerce_float_param(params, "a0_slope"),
+            formation_ip=124750.0 if "formation_ip" not in params else _coerce_float_param(params, "formation_ip"),
+            a0_floor=1.0e-6 if "a0_floor" not in params else _coerce_float_param(params, "a0_floor"),
         )
 
     raise ValueError(f"Unknown scenario name: {name}")

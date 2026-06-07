@@ -182,3 +182,102 @@ def test_t15_synthetic_follow_static_circle_boundary_is_constant() -> None:
     assert np.allclose(radii_0, radii_1)
     assert scenario.Ip_ref(0.0) >= 100_000.0
     assert scenario.Ip_ref(1.0) <= 420_000.0
+
+
+def test_t15_training_circle_static_named_scenario_matches_rl_debug_reference() -> None:
+    angles = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=float)
+    base_radii = np.full((32,), 0.6, dtype=float)
+
+    scenario = make_scenario("t15_training_circle_static", base_radii, 0.0, params={}, center=(1.40, 0.0))
+    radii_0 = scenario.ref_radii(angles, 0.0)
+    radii_1 = scenario.ref_radii(angles, 0.75)
+
+    assert scenario.name == "t15_synthetic_follow"
+    assert scenario.Ip_ref(0.0) == pytest.approx(0.0)
+    assert 112_947.0 <= scenario.Ip_ref(0.50) <= 414_434.0
+    assert np.allclose(radii_0, np.full((32,), 0.55), atol=5.0e-5)
+    assert np.allclose(radii_0, radii_1)
+
+
+def test_t15_training_circle_ip_scaled_expands_radius_with_ip_reference() -> None:
+    angles = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=float)
+    base_radii = np.full((32,), 0.6, dtype=float)
+
+    scenario = make_scenario("t15_training_circle_ip_scaled", base_radii, 0.0, params={}, center=(1.40, 0.0))
+
+    r0 = scenario.ref_radii(angles, 0.0)
+    r_early = scenario.ref_radii(angles, 0.01)
+    r_formed = scenario.ref_radii(angles, 0.10)
+    ip_formed = scenario.Ip_ref(0.10)
+
+    assert scenario.name == "t15_training_circle_ip_scaled"
+    assert scenario.Ip_ref(0.0) == pytest.approx(0.0)
+    assert np.allclose(r0, np.full((32,), 1.0e-6))
+    assert np.allclose(r_early, r_early[0])
+    assert np.allclose(r_formed, r_formed[0])
+    assert r_early[0] > r0[0]
+    assert r_formed[0] > r_early[0]
+    assert r_formed[0] == pytest.approx(0.558330912696 + 2.03086959551e-7 * ip_formed)
+
+
+def test_t15_synthetic_follow_accepts_initial_boundary_parameters() -> None:
+    angles = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=float)
+    base_radii = np.full((32,), 0.6, dtype=float)
+    initial = {"R0": 1.40, "Z0": 0.0, "A0": 0.62, "kappa": 1.15, "delta": 0.12}
+
+    scenario = make_scenario(
+        "t15_synthetic_follow",
+        base_radii,
+        125_000.0,
+        params={
+            "duration_s": 0.2,
+            "t_step": 1.0e-3,
+            "boundary_kind": "generated_parameters",
+            "boundary_initial_parameters": initial,
+            "boundary_bounds": {
+                "R0": {"min": 1.3, "max": 1.5},
+                "Z0": {"min": -0.1, "max": 0.1},
+                "A0": {"min": 0.5, "max": 0.7},
+                "kappa": {"min": 1.0, "max": 1.5},
+                "delta": {"min": 0.0, "max": 0.4},
+            },
+        },
+        center=(1.40, 0.0),
+    )
+
+    radii_0 = scenario.ref_radii(angles, 0.0)
+
+    expected = reference_radii_from_parameters(
+        BoundaryParameters(**initial),
+        center=(1.40, 0.0),
+        angles=angles,
+        theta_count=512,
+    )
+    assert np.nanmean(radii_0) == pytest.approx(np.nanmean(expected))
+
+
+
+def test_t15_training_replay_start_3859_uses_replay_initial_state() -> None:
+    angles = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=float)
+    base_radii = np.full((32,), 0.6, dtype=float)
+
+    scenario = make_scenario("t15_training_replay_start_3859", base_radii, 0.0, params={}, center=(1.40, 0.0))
+
+    radii_0 = scenario.ref_radii(angles, 0.0)
+    expected = reference_radii_from_parameters(
+        BoundaryParameters(
+            R0=1.411347297587252,
+            Z0=-0.0034510165353685133,
+            A0=0.6100682302704028,
+            kappa=1.1120020187817363,
+            delta=0.0993730470809749,
+        ),
+        center=(1.40, 0.0),
+        angles=angles,
+        theta_count=512,
+    )
+
+    assert scenario.Ip_ref(0.0) == pytest.approx(124844.69119195438)
+    assert 112_947.0 <= scenario.Ip_ref(0.50) <= 414_434.0
+    assert np.allclose(radii_0, expected)
+    assert not np.allclose(radii_0, scenario.ref_radii(angles, 0.75))

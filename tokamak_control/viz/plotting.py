@@ -351,6 +351,26 @@ def _as_matrix(series: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _fixed_series_ylim(y: np.ndarray, ref: np.ndarray | None = None) -> tuple[float, float] | None:
+    """Return padded y limits from a complete time series."""
+    y_mat = _as_matrix(y)
+    finite_parts = [y_mat[np.isfinite(y_mat)]]
+    if ref is not None:
+        ref_arr = np.asarray(ref, dtype=float)
+        finite_parts.append(ref_arr[np.isfinite(ref_arr)])
+    finite = (
+        np.concatenate([part for part in finite_parts if part.size], axis=0)
+        if any(part.size for part in finite_parts)
+        else np.zeros((0,), dtype=float)
+    )
+    if not finite.size:
+        return None
+    lo = float(np.min(finite))
+    hi = float(np.max(finite))
+    pad = 0.08 * max(abs(hi - lo), abs(hi), abs(lo), 1.0)
+    return lo - pad, hi + pad
+
+
 def _plot_live_series(
     ax: plt.Axes,
     t: np.ndarray,
@@ -361,6 +381,7 @@ def _plot_live_series(
     labels: list[str],
     ref: np.ndarray | None = None,
     channel_plot_limit: int = 12,
+    ylim: tuple[float, float] | None = None,
 ) -> None:
     """Нарисовать временной ряд до текущего кадра и вертикальный маркер времени."""
     if t.size == 0:
@@ -396,15 +417,12 @@ def _plot_live_series(
 
     ax.axvline(t_now, color="red", linewidth=1.0, alpha=0.8)
     ax.set_xlim(float(t[0]), float(t[-1]) if t.size > 1 else float(t[0]) + 1.0e-6)
-    finite_parts = [y_mat[:end][np.isfinite(y_mat[:end])]]
-    if ref_arr is not None:
-        finite_parts.append(ref_arr[:end][np.isfinite(ref_arr[:end])])
-    finite = np.concatenate([part for part in finite_parts if part.size], axis=0) if any(part.size for part in finite_parts) else np.zeros((0,), dtype=float)
-    if finite.size:
-        lo = float(np.min(finite))
-        hi = float(np.max(finite))
-        pad = 0.08 * max(abs(hi - lo), abs(hi), abs(lo), 1.0)
-        ax.set_ylim(lo - pad, hi + pad)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    else:
+        dynamic_ylim = _fixed_series_ylim(y_mat[:end], ref_arr[:end] if ref_arr is not None else None)
+        if dynamic_ylim is not None:
+            ax.set_ylim(*dynamic_ylim)
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
     if y_mat.shape[1] <= 6:
@@ -431,6 +449,9 @@ def _fig_boundary_with_live_timeseries(
     Ip_ref: np.ndarray | None,
     pfc_currents: np.ndarray,
     sol_currents: np.ndarray,
+    Ip_ylim: tuple[float, float] | None = None,
+    pfc_ylim: tuple[float, float] | None = None,
+    sol_ylim: tuple[float, float] | None = None,
 ) -> plt.Figure:
     """Собрать широкий кадр: сечение токамака слева, live-графики справа."""
     fig = plt.figure(figsize=(14.5, 7.2), constrained_layout=True)
@@ -461,6 +482,7 @@ def _fig_boundary_with_live_timeseries(
         ylabel="Ip [A]",
         labels=["Ip"],
         ref=Ip_ref,
+        ylim=Ip_ylim,
     )
 
     ax_pfc = fig.add_subplot(gs[1, 1], sharex=ax_ip)
@@ -472,6 +494,7 @@ def _fig_boundary_with_live_timeseries(
         frame_index,
         ylabel="PFC [A]",
         labels=[f"PFC{i + 1}" for i in range(pfc.shape[1])],
+        ylim=pfc_ylim,
     )
 
     ax_sol = fig.add_subplot(gs[2, 1], sharex=ax_ip)
@@ -483,6 +506,7 @@ def _fig_boundary_with_live_timeseries(
         frame_index,
         ylabel="SOL [A]",
         labels=[f"SOL{i + 1}" for i in range(sol.shape[1])],
+        ylim=sol_ylim,
     )
     ax_sol.set_xlabel("t [s]")
     return fig
@@ -720,9 +744,12 @@ def save_run_frames(
     radii_ref = np.asarray(run["radii_ref"], dtype=float) if "radii_ref" in run else None
     pfc_currents = _as_matrix(np.asarray(run["pfc_currents"], dtype=float))
     sol_currents = _as_matrix(np.asarray(run["sol_currents"], dtype=float))
+    Ip_ylim = _fixed_series_ylim(Ip, Ip_ref)
+    pfc_ylim = _fixed_series_ylim(pfc_currents)
+    sol_ylim = _fixed_series_ylim(sol_currents)
     boundary_polys = np.asarray(run.get("boundary_poly_true"), dtype=float) if "boundary_poly_true" in run else None
-    if boundary_polys is None or boundary_polys.ndim != 3:
-        raise RuntimeError("Run artifact does not contain stored physical boundary polylines")
+    if boundary_polys is not None and boundary_polys.ndim != 3:
+        raise RuntimeError(f"boundary_poly_true must have shape (T, N, 2), got {boundary_polys.shape}")
     steps = np.asarray(run["step"], dtype=int)
     step_to_index = {int(step): step_idx for step_idx, step in enumerate(steps)}
 
@@ -734,8 +761,14 @@ def save_run_frames(
         psi = np.asarray(psi_snaps[idx], dtype=float)
         step_label = int(snap_steps[idx]) if idx < snap_steps.shape[0] else idx
         if step_label not in step_to_index:
-            raise RuntimeError(f"No stored physical boundary polyline for snapshot step {step_label}")
-        poly = _polyline_from_padded_row(boundary_polys[step_to_index[step_label]])
+            raise RuntimeError(f"No stored time-series row for snapshot step {step_label}")
+        if boundary_polys is None:
+            poly = None
+        else:
+            try:
+                poly = _polyline_from_padded_row(boundary_polys[step_to_index[step_label]])
+            except RuntimeError:
+                poly = None
         frame_title = f"ψ and boundary (step {step_label})"
         fig = _fig_boundary_with_live_timeseries(
             psi=psi,
@@ -754,6 +787,9 @@ def save_run_frames(
             Ip_ref=Ip_ref,
             pfc_currents=pfc_currents,
             sol_currents=sol_currents,
+            Ip_ylim=Ip_ylim,
+            pfc_ylim=pfc_ylim,
+            sol_ylim=sol_ylim,
         )
         frame_path = frames_dir / f"frame_{frame_idx:04d}.png"
         fig.savefig(frame_path, dpi=int(dpi), bbox_inches="tight")
