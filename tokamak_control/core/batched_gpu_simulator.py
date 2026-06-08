@@ -351,7 +351,7 @@ class BatchedGpuTokamakSimulator:
             fracs = self._ray_sample_fracs
             radii_samples = self._ray_caps[None, :, None] * fracs[None, None, :]
             center = torch.tensor([float(self.settings.R0), float(self.settings.Z0)], dtype=torch.float64, device=self.device)
-            sample_points = center[None, None, None, :] + radii_samples[None, :, :, None] * self._dirs[None, :, None, :]
+            sample_points = center[None, None, None, :] + radii_samples[:, :, :, None] * self._dirs[None, :, None, :]
             psi_samples = self._sample_points(psi=self._psi, points=sample_points.reshape(n_angles * int(fracs.numel()), 2)).reshape(b, n_angles, int(fracs.numel()))
             level = levels[:, None, None]
             finite = torch.isfinite(psi_samples) & torch.isfinite(level)
