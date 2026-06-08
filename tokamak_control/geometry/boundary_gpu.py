@@ -343,7 +343,6 @@ def _limited_boundary_gpu(
         return contact
     return _outermost_limited_boundary_gpu(
         psi_t=psi_t,
-        psi_np=psi_np,
         grid=grid,
         axis=axis,
         limiter_poly=limiter_poly,
@@ -375,21 +374,20 @@ def _limited_limiter_contact_boundary_gpu(
     touch_tol = 2.5 * float(max(abs(float(grid.r.step)), abs(float(grid.z.step)), float(limiter_tol)))
     levels = _ordered_limiter_contact_levels(values, axis)
 
-    for level_chunk in _level_chunks(levels):
-        contours_by_level = _contours_at_levels_gpu(psi_t, grid, level_chunk, runtime)
-        for contact_level, contours in zip(level_chunk, contours_by_level, strict=True):
-            result = _select_limited_contact_candidate(
-                contours=contours,
-                contact_level=float(contact_level),
-                points=points,
-                rounded_values=rounded_values,
-                axis=axis,
-                limiter_poly=limiter_poly,
-                limiter_tol=limiter_tol,
-                touch_tol=touch_tol,
-            )
-            if result is not None:
-                return result
+    for contact_level in levels:
+        contours = _contours_at_level_gpu(psi_t, grid, float(contact_level), runtime)
+        result = _select_limited_contact_candidate(
+            contours=contours,
+            contact_level=float(contact_level),
+            points=points,
+            rounded_values=rounded_values,
+            axis=axis,
+            limiter_poly=limiter_poly,
+            limiter_tol=limiter_tol,
+            touch_tol=touch_tol,
+        )
+        if result is not None:
+            return result
     return None
 
 
