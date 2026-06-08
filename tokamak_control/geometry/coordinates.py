@@ -122,17 +122,30 @@ def radii_from_polyline_ray_intersections(
     poly = _as_closed_polyline(polyline)
     qa = np.asarray(query_angles, dtype=float).reshape(-1)
 
-    seg_starts = poly[:-1]
-    seg_ends = poly[1:]
-    out = np.empty(qa.shape, dtype=float)
+    if qa.size == 0:
+        return np.empty((0,), dtype=float)
 
-    for i, angle in enumerate(qa):
-        hits: list[float] = []
-        for a, b in zip(seg_starts, seg_ends):
-            t = _ray_segment_intersection_radius(center, float(angle), a, b)
-            if t is not None:
-                hits.append(float(t))
-        if not hits:
-            raise ValueError("No ray/polyline intersection found for a measurement angle")
-        out[i] = max(hits)
-    return out
+    c = np.array(center, dtype=float).reshape(2)
+    seg_starts = np.asarray(poly[:-1], dtype=float)
+    seg_vecs = np.asarray(poly[1:] - poly[:-1], dtype=float)
+
+    directions = np.stack([np.cos(qa), np.sin(qa)], axis=1)
+    rhs = seg_starts[None, :, :] - c.reshape(1, 1, 2)
+    d = directions[:, None, :]
+    s = seg_vecs[None, :, :]
+
+    den = d[..., 0] * s[..., 1] - d[..., 1] * s[..., 0]
+    rhs_cross_s = rhs[..., 0] * s[..., 1] - rhs[..., 1] * s[..., 0]
+    rhs_cross_d = rhs[..., 0] * d[..., 1] - rhs[..., 1] * d[..., 0]
+
+    valid_den = np.abs(den) > 1.0e-12
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_ray = rhs_cross_s / den
+        u_seg = rhs_cross_d / den
+
+    valid = valid_den & (t_ray >= 0.0) & (u_seg >= -1.0e-12) & (u_seg <= 1.0 + 1.0e-12)
+    hits = np.where(valid, np.maximum(t_ray, 0.0), -np.inf)
+    out = np.max(hits, axis=1)
+    if not np.all(np.isfinite(out)):
+        raise ValueError("No ray/polyline intersection found for a measurement angle")
+    return np.asarray(out, dtype=float)

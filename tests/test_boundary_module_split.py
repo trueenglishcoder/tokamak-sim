@@ -9,7 +9,7 @@ from tokamak_control.core.grid import Grid1D, Grid2D
 from tokamak_control.geometry.boundary import find_plasma_boundary_with_status
 from tokamak_control.geometry.boundary_cpu import find_plasma_boundary_cpu_with_status
 from tokamak_control.geometry.boundary_gpu import find_plasma_boundary_gpu_with_status
-from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
+from tokamak_control.geometry.coordinates import _ray_segment_intersection_radius, radii_from_polyline_ray_intersections
 
 
 def _cuda_available() -> bool:
@@ -44,6 +44,30 @@ def _case():
 def _radii(poly: np.ndarray, center: tuple[float, float]) -> np.ndarray:
     angles = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=float)
     return radii_from_polyline_ray_intersections(poly, center, angles)
+
+
+def test_vectorized_polyline_radii_match_scalar_ray_solver() -> None:
+    center = (1.2, -0.05)
+    theta = np.linspace(-np.pi, np.pi, 97, endpoint=False, dtype=float)
+    poly = np.column_stack([
+        center[0] + 0.42 * np.cos(theta) + 0.06 * np.sin(theta) ** 2,
+        center[1] + 0.31 * np.sin(theta),
+    ])
+    poly = np.vstack([poly, poly[0]])
+    angles = np.linspace(-np.pi, np.pi, 31, endpoint=False, dtype=float)
+
+    expected = []
+    for angle in angles:
+        hits = []
+        for a, b in zip(poly[:-1], poly[1:], strict=True):
+            hit = _ray_segment_intersection_radius(center, float(angle), a, b)
+            if hit is not None:
+                hits.append(hit)
+        expected.append(max(hits))
+
+    actual = radii_from_polyline_ray_intersections(poly, center, angles)
+
+    assert np.allclose(actual, np.asarray(expected, dtype=float), rtol=0.0, atol=1.0e-12)
 
 
 def test_cpu_direct_api_matches_dispatcher_cpu_mode() -> None:
