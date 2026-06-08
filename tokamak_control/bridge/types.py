@@ -14,6 +14,8 @@ class MachineSpec:
     config_path: Path
     initial_currents_path: Path | None
     boundary_mode: str
+    compute_backend: str
+    gpu_device: str
     limiter_name: str | None
     t_step: float
     n_active_pfc: int

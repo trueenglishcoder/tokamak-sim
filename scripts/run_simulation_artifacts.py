@@ -223,6 +223,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Print profiling summaries every N timed steps. 0 disables periodic profiling log output.",
     )
     ap.add_argument(
+        "--compute-backend",
+        choices=("cpu", "gpu"),
+        default=None,
+        help="Override config compute.backend. Defaults to the value in the TOML config, or cpu if absent.",
+    )
+    ap.add_argument(
+        "--gpu-device",
+        default=None,
+        help="Override config compute.gpu_device when --compute-backend gpu is used.",
+    )
+    ap.add_argument(
         "--limiter",
         choices=limiter_names(),
         default=None,
@@ -264,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         show_progress=not bool(args.no_progress),
         profile=bool(args.profile),
         profile_summary_every=int(args.profile_summary_every),
+        compute_backend=args.compute_backend,
+        gpu_device=args.gpu_device,
     )
 
     out_dir = result.run_dir

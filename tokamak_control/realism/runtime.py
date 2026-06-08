@@ -5,6 +5,7 @@ from typing import Deque
 
 import numpy as np
 
+from tokamak_control.compute import ComputeBackend
 from tokamak_control.geometry.boundary import BoundaryMode, BoundaryNotFoundError, find_plasma_boundary_with_status
 from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
 from tokamak_control.realism.types import ActuatorRealismResult, RealismSettings, SensorRealismResult
@@ -108,6 +109,8 @@ class RealismRuntime:
         angles_rad: np.ndarray | None = None,
         limiter_shape: np.ndarray | None = None,
         boundary_mode: BoundaryMode = "limited",
+        compute_backend: ComputeBackend | str = "cpu",
+        gpu_device: str = "cuda:0",
     ) -> SensorRealismResult:
         """Create measured channels from true plant state without inventing missing data."""
         s = self._settings.sensors
@@ -134,6 +137,8 @@ class RealismRuntime:
                     n_levels=40,
                     limiter_shape=limiter_shape,
                     boundary_mode=boundary_mode,
+                    compute_backend=compute_backend,
+                    gpu_device=gpu_device,
                 )
                 boundary_meas = np.asarray(boundary_recomputed, dtype=float)
             except BoundaryNotFoundError:

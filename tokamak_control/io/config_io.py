@@ -11,6 +11,7 @@ import tomli_w
 
 from tokamak_control.core.grid import Grid1D, Grid2D
 from tokamak_control.core.coils import Coil, CoilActuator, CoilGroup
+from tokamak_control.compute import ComputeSettings
 from tokamak_control.config.settings import PhysicsSettings
 from tokamak_control.geometry.boundary import BoundaryMode
 from tokamak_control.geometry.limiters import get_limiter_shape
@@ -25,6 +26,7 @@ class LoadedConfig:
     pfc: CoilGroup
     sol: CoilGroup
     physics: PhysicsSettings
+    compute: ComputeSettings = ComputeSettings()
     realism: RealismSettings = RealismSettings()
     boundary_mode: BoundaryMode = "limited"
     limiter_name: str | None = None
@@ -266,6 +268,17 @@ def _load_realism_settings(cfg: dict) -> RealismSettings:
     )
 
 
+def _load_compute_settings(cfg: dict) -> ComputeSettings:
+    """Read runtime compute backend settings from the top-level compute table."""
+    defaults = ComputeSettings()
+    node = _require_mapping(cfg.get("compute", {}), "compute")
+    return ComputeSettings(
+        backend=str(node.get("backend", defaults.backend)),
+        gpu_device=str(node.get("gpu_device", defaults.gpu_device)),
+        boundary_equivalence_mode=str(node.get("boundary_equivalence_mode", defaults.boundary_equivalence_mode)),
+    )
+
+
 def load_config(path: str | Path, initial_currents_path: str | Path | None = None) -> LoadedConfig:
     """Load a TOML configuration and construct domain objects."""
     path = Path(path)
@@ -319,6 +332,7 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
     )
     physics.validate()
 
+    compute = _load_compute_settings(cfg)
     realism = _load_realism_settings(cfg)
     realism.validate()
 
@@ -413,6 +427,7 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         pfc=pfc,
         sol=sol,
         physics=physics,
+        compute=compute,
         realism=realism,
         boundary_mode=boundary_mode,
         limiter_name=limiter_name,
@@ -429,6 +444,7 @@ def dump_config(
     pfc: CoilGroup,
     sol: CoilGroup,
     physics: PhysicsSettings,
+    compute: ComputeSettings | None = None,
     realism: RealismSettings | None = None,
     limiter_name: str | None = None,
     boundary_mode: BoundaryMode = "limited",
@@ -436,6 +452,7 @@ def dump_config(
     """Записать TOML-конфигурацию текущей расчетной схемы."""
     path = Path(path)
     physics.validate()
+    compute = ComputeSettings() if compute is None else compute
     realism = RealismSettings() if realism is None else realism
     realism.validate()
 
@@ -462,6 +479,11 @@ def dump_config(
             "ip_coupling_sol": list(physics.ip_coupling_sol) if physics.ip_coupling_sol is not None else None,
             "pfc_deriv_limit": physics.pfc_deriv_limit,
             "sol_deriv_limit": physics.sol_deriv_limit,
+        },
+        "compute": {
+            "backend": compute.backend,
+            "gpu_device": compute.gpu_device,
+            "boundary_equivalence_mode": compute.boundary_equivalence_mode,
         },
         "realism": {
             "enabled": realism.enabled,

@@ -14,6 +14,7 @@ from typing import Literal
 
 import numpy as np
 
+from tokamak_control.compute import ComputeSettings, ComputeBackend, compute_runtime_metadata
 from tokamak_control.config.scenarios import Scenario, ScenarioName, make_scenario
 from tokamak_control.control.base import ControlAction, Controller
 from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
@@ -304,6 +305,7 @@ def _build_run_metadata(
         "boundary": {
             "mode": cfg.boundary_mode,
         },
+        "compute": compute_runtime_metadata(cfg.compute, validate=False),
         "limiter": {
             "name": cfg.limiter_name,
             "shape": None if cfg.limiter_shape is None else np.asarray(cfg.limiter_shape, dtype=float).tolist(),
@@ -385,6 +387,8 @@ def _prepare(
             n_levels=80 if cfg.limiter_shape is not None else 10,
             limiter_shape=cfg.limiter_shape,
             boundary_mode=cfg.boundary_mode,
+            compute_backend=cfg.compute.backend,
+            gpu_device=cfg.compute.gpu_device,
         )
         base_radii = radii_from_polyline_ray_intersections(boundary0, center, angles)
     except BoundaryNotFoundError:
@@ -542,6 +546,8 @@ def _initial_boundary_tracker(
     target_mean_radius: float | None,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
+    compute_backend: str,
+    gpu_device: str,
     logger: logging.Logger,
     run_profiler: Profiler,
 ) -> _BoundaryTracker:
@@ -557,6 +563,8 @@ def _initial_boundary_tracker(
                 target_mean_radius=target_mean_radius,
                 limiter_shape=limiter_shape,
                 boundary_mode=boundary_mode,
+                compute_backend=compute_backend,
+                gpu_device=gpu_device,
             )
             return _BoundaryTracker(
                 poly=poly,
@@ -596,6 +604,8 @@ def _sensor_measurements(
     angles: np.ndarray,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
+    compute_backend: str,
+    gpu_device: str,
     run_profiler: Profiler,
     profile_key: str,
 ) -> SensorRealismResult:
@@ -631,6 +641,8 @@ def _sensor_measurements(
             angles_rad=angles,
             limiter_shape=limiter_shape,
             boundary_mode=boundary_mode,
+            compute_backend=compute_backend,
+            gpu_device=gpu_device,
         )
 
 
@@ -719,6 +731,8 @@ def _update_boundary_tracker(
     refs: _StepRefs,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
+    compute_backend: str,
+    gpu_device: str,
     logger: logging.Logger,
     verbose: bool,
     step_index: int,
@@ -739,6 +753,8 @@ def _update_boundary_tracker(
                 target_mean_radius=refs.target_mean_radius,
                 limiter_shape=limiter_shape,
                 boundary_mode=boundary_mode,
+                compute_backend=compute_backend,
+                gpu_device=gpu_device,
             )
             tracker.poly = poly
             tracker.level = float(level)
@@ -875,6 +891,8 @@ def _run_single_step(
     center: tuple[float, float],
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
+    compute_backend: str,
+    gpu_device: str,
     angles: np.ndarray,
     active_disturbances: Sequence[Disturbance],
     writer: RunWriter,
@@ -901,6 +919,8 @@ def _run_single_step(
         angles=angles,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
+        compute_backend=compute_backend,
+        gpu_device=gpu_device,
         run_profiler=run_profiler,
         profile_key="step_measurements_pre",
     )
@@ -939,6 +959,8 @@ def _run_single_step(
         refs=refs,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
+        compute_backend=compute_backend,
+        gpu_device=gpu_device,
         logger=logger,
         verbose=verbose,
         step_index=step_index,
@@ -959,6 +981,8 @@ def _run_single_step(
         angles=angles,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
+        compute_backend=compute_backend,
+        gpu_device=gpu_device,
         run_profiler=run_profiler,
         profile_key="step_measurements_post",
     )
@@ -1059,6 +1083,8 @@ def run(
     show_progress: bool = False,
     profile: bool = False,
     profile_summary_every: int = 0,
+    compute_backend: ComputeBackend | str | None = None,
+    gpu_device: str | None = None,
 ) -> RunResult:
     """Запустить одну замкнутую симуляцию и вернуть пути созданных артефактов."""
     logger, run_profiler = _configure_run_logging(
@@ -1069,6 +1095,16 @@ def run(
 
     logger.info("Loading configuration")
     cfg, config_source = _load_config_for_run(config, initial_currents_path=initial_currents_path, run_profiler=run_profiler)
+    if compute_backend is not None or gpu_device is not None:
+        cfg = replace(
+            cfg,
+            compute=ComputeSettings(
+                backend=(cfg.compute.backend if compute_backend is None else compute_backend),
+                gpu_device=(cfg.compute.gpu_device if gpu_device is None else str(gpu_device)),
+                boundary_equivalence_mode=cfg.compute.boundary_equivalence_mode,
+            ),
+        )
+    compute_runtime_metadata(cfg.compute, validate=True)
 
     logger.info("Normalizing controller launch: %s", controller_name)
     canonical_controller_name, normalized_controller_params, ctor_kwargs = _normalize_controller_for_run(
@@ -1158,6 +1194,8 @@ def run(
         target_mean_radius=initial_refs.target_mean_radius,
         limiter_shape=cfg_runtime.limiter_shape,
         boundary_mode=cfg_runtime.boundary_mode,
+        compute_backend=cfg_runtime.compute.backend,
+        gpu_device=cfg_runtime.compute.gpu_device,
         logger=logger,
         run_profiler=run_profiler,
     )
@@ -1191,6 +1229,8 @@ def run(
                         center=center,
                         limiter_shape=cfg_runtime.limiter_shape,
                         boundary_mode=cfg_runtime.boundary_mode,
+                        compute_backend=cfg_runtime.compute.backend,
+                        gpu_device=cfg_runtime.compute.gpu_device,
                         angles=angles,
                         active_disturbances=active_disturbances,
                         writer=writer,

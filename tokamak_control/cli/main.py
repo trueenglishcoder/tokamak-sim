@@ -85,6 +85,17 @@ def _add_simulate(p) -> None:
         action="store_true",
         help="Enable measurement and actuation realism for this run.",
     )
+    ap.add_argument(
+        "--compute-backend",
+        choices=("cpu", "gpu"),
+        default=None,
+        help="Override config compute.backend. Defaults to the value in the TOML config, or cpu if absent.",
+    )
+    ap.add_argument(
+        "--gpu-device",
+        default=None,
+        help="Override config compute.gpu_device when using the GPU backend.",
+    )
 
     def _run(args: argparse.Namespace) -> int:
         try:
@@ -111,6 +122,8 @@ def _add_simulate(p) -> None:
             snapshot_every=args.snap_every,
             disturbances=disturbances,
             realism_enabled=bool(args.realism),
+            compute_backend=args.compute_backend,
+            gpu_device=args.gpu_device,
         )
         print(str(res.run_dir))
         print(str(res.manifest_path))

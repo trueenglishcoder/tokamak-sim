@@ -8,6 +8,7 @@ from typing import Literal, cast
 import numpy as np
 from contourpy import contour_generator
 
+from tokamak_control.compute import ComputeBackend, normalize_compute_backend
 from tokamak_control.core.grid import Grid2D
 from tokamak_control.geometry.xpoints import find_x_points
 from tokamak_control.io.logger import get_logger
@@ -65,7 +66,11 @@ def boundary_profiling_snapshot() -> dict[str, object]:
     return _PROFILER.summary_dict(
         total_key="boundary_total",
         keys=(
+            "axis_search",
+            "limited_contact_levels",
             "contours_at_level",
+            "candidate_filtering",
+            "xpoint_search",
         ),
         path_keys=(
             "limited_success",
@@ -80,7 +85,11 @@ def log_boundary_profiling_summary() -> None:
     _PROFILER.log_summary(
         total_key="boundary_total",
         keys=(
+            "axis_search",
+            "limited_contact_levels",
             "contours_at_level",
+            "candidate_filtering",
+            "xpoint_search",
         ),
         path_keys=(
             "limited_success",
@@ -106,6 +115,8 @@ def find_plasma_boundary_with_status(
     local_bbox_pad_z: float | None = None,
     limiter_shape: np.ndarray | None = None,
     boundary_mode: BoundaryMode = "limited",
+    compute_backend: ComputeBackend | str = "cpu",
+    gpu_device: str = "cuda:0",
 ) -> tuple[np.ndarray, float, BoundaryStatus]:
     """Найти контур границы плазмы по полю psi.
 
@@ -116,19 +127,43 @@ def find_plasma_boundary_with_status(
     найденной.
     """
     mode = _normalize_boundary_mode(boundary_mode)
+    backend = normalize_compute_backend(compute_backend)
+    if backend == "gpu":
+        from tokamak_control.geometry.boundary_gpu import find_plasma_boundary_gpu_with_status
+
+        return find_plasma_boundary_gpu_with_status(
+            psi,
+            grid,
+            center,
+            n_levels=n_levels,
+            prev_level=prev_level,
+            prev_poly=prev_poly,
+            local_n_levels=local_n_levels,
+            local_span_frac=local_span_frac,
+            target_mean_radius=target_mean_radius,
+            target_switch_ratio=target_switch_ratio,
+            target_switch_abs_delta=target_switch_abs_delta,
+            local_bbox_pad_r=local_bbox_pad_r,
+            local_bbox_pad_z=local_bbox_pad_z,
+            limiter_shape=limiter_shape,
+            boundary_mode=mode,
+            gpu_device=gpu_device,
+        )
+
     with _time_block("boundary_total"):
         if psi.shape != grid.shape:
             raise ValueError(f"psi shape {psi.shape} != grid shape {grid.shape}")
 
         limiter_poly = _prepare_limiter_shape(limiter_shape)
         limiter_tol = 0.5 * min(abs(float(grid.r.step)), abs(float(grid.z.step)))
-        axis = _find_magnetic_axis(
-            psi=psi,
-            grid=grid,
-            center=center,
-            limiter_poly=limiter_poly,
-            limiter_tol=limiter_tol,
-        )
+        with _time_block("axis_search"):
+            axis = _find_magnetic_axis(
+                psi=psi,
+                grid=grid,
+                center=center,
+                limiter_poly=limiter_poly,
+                limiter_tol=limiter_tol,
+            )
         search_center = axis.point
 
         if mode == "limited":
@@ -271,7 +306,8 @@ def _separatrix_boundary(
 ) -> tuple[np.ndarray, float] | None:
     """Найти сепаратрису по X-point, если она представлена замкнутым контуром."""
     min_sep = 2.0 * float(max(abs(float(grid.r.step)), abs(float(grid.z.step))))
-    x_points = find_x_points(psi, grid, max_points=8, min_separation=min_sep)
+    with _time_block("xpoint_search"):
+        x_points = find_x_points(psi, grid, max_points=8, min_separation=min_sep)
     if x_points.shape[0] == 0:
         return None
 
@@ -281,18 +317,19 @@ def _separatrix_boundary(
         if not np.isfinite(level):
             continue
         for poly in _contours_at_level(psi, grid, float(level)):
-            if not _is_closed_poly(poly):
-                continue
-            if not _encloses_center(poly, axis):
-                continue
-            closed = _close_poly(poly)
-            if _point_to_polyline_distance(np.asarray(point, dtype=float), closed) > min_sep:
-                continue
-            if limiter_poly is not None and not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
-                continue
-            area = abs(_poly_area(closed))
-            if np.isfinite(area) and area > 0.0:
-                candidates.append((closed, float(level), float(area)))
+            with _time_block("candidate_filtering"):
+                if not _is_closed_poly(poly):
+                    continue
+                if not _encloses_center(poly, axis):
+                    continue
+                closed = _close_poly(poly)
+                if _point_to_polyline_distance(np.asarray(point, dtype=float), closed) > min_sep:
+                    continue
+                if limiter_poly is not None and not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
+                    continue
+                area = abs(_poly_area(closed))
+                if np.isfinite(area) and area > 0.0:
+                    candidates.append((closed, float(level), float(area)))
 
     if not candidates:
         return None
@@ -343,9 +380,10 @@ def _limited_limiter_contact_boundary(
     limiter_tol: float,
 ) -> tuple[np.ndarray, float] | None:
     """Найти limited LCFS как flux-поверхность первого контакта с лимитером."""
-    limiter_points = _sample_limiter_points(limiter_poly, grid)
-    limiter_psi = _sample_psi_bilinear(psi, grid, limiter_points)
-    valid = np.isfinite(limiter_psi)
+    with _time_block("limited_contact_levels"):
+        limiter_points = _sample_limiter_points(limiter_poly, grid)
+        limiter_psi = _sample_psi_bilinear(psi, grid, limiter_points)
+        valid = np.isfinite(limiter_psi)
     if not bool(np.any(valid)):
         return None
 
@@ -361,17 +399,18 @@ def _limited_limiter_contact_boundary(
             continue
         candidates: list[tuple[np.ndarray, float]] = []
         for poly in _contours_at_level(psi, grid, float(contact_level)):
-            if not _is_closed_poly(poly):
-                continue
-            if not _encloses_center(poly, axis.point):
-                continue
-            closed = _close_poly(poly)
-            if not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
-                continue
-            contact_dist = _polyline_to_points_distance(closed, contact_points)
-            if contact_dist > touch_tol:
-                continue
-            candidates.append((closed, float(contact_dist)))
+            with _time_block("candidate_filtering"):
+                if not _is_closed_poly(poly):
+                    continue
+                if not _encloses_center(poly, axis.point):
+                    continue
+                closed = _close_poly(poly)
+                if not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
+                    continue
+                contact_dist = _polyline_to_points_distance(closed, contact_points)
+                if contact_dist > touch_tol:
+                    continue
+                candidates.append((closed, float(contact_dist)))
 
         if candidates:
             best_poly, _dist = min(candidates, key=lambda item: item[1])
@@ -404,16 +443,17 @@ def _outermost_limited_boundary(
     candidates: list[tuple[np.ndarray, float, float]] = []
     for level in levels:
         for poly in _contours_at_level(psi, grid, float(level)):
-            if not _is_closed_poly(poly):
-                continue
-            if not _encloses_center(poly, axis.point):
-                continue
-            closed = _close_poly(poly)
-            if not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
-                continue
-            area = abs(_poly_area(closed))
-            if np.isfinite(area) and area > 0.0:
-                candidates.append((closed, float(level), float(area)))
+            with _time_block("candidate_filtering"):
+                if not _is_closed_poly(poly):
+                    continue
+                if not _encloses_center(poly, axis.point):
+                    continue
+                closed = _close_poly(poly)
+                if not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
+                    continue
+                area = abs(_poly_area(closed))
+                if np.isfinite(area) and area > 0.0:
+                    candidates.append((closed, float(level), float(area)))
 
     if not candidates:
         return None

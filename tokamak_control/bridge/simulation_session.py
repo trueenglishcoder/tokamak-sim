@@ -7,6 +7,7 @@ from typing import Mapping
 import numpy as np
 
 from tokamak_control.bridge.types import DerivativeAction, InitialStateOverride, MachineSpec, ReferenceFrame, ResetResult, StepResult, StepSnapshot
+from tokamak_control.compute import ComputeBackend, ComputeSettings, compute_runtime_metadata
 from tokamak_control.core.coils import CoilGroup
 from tokamak_control.config.scenarios import Scenario, ScenarioName, make_scenario
 from tokamak_control.core.plasma_model import PlasmaModel
@@ -32,6 +33,8 @@ class SimulationSession:
         realism_enabled: bool = False,
         realism_settings: RealismSettings | None = None,
         initial_state_override: InitialStateOverride | None = None,
+        compute_backend: ComputeBackend | str | None = None,
+        gpu_device: str | None = None,
     ) -> None:
         """Создать описание сессии; модель строится при ``reset``."""
         if int(angles) <= 0:
@@ -47,6 +50,8 @@ class SimulationSession:
         self.realism_enabled = bool(realism_enabled)
         self.realism_settings = realism_settings
         self.initial_state_override = initial_state_override
+        self.compute_backend = compute_backend
+        self.gpu_device = gpu_device
 
         self._cfg: LoadedConfig | None = None
         self._model: PlasmaModel | None = None
@@ -75,6 +80,8 @@ class SimulationSession:
         realism_enabled: bool = False,
         realism_settings: RealismSettings | None = None,
         initial_state_override: InitialStateOverride | None = None,
+        compute_backend: ComputeBackend | str | None = None,
+        gpu_device: str | None = None,
     ) -> SimulationSession:
         """Собрать сессию из путей без запуска шага модели."""
         _ = seed
@@ -88,6 +95,8 @@ class SimulationSession:
             realism_enabled=bool(realism_enabled),
             realism_settings=realism_settings,
             initial_state_override=initial_state_override,
+            compute_backend=compute_backend,
+            gpu_device=gpu_device,
         )
 
     def reset(
@@ -106,7 +115,17 @@ class SimulationSession:
         )
         active_initial_override = initial_state_override if initial_state_override is not None else self.initial_state_override
         cfg = load_config(self.config_path, initial_currents_path=active_initial_path)
+        if self.compute_backend is not None or self.gpu_device is not None:
+            cfg = replace(
+                cfg,
+                compute=ComputeSettings(
+                    backend=(cfg.compute.backend if self.compute_backend is None else self.compute_backend),
+                    gpu_device=(cfg.compute.gpu_device if self.gpu_device is None else str(self.gpu_device)),
+                    boundary_equivalence_mode=cfg.compute.boundary_equivalence_mode,
+                ),
+            )
         cfg = _apply_initial_state_override(cfg, active_initial_override)
+        compute_meta = compute_runtime_metadata(cfg.compute, validate=True)
         model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
         active_realism_settings = realism_settings if realism_settings is not None else (self.realism_settings if self.realism_settings is not None else cfg.realism)
         active_realism_settings.validate()
@@ -124,6 +143,8 @@ class SimulationSession:
                 n_levels=80 if cfg.limiter_shape is not None else 10,
                 limiter_shape=cfg.limiter_shape,
                 boundary_mode=cfg.boundary_mode,
+                compute_backend=cfg.compute.backend,
+                gpu_device=cfg.compute.gpu_device,
             )
             base_radii = radii_from_polyline_ray_intersections(boundary_poly, center, angles_rad)
         except BoundaryNotFoundError as exc:
@@ -180,6 +201,7 @@ class SimulationSession:
                 "initial_state_override": _initial_state_override_metadata(active_initial_override),
                 "realism_active": realism is not None,
                 "realism_settings": _realism_settings_metadata(active_realism_settings),
+                "compute": compute_meta,
             },
         )
 
@@ -222,6 +244,8 @@ class SimulationSession:
                 target_mean_radius=float(np.nanmean(ref_for_boundary.radii_ref)),
                 limiter_shape=cfg.limiter_shape,
                 boundary_mode=cfg.boundary_mode,
+                compute_backend=cfg.compute.backend,
+                gpu_device=cfg.compute.gpu_device,
             )
             self._boundary_poly = np.asarray(boundary_poly, dtype=float)
             self._boundary_level = float(boundary_level)
@@ -304,6 +328,8 @@ class SimulationSession:
                 angles_rad=angles_rad,
                 limiter_shape=cfg.limiter_shape,
                 boundary_mode=cfg.boundary_mode,
+                compute_backend=cfg.compute.backend,
+                gpu_device=cfg.compute.gpu_device,
             )
             measured_ip = sensors.measured_ip
             measured_currents = sensors.measured_active_currents
@@ -365,14 +391,17 @@ def _apply_initial_state_override(cfg: LoadedConfig, override: InitialStateOverr
 def _initial_state_override_metadata(override: InitialStateOverride | None) -> dict[str, object]:
     if override is None:
         return {"enabled": False, "ip": None, "coil_currents": "config", "ip_scale": None}
-    return {
+    data: dict[str, object] = {
         "enabled": bool(override.ip is not None or override.coil_currents != "config" or override.ip_scale is not None),
         "ip": None if override.ip is None else float(override.ip),
         "coil_currents": str(override.coil_currents),
         "ip_scale": None if override.ip_scale is None else float(override.ip_scale),
-        "pfc_currents": None if override.pfc_currents is None else np.asarray(override.pfc_currents, dtype=float).tolist(),
-        "sol_currents": None if override.sol_currents is None else np.asarray(override.sol_currents, dtype=float).tolist(),
     }
+    if override.pfc_currents is not None:
+        data["pfc_currents"] = np.asarray(override.pfc_currents, dtype=float).tolist()
+    if override.sol_currents is not None:
+        data["sol_currents"] = np.asarray(override.sol_currents, dtype=float).tolist()
+    return data
 
 
 def _build_machine_spec(
@@ -402,6 +431,8 @@ def _build_machine_spec(
         config_path=Path(config_path),
         initial_currents_path=None if initial_currents_path is None else Path(initial_currents_path),
         boundary_mode=str(cfg.boundary_mode),
+        compute_backend=str(cfg.compute.backend),
+        gpu_device=str(cfg.compute.gpu_device),
         limiter_name=cfg.limiter_name,
         t_step=float(model.t_step),
         n_active_pfc=n_pfc,
