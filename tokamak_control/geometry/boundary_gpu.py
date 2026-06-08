@@ -74,11 +74,8 @@ def find_plasma_boundary_gpu_with_status(
     torch = runtime.torch
 
     with _time_block("boundary_total"):
-        psi_arr = np.asarray(psi, dtype=float)
-        if psi_arr.shape != grid.shape:
-            raise ValueError(f"psi shape {psi_arr.shape} != grid shape {grid.shape}")
-
-        psi_t = torch.as_tensor(psi_arr, dtype=torch.float64, device=runtime.device)
+        psi_t = _psi_tensor(psi, grid=grid, runtime=runtime)
+        psi_arr = psi_t.detach().cpu().numpy().astype(float, copy=True)
         limiter_poly = _prepare_limiter_shape(limiter_shape)
         limiter_tol = 0.5 * min(abs(float(grid.r.step)), abs(float(grid.z.step)))
         with _time_block("axis_search"):
@@ -120,6 +117,17 @@ def find_plasma_boundary_gpu_with_status(
             poly, level = found
             return _close_poly(poly), float(level), "separatrix_success"
         raise BoundaryNotFoundError("No diverted plasma separatrix boundary found")
+
+
+def _psi_tensor(psi, *, grid: Grid2D, runtime: _TorchRuntime):
+    torch = runtime.torch
+    if hasattr(psi, "detach") and hasattr(psi, "device"):
+        psi_t = psi.detach().to(device=runtime.device, dtype=torch.float64)
+    else:
+        psi_t = torch.as_tensor(np.asarray(psi, dtype=float), dtype=torch.float64, device=runtime.device)
+    if tuple(psi_t.shape) != tuple(grid.shape):
+        raise ValueError(f"psi shape {tuple(psi_t.shape)} != grid shape {grid.shape}")
+    return psi_t
 
 
 def _require_torch_runtime(gpu_device: str) -> _TorchRuntime:

@@ -28,12 +28,13 @@ def configure_plasma_model_profiling(
     *,
     enabled: bool,
     summary_every: int = 0,
+    reset: bool = True,
 ) -> None:
     _PROFILER.configure(
         enabled=enabled,
         summary_every=summary_every,
         logger=get_logger("core.plasma_model.profiling"),
-        reset=True,
+        reset=reset,
     )
 
 

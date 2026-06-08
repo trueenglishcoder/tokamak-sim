@@ -10,6 +10,7 @@ from tokamak_control.bridge.types import DerivativeAction, InitialStateOverride,
 from tokamak_control.compute import ComputeBackend, ComputeSettings, compute_runtime_metadata
 from tokamak_control.core.coils import CoilGroup
 from tokamak_control.config.scenarios import Scenario, ScenarioName, make_scenario
+from tokamak_control.core.gpu_plasma_model import GpuPlasmaModel
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.geometry.boundary import BoundaryMode, BoundaryNotFoundError, find_plasma_boundary_with_status
 from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
@@ -54,7 +55,7 @@ class SimulationSession:
         self.gpu_device = gpu_device
 
         self._cfg: LoadedConfig | None = None
-        self._model: PlasmaModel | None = None
+        self._model: PlasmaModel | GpuPlasmaModel | None = None
         self._machine: MachineSpec | None = None
         self._scenario: Scenario | None = None
         self._realism: RealismRuntime | None = None
@@ -126,13 +127,13 @@ class SimulationSession:
             )
         cfg = _apply_initial_state_override(cfg, active_initial_override)
         compute_meta = compute_runtime_metadata(cfg.compute, validate=True)
-        model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+        model = _make_model(cfg)
         active_realism_settings = realism_settings if realism_settings is not None else (self.realism_settings if self.realism_settings is not None else cfg.realism)
         active_realism_settings.validate()
         realism = RealismRuntime(active_realism_settings, seed=seed) if (self.realism_enabled or active_realism_settings.enabled) and RealismRuntime.has_any_effect(active_realism_settings) else None
         angles_rad = np.linspace(-np.pi, np.pi, self.angle_count, endpoint=False, dtype=float)
         center = (model.R0, model.Z0)
-        psi0 = model.compute_psi()
+        psi0 = _model_compute_psi_for_boundary(model)
         boundary_found = True
         boundary_reason = None
         try:
@@ -226,8 +227,9 @@ class SimulationSession:
             pfc_derivs = actuation.pfc_applied
             sol_derivs = actuation.sol_applied
         state = model.step(pfc_current_derivs=pfc_derivs, sol_current_derivs=sol_derivs)
-        psi_true = model.compute_psi()
-        model.state.psi = psi_true
+        psi_true = _model_compute_psi_for_boundary(model)
+        if not isinstance(model, GpuPlasmaModel):
+            model.state.psi = psi_true
 
         boundary_found = True
         boundary_reason = None
@@ -359,11 +361,29 @@ class SimulationSession:
             derivative_limit_margin=derivative_margin,
         )
 
-    def _require_ready(self) -> tuple[LoadedConfig, PlasmaModel, MachineSpec, Scenario, np.ndarray, RealismRuntime | None]:
+    def _require_ready(self) -> tuple[LoadedConfig, PlasmaModel | GpuPlasmaModel, MachineSpec, Scenario, np.ndarray, RealismRuntime | None]:
         """Вернуть runtime-объекты после успешного reset."""
         if self._cfg is None or self._model is None or self._machine is None or self._scenario is None or self._angles_rad is None:
             raise RuntimeError("SimulationSession.reset() must be called before stepping")
         return self._cfg, self._model, self._machine, self._scenario, self._angles_rad, self._realism
+
+
+def _make_model(cfg: LoadedConfig) -> PlasmaModel | GpuPlasmaModel:
+    if cfg.compute.backend == "gpu":
+        return GpuPlasmaModel.from_settings(
+            grid=cfg.grid,
+            pfc=cfg.pfc,
+            sol=cfg.sol,
+            settings=cfg.physics,
+            gpu_device=cfg.compute.gpu_device,
+        )
+    return PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+
+
+def _model_compute_psi_for_boundary(model: PlasmaModel | GpuPlasmaModel):
+    if isinstance(model, GpuPlasmaModel):
+        return model.compute_psi_tensor()
+    return model.compute_psi()
 
 
 def _apply_initial_state_override(cfg: LoadedConfig, override: InitialStateOverride | None) -> LoadedConfig:

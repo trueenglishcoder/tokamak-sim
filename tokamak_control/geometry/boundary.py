@@ -51,13 +51,14 @@ def configure_boundary_profiling(
     *,
     enabled: bool,
     summary_every: int = 0,
+    reset: bool = True,
 ) -> None:
     """Настроить сбор профиля поиска границы плазмы."""
     _PROFILER.configure(
         enabled=enabled,
         summary_every=summary_every,
         logger=get_logger("geometry.boundary.profiling"),
-        reset=True,
+        reset=reset,
     )
 
 

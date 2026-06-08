@@ -42,6 +42,9 @@ def compute_runtime_metadata(settings: ComputeSettings, *, validate: bool = Fals
     if settings.backend == "cpu":
         return {
             "backend": "cpu",
+            "plant_backend": "cpu",
+            "boundary_backend": "cpu",
+            "batched_env_backend": "cpu",
             "gpu_device": settings.gpu_device,
             "boundary_equivalence_mode": settings.boundary_equivalence_mode,
             "torch_version": None,
@@ -56,6 +59,9 @@ def compute_runtime_metadata(settings: ComputeSettings, *, validate: bool = Fals
             raise RuntimeError("GPU compute backend requires tokamak-sim[gpu] with torch installed") from exc
         return {
             "backend": "gpu",
+            "plant_backend": "gpu",
+            "boundary_backend": "gpu",
+            "batched_env_backend": "gpu",
             "gpu_device": settings.gpu_device,
             "boundary_equivalence_mode": settings.boundary_equivalence_mode,
             "torch_version": None,
@@ -82,6 +88,9 @@ def compute_runtime_metadata(settings: ComputeSettings, *, validate: bool = Fals
 
     return {
         "backend": "gpu",
+        "plant_backend": "gpu",
+        "boundary_backend": "gpu",
+        "batched_env_backend": "gpu",
         "gpu_device": settings.gpu_device,
         "boundary_equivalence_mode": settings.boundary_equivalence_mode,
         "torch_version": str(torch.__version__),
