@@ -7,26 +7,82 @@ from typing import Literal
 import numpy as np
 
 from tokamak_control.core.grid import Grid2D
-from tokamak_control.geometry.boundary import (
+from tokamak_control.geometry.boundary_common import (
     BoundaryMode,
     BoundaryNotFoundError,
     BoundaryStatus,
-    _MagneticAxis,
-    _close_poly,
-    _encloses_center,
-    _is_closed_poly,
-    _limited_candidate_levels,
-    _ordered_limiter_contact_levels,
-    _point_to_polyline_distance,
-    _points_in_or_on_polygon,
-    _poly_area,
-    _poly_fits_limiter,
-    _polyline_to_points_distance,
-    _prepare_limiter_shape,
-    _psi_at_nearest_grid_point,
-    _sample_limiter_points,
-    _time_block,
+    MagneticAxis as _MagneticAxis,
+    close_poly as _close_poly,
+    encloses_center as _encloses_center,
+    is_closed_poly as _is_closed_poly,
+    ordered_limiter_contact_levels as _ordered_limiter_contact_levels,
+    point_to_polyline_distance as _point_to_polyline_distance,
+    points_in_or_on_polygon as _points_in_or_on_polygon,
+    poly_area as _poly_area,
+    poly_fits_limiter as _poly_fits_limiter,
+    polyline_to_points_distance as _polyline_to_points_distance,
+    prepare_limiter_shape as _prepare_limiter_shape,
+    sample_limiter_points as _sample_limiter_points,
 )
+
+from tokamak_control.io.logger import get_logger
+from tokamak_control.io.profiling import Profiler
+
+
+_PROFILER = Profiler(
+    enabled=False,
+    summary_every=0,
+    logger=get_logger("geometry.boundary_gpu.profiling"),
+)
+_time_block = _PROFILER.time_block
+_record_path = _PROFILER.record_path
+
+
+def configure_boundary_gpu_profiling(*, enabled: bool, summary_every: int = 0, reset: bool = True) -> None:
+    _PROFILER.configure(
+        enabled=enabled,
+        summary_every=summary_every,
+        logger=get_logger("geometry.boundary_gpu.profiling"),
+        reset=reset,
+    )
+
+
+def boundary_gpu_profiling_snapshot() -> dict[str, object]:
+    return _PROFILER.summary_dict(
+        total_key="boundary_total",
+        keys=(
+            "axis_search",
+            "limiter_mask",
+            "level_generation",
+            "limited_contact_levels",
+            "marching_squares",
+            "loop_stitching",
+            "candidate_filtering",
+            "xpoint_search",
+            "final_cpu_transfer",
+        ),
+        path_keys=("limited_success", "separatrix_success"),
+        title="boundary_gpu",
+    )
+
+
+def log_boundary_gpu_profiling_summary() -> None:
+    _PROFILER.log_summary(
+        total_key="boundary_total",
+        keys=(
+            "axis_search",
+            "limiter_mask",
+            "level_generation",
+            "limited_contact_levels",
+            "marching_squares",
+            "loop_stitching",
+            "candidate_filtering",
+            "xpoint_search",
+            "final_cpu_transfer",
+        ),
+        path_keys=("limited_success", "separatrix_success"),
+        title="boundary_gpu",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +131,6 @@ def find_plasma_boundary_gpu_with_status(
 
     with _time_block("boundary_total"):
         psi_t = _psi_tensor(psi, grid=grid, runtime=runtime)
-        psi_arr = psi_t.detach().cpu().numpy().astype(float, copy=True)
         limiter_poly = _prepare_limiter_shape(limiter_shape)
         limiter_tol = 0.5 * min(abs(float(grid.r.step)), abs(float(grid.z.step)))
         with _time_block("axis_search"):
@@ -91,7 +146,6 @@ def find_plasma_boundary_gpu_with_status(
         if boundary_mode == "limited":
             found = _limited_boundary_gpu(
                 psi_t=psi_t,
-                psi_np=psi_arr,
                 grid=grid,
                 axis=axis,
                 limiter_poly=limiter_poly,
@@ -101,12 +155,13 @@ def find_plasma_boundary_gpu_with_status(
             )
             if found is not None:
                 poly, level = found
-                return _close_poly(poly), float(level), "limited_success"
+                _record_path("limited_success")
+                with _time_block("final_cpu_transfer"):
+                    return _close_poly(poly), float(level), "limited_success"
             raise BoundaryNotFoundError("No limited plasma boundary found inside limiter")
 
         found = _separatrix_boundary_gpu(
             psi_t=psi_t,
-            psi_np=psi_arr,
             grid=grid,
             axis=axis.point,
             limiter_poly=limiter_poly,
@@ -115,7 +170,9 @@ def find_plasma_boundary_gpu_with_status(
         )
         if found is not None:
             poly, level = found
-            return _close_poly(poly), float(level), "separatrix_success"
+            _record_path("separatrix_success")
+            with _time_block("final_cpu_transfer"):
+                return _close_poly(poly), float(level), "separatrix_success"
         raise BoundaryNotFoundError("No diverted plasma separatrix boundary found")
 
 
@@ -265,7 +322,6 @@ def _select_axis_candidate_gpu(candidates: list[tuple[float, float, float, str, 
 def _limited_boundary_gpu(
     *,
     psi_t,
-    psi_np: np.ndarray,
     grid: Grid2D,
     axis: _MagneticAxis,
     limiter_poly: np.ndarray | None,
@@ -374,7 +430,6 @@ def _select_limited_contact_candidate(
 def _outermost_limited_boundary_gpu(
     *,
     psi_t,
-    psi_np: np.ndarray,
     grid: Grid2D,
     axis: _MagneticAxis,
     limiter_poly: np.ndarray,
@@ -382,13 +437,14 @@ def _outermost_limited_boundary_gpu(
     n_levels: int,
     runtime: _TorchRuntime,
 ) -> tuple[np.ndarray, float] | None:
-    levels = _limited_candidate_levels(
-        psi=psi_np,
+    levels = _limited_candidate_levels_gpu(
+        psi_t=psi_t,
         grid=grid,
         axis=axis,
         limiter_poly=limiter_poly,
         limiter_tol=limiter_tol,
         n_levels=n_levels,
+        runtime=runtime,
     )
     if levels.size == 0:
         return None
@@ -417,7 +473,6 @@ def _outermost_limited_boundary_gpu(
 def _separatrix_boundary_gpu(
     *,
     psi_t,
-    psi_np: np.ndarray,
     grid: Grid2D,
     axis: tuple[float, float],
     limiter_poly: np.ndarray | None,
@@ -431,7 +486,7 @@ def _separatrix_boundary_gpu(
         return None
     candidates: list[tuple[np.ndarray, float, float]] = []
     for point in x_points:
-        level = _psi_at_nearest_grid_point(psi_np, grid, (float(point[0]), float(point[1])))
+        level = _psi_at_nearest_grid_point_gpu(psi_t, grid, (float(point[0]), float(point[1])), runtime)
         if not np.isfinite(level):
             continue
         for poly in _contours_at_level_gpu(psi_t, grid, float(level), runtime):
@@ -452,6 +507,51 @@ def _separatrix_boundary_gpu(
         return None
     best_poly, best_level, _area = max(candidates, key=lambda item: item[2])
     return best_poly, best_level
+
+
+def _limited_candidate_levels_gpu(
+    *,
+    psi_t,
+    grid: Grid2D,
+    axis: _MagneticAxis,
+    limiter_poly: np.ndarray,
+    limiter_tol: float,
+    n_levels: int,
+    runtime: _TorchRuntime,
+) -> np.ndarray:
+    torch = runtime.torch
+    with _time_block("level_generation"):
+        limiter_mask = _limiter_mask_gpu(grid, limiter_poly, limiter_tol, runtime)
+        inside = psi_t[limiter_mask & torch.isfinite(psi_t)]
+        if int(inside.numel()) == 0:
+            return np.zeros((0,), dtype=float)
+        count = max(int(n_levels), 1024)
+        axis_level = float(axis.level)
+        if axis.kind == "maximum":
+            edge_level = float(torch.min(inside).detach().cpu())
+            if edge_level >= axis_level:
+                return np.zeros((0,), dtype=float)
+            levels = torch.linspace(axis_level, edge_level, count + 2, dtype=torch.float64, device=runtime.device)[1:-1]
+            levels = torch.unique(torch.round(levels * 1.0e14) / 1.0e14)
+            return torch.sort(levels, descending=True).values.detach().cpu().numpy().astype(float, copy=True)
+        edge_level = float(torch.max(inside).detach().cpu())
+        if edge_level <= axis_level:
+            return np.zeros((0,), dtype=float)
+        levels = torch.linspace(axis_level, edge_level, count + 2, dtype=torch.float64, device=runtime.device)[1:-1]
+        levels = torch.unique(torch.round(levels * 1.0e14) / 1.0e14)
+        return torch.sort(levels).values.detach().cpu().numpy().astype(float, copy=True)
+
+
+def _psi_at_nearest_grid_point_gpu(psi_t, grid: Grid2D, point: tuple[float, float], runtime: _TorchRuntime) -> float:
+    torch = runtime.torch
+    r, z = _grid_tensors(grid, runtime)
+    target_r = torch.tensor(float(point[0]), dtype=torch.float64, device=runtime.device)
+    target_z = torch.tensor(float(point[1]), dtype=torch.float64, device=runtime.device)
+    i = int(torch.argmin(torch.abs(r - target_r)).detach().cpu())
+    j = int(torch.argmin(torch.abs(z - target_z)).detach().cpu())
+    if tuple(psi_t.shape) != tuple(grid.shape):
+        return float("nan")
+    return float(psi_t[j, i].detach().cpu())
 
 
 def _sample_psi_bilinear_gpu(psi_t, grid: Grid2D, points: np.ndarray, runtime: _TorchRuntime) -> np.ndarray:
@@ -488,8 +588,9 @@ def _sample_psi_bilinear_gpu(psi_t, grid: Grid2D, points: np.ndarray, runtime: _
 
 
 def _contours_at_level_gpu(psi_t, grid: Grid2D, level: float, runtime: _TorchRuntime) -> list[np.ndarray]:
-    with _time_block("contours_at_level"):
+    with _time_block("marching_squares"):
         segments = _marching_square_segments_gpu(psi_t, grid, float(level), runtime)
+    with _time_block("loop_stitching"):
         return _stitch_segments_to_polylines(segments)
 
 
@@ -499,8 +600,9 @@ def _contours_at_levels_gpu(psi_t, grid: Grid2D, levels: np.ndarray, runtime: _T
         return []
     if levels_arr.size == 1:
         return [_contours_at_level_gpu(psi_t, grid, float(levels_arr[0]), runtime)]
-    with _time_block("contours_at_level"):
+    with _time_block("marching_squares"):
         grouped_segments = _marching_square_segments_for_levels_gpu(psi_t, grid, levels_arr, runtime)
+    with _time_block("loop_stitching"):
         return [_stitch_segments_to_polylines(grouped_segments[idx]) for idx in range(levels_arr.size)]
 
 
