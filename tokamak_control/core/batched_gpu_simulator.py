@@ -349,7 +349,9 @@ class BatchedGpuTokamakSimulator:
             b = int(self.batch_size)
             n_angles = int(self.angles_rad.size)
             fracs = self._ray_sample_fracs
-            radii_samples = self._ray_caps[None, :, None] * fracs[None, None, :]
+            ray_tol = 2.0 * float(max(abs(float(self.grid.r.step)), abs(float(self.grid.z.step))))
+            ray_caps = self._ray_caps + ray_tol
+            radii_samples = ray_caps[None, :, None] * fracs[None, None, :]
             center = torch.tensor([float(self.settings.R0), float(self.settings.Z0)], dtype=torch.float64, device=self.device)
             sample_points = center[None, None, None, :] + radii_samples[:, :, :, None] * self._dirs[None, :, None, :]
             psi_samples = self._sample_points(psi=self._psi, points=sample_points.reshape(n_angles * int(fracs.numel()), 2)).reshape(b, n_angles, int(fracs.numel()))
@@ -371,7 +373,7 @@ class BatchedGpuTokamakSimulator:
             frac = torch.clamp(frac, 0.0, 1.0)
             radii = torch.where(any_hit, r0 + frac * (r1 - r0), torch.full_like(r0, torch.nan))
             points = center[None, None, :] + radii[:, :, None] * self._dirs[None, :, :]
-            valid = torch.all(any_hit & torch.isfinite(radii) & (radii <= self._ray_caps[None, :] + 2.0 * max(abs(float(self.grid.r.step)), abs(float(self.grid.z.step)))), dim=1)
+            valid = torch.all(any_hit & torch.isfinite(radii) & (radii <= self._ray_caps[None, :] + ray_tol), dim=1)
             return radii, points, valid
 
     def _sample_points(self, psi, points):
