@@ -100,8 +100,9 @@ def fixed_angle_boundary_gpu(
     axis_points, axis_levels, axis_kind = _axis_search(psi_t, grid, center, limiter)
     if str(boundary_mode) == "limited":
         limiter_psi = _sample_limiter_psi(psi_t, grid, limiter)
-        high = torch.nanmax(limiter_psi, dim=1).values
-        low = torch.nanmin(limiter_psi, dim=1).values
+        finite_limiter = torch.isfinite(limiter_psi)
+        high = torch.max(torch.where(finite_limiter, limiter_psi, torch.full_like(limiter_psi, -torch.inf)), dim=1).values
+        low = torch.min(torch.where(finite_limiter, limiter_psi, torch.full_like(limiter_psi, torch.inf)), dim=1).values
         level = torch.where(axis_kind > 0, high, low)
         status_code = torch.ones((B,), dtype=torch.int64, device=dev)
     elif str(boundary_mode) == "diverted":
