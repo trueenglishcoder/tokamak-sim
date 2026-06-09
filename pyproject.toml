@@ -31,11 +31,11 @@ dependencies = [
 
 
 [project.optional-dependencies]
-gpu = [
-  "torch>=2.5",
-]
 dev = [
   "pytest>=7.4",
+]
+gpu = [
+  "torch>=2.5",
 ]
 
 # Console script entry point — must come AFTER all [project] keys above

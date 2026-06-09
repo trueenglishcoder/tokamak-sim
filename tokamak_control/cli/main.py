@@ -85,16 +85,17 @@ def _add_simulate(p) -> None:
         action="store_true",
         help="Enable measurement and actuation realism for this run.",
     )
+
     ap.add_argument(
         "--compute-backend",
         choices=("cpu", "gpu"),
         default=None,
-        help="Override config compute.backend. Defaults to the value in the TOML config, or cpu if absent.",
+        help="Override config compute backend for the simulator.",
     )
     ap.add_argument(
         "--gpu-device",
         default=None,
-        help="Override config compute.gpu_device when using the GPU backend.",
+        help="CUDA device for --compute-backend gpu, for example cuda:0.",
     )
 
     def _run(args: argparse.Namespace) -> int:

@@ -212,6 +212,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable the live progress bar during the simulation loop.",
     )
     ap.add_argument(
+        "--compute-backend",
+        choices=("cpu", "gpu"),
+        default=None,
+        help="Override config compute backend for the simulator.",
+    )
+    ap.add_argument(
+        "--gpu-device",
+        default=None,
+        help="CUDA device for --compute-backend gpu, for example cuda:0.",
+    )
+    ap.add_argument(
         "--profile",
         action="store_true",
         help="Enable runtime profiling and write a profiling summary JSON into the run directory.",
@@ -221,17 +232,6 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=0,
         help="Print profiling summaries every N timed steps. 0 disables periodic profiling log output.",
-    )
-    ap.add_argument(
-        "--compute-backend",
-        choices=("cpu", "gpu"),
-        default=None,
-        help="Override config compute.backend. Defaults to the value in the TOML config, or cpu if absent.",
-    )
-    ap.add_argument(
-        "--gpu-device",
-        default=None,
-        help="Override config compute.gpu_device when --compute-backend gpu is used.",
     )
     ap.add_argument(
         "--limiter",

@@ -228,6 +228,15 @@ def _coerce_actuator_elements(node: dict, name: str) -> list[np.ndarray]:
     return [positions[i : i + 1].copy() for i in range(positions.shape[0])]
 
 
+
+def _load_compute_settings(cfg: dict) -> ComputeSettings:
+    defaults = ComputeSettings()
+    node = _require_mapping(cfg.get("compute", {}), "compute")
+    return ComputeSettings(
+        backend=str(node.get("backend", defaults.backend)),
+        gpu_device=str(node.get("gpu_device", defaults.gpu_device)),
+    )
+
 def _load_realism_settings(cfg: dict) -> RealismSettings:
     """Read neutral realism settings from the top-level realism table."""
     defaults = RealismSettings()
@@ -267,16 +276,6 @@ def _load_realism_settings(cfg: dict) -> RealismSettings:
         sensors=sensors,
     )
 
-
-def _load_compute_settings(cfg: dict) -> ComputeSettings:
-    """Read runtime compute backend settings from the top-level compute table."""
-    defaults = ComputeSettings()
-    node = _require_mapping(cfg.get("compute", {}), "compute")
-    return ComputeSettings(
-        backend=str(node.get("backend", defaults.backend)),
-        gpu_device=str(node.get("gpu_device", defaults.gpu_device)),
-        boundary_equivalence_mode=str(node.get("boundary_equivalence_mode", defaults.boundary_equivalence_mode)),
-    )
 
 
 def load_config(path: str | Path, initial_currents_path: str | Path | None = None) -> LoadedConfig:
@@ -333,6 +332,7 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
     physics.validate()
 
     compute = _load_compute_settings(cfg)
+    compute.validate(require_available=False)
     realism = _load_realism_settings(cfg)
     realism.validate()
 
@@ -453,6 +453,7 @@ def dump_config(
     path = Path(path)
     physics.validate()
     compute = ComputeSettings() if compute is None else compute
+    compute.validate(require_available=False)
     realism = RealismSettings() if realism is None else realism
     realism.validate()
 
@@ -483,7 +484,6 @@ def dump_config(
         "compute": {
             "backend": compute.backend,
             "gpu_device": compute.gpu_device,
-            "boundary_equivalence_mode": compute.boundary_equivalence_mode,
         },
         "realism": {
             "enabled": realism.enabled,

@@ -1,103 +1,39 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
+from tokamak_control.compute import require_gpu_available
 from tokamak_control.core.grid import Grid2D
-from tokamak_control.geometry.boundary_common import (
-    BoundaryMode,
-    BoundaryNotFoundError,
-    BoundaryStatus,
-    MagneticAxis as _MagneticAxis,
-    close_poly as _close_poly,
-    encloses_center as _encloses_center,
-    is_closed_poly as _is_closed_poly,
-    ordered_limiter_contact_levels as _ordered_limiter_contact_levels,
-    point_to_polyline_distance as _point_to_polyline_distance,
-    points_in_or_on_polygon as _points_in_or_on_polygon,
-    poly_area as _poly_area,
-    poly_fits_limiter as _poly_fits_limiter,
-    polyline_to_points_distance as _polyline_to_points_distance,
-    prepare_limiter_shape as _prepare_limiter_shape,
-    sample_limiter_points as _sample_limiter_points,
-)
-
-from tokamak_control.io.logger import get_logger
-from tokamak_control.io.profiling import Profiler
+from tokamak_control.core.torch_sampling import bilinear_sample_torch_points
+from tokamak_control.geometry.boundary_common import BoundaryMode, BoundaryNotFoundError, BoundaryStatus
 
 
-_PROFILER = Profiler(
-    enabled=False,
-    summary_every=0,
-    logger=get_logger("geometry.boundary_gpu.profiling"),
-)
-_time_block = _PROFILER.time_block
-_record_path = _PROFILER.record_path
+@dataclass(slots=True)
+class FixedAngleBoundaryGpuResult:
+    found: object
+    status_code: object
+    level: object
+    points: object
+    radii: object
+    axis_points: object
 
 
-def configure_boundary_gpu_profiling(*, enabled: bool, summary_every: int = 0, reset: bool = True) -> None:
-    _PROFILER.configure(
-        enabled=enabled,
-        summary_every=summary_every,
-        logger=get_logger("geometry.boundary_gpu.profiling"),
-        reset=reset,
-    )
-
-
-def boundary_gpu_profiling_snapshot() -> dict[str, object]:
-    return _PROFILER.summary_dict(
-        total_key="boundary_total",
-        keys=(
-            "axis_search",
-            "limiter_mask",
-            "level_generation",
-            "limited_contact_levels",
-            "marching_squares",
-            "loop_stitching",
-            "candidate_filtering",
-            "xpoint_search",
-            "final_cpu_transfer",
-        ),
-        path_keys=("limited_success", "separatrix_success"),
-        title="boundary_gpu",
-    )
-
-
-def log_boundary_gpu_profiling_summary() -> None:
-    _PROFILER.log_summary(
-        total_key="boundary_total",
-        keys=(
-            "axis_search",
-            "limiter_mask",
-            "level_generation",
-            "limited_contact_levels",
-            "marching_squares",
-            "loop_stitching",
-            "candidate_filtering",
-            "xpoint_search",
-            "final_cpu_transfer",
-        ),
-        path_keys=("limited_success", "separatrix_success"),
-        title="boundary_gpu",
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _TorchRuntime:
-    torch: object
-    device: object
+def _torch(device: str):
+    require_gpu_available(device)
+    import torch
+    return torch
 
 
 def find_plasma_boundary_gpu_with_status(
-    psi: np.ndarray,
+    psi,
     grid: Grid2D,
     center: tuple[float, float],
-    n_levels: int = 10,
+    n_levels: int = 80,
     prev_level: float | None = None,
-    prev_poly: np.ndarray | None = None,
+    prev_poly=None,
     local_n_levels: int = 7,
     local_span_frac: float = 0.02,
     target_mean_radius: float | None = None,
@@ -105,748 +41,160 @@ def find_plasma_boundary_gpu_with_status(
     target_switch_abs_delta: float = 0.10,
     local_bbox_pad_r: float | None = None,
     local_bbox_pad_z: float | None = None,
-    limiter_shape: np.ndarray | None = None,
+    limiter_shape=None,
     boundary_mode: BoundaryMode = "limited",
     gpu_device: str = "cuda:0",
 ) -> tuple[np.ndarray, float, BoundaryStatus]:
-    """Find the plasma boundary with the CUDA/Torch backend.
-
-    The physical selection rules intentionally mirror the CPU boundary finder.
-    CPU fallback is not allowed here: requesting GPU mode requires a usable CUDA
-    device.
-    """
-    _ = (
-        prev_level,
-        prev_poly,
-        local_n_levels,
-        local_span_frac,
-        target_mean_radius,
-        target_switch_ratio,
-        target_switch_abs_delta,
-        local_bbox_pad_r,
-        local_bbox_pad_z,
+    del n_levels, prev_level, prev_poly, local_n_levels, local_span_frac, target_mean_radius, target_switch_ratio, target_switch_abs_delta, local_bbox_pad_r, local_bbox_pad_z
+    if limiter_shape is None:
+        raise BoundaryNotFoundError("GPU boundary requires limiter geometry")
+    torch = _torch(gpu_device)
+    psi_t = torch.as_tensor(psi, dtype=torch.float64, device=torch.device(gpu_device))
+    if psi_t.ndim == 2:
+        psi_t = psi_t.unsqueeze(0)
+    angles = torch.linspace(-torch.pi, torch.pi, 128, device=psi_t.device, dtype=torch.float64)[:-1]
+    result = fixed_angle_boundary_gpu(
+        psi=psi_t,
+        grid=grid,
+        center=center,
+        angles_rad=angles,
+        limiter_shape=np.asarray(limiter_shape, dtype=float),
+        boundary_mode=boundary_mode,
+        gpu_device=gpu_device,
     )
-    runtime = _require_torch_runtime(gpu_device)
-    torch = runtime.torch
-
-    with _time_block("boundary_total"):
-        psi_t = _psi_tensor(psi, grid=grid, runtime=runtime)
-        limiter_poly = _prepare_limiter_shape(limiter_shape)
-        limiter_tol = 0.5 * min(abs(float(grid.r.step)), abs(float(grid.z.step)))
-        with _time_block("axis_search"):
-            axis = _find_magnetic_axis_gpu(
-                psi_t=psi_t,
-                grid=grid,
-                center=center,
-                limiter_poly=limiter_poly,
-                limiter_tol=limiter_tol,
-                runtime=runtime,
-            )
-
-        if boundary_mode == "limited":
-            found = _limited_boundary_gpu(
-                psi_t=psi_t,
-                grid=grid,
-                axis=axis,
-                limiter_poly=limiter_poly,
-                limiter_tol=limiter_tol,
-                n_levels=n_levels,
-                runtime=runtime,
-            )
-            if found is not None:
-                poly, level = found
-                _record_path("limited_success")
-                with _time_block("final_cpu_transfer"):
-                    return _close_poly(poly), float(level), "limited_success"
-            raise BoundaryNotFoundError("No limited plasma boundary found inside limiter")
-
-        found = _separatrix_boundary_gpu(
-            psi_t=psi_t,
-            grid=grid,
-            axis=axis.point,
-            limiter_poly=limiter_poly,
-            limiter_tol=limiter_tol,
-            runtime=runtime,
-        )
-        if found is not None:
-            poly, level = found
-            _record_path("separatrix_success")
-            with _time_block("final_cpu_transfer"):
-                return _close_poly(poly), float(level), "separatrix_success"
-        raise BoundaryNotFoundError("No diverted plasma separatrix boundary found")
+    if not bool(result.found[0].detach().cpu().item()):
+        raise BoundaryNotFoundError("No GPU plasma boundary found")
+    poly = result.points[0].detach().cpu().numpy().astype(float)
+    if not np.allclose(poly[0], poly[-1]):
+        poly = np.vstack([poly, poly[0]])
+    level = float(result.level[0].detach().cpu().item())
+    status: BoundaryStatus = "limited_success" if int(result.status_code[0].detach().cpu().item()) == 1 else "separatrix_success"
+    return poly, level, status
 
 
-def _psi_tensor(psi, *, grid: Grid2D, runtime: _TorchRuntime):
-    torch = runtime.torch
-    if hasattr(psi, "detach") and hasattr(psi, "device"):
-        psi_t = psi.detach().to(device=runtime.device, dtype=torch.float64)
-    else:
-        psi_t = torch.as_tensor(np.asarray(psi, dtype=float), dtype=torch.float64, device=runtime.device)
-    if tuple(psi_t.shape) != tuple(grid.shape):
-        raise ValueError(f"psi shape {tuple(psi_t.shape)} != grid shape {grid.shape}")
-    return psi_t
-
-
-def _require_torch_runtime(gpu_device: str) -> _TorchRuntime:
-    try:
-        import torch
-    except Exception as exc:  # pragma: no cover - depends on optional dependency
-        raise RuntimeError("GPU compute backend requires tokamak-sim[gpu] with torch installed") from exc
-
-    device = torch.device(str(gpu_device))
-    if device.type != "cuda":
-        raise RuntimeError(f"GPU compute backend requires a CUDA device, got {gpu_device!r}")
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU compute backend requested, but torch.cuda.is_available() is False")
-    try:
-        torch.empty((1,), device=device)
-    except Exception as exc:  # pragma: no cover - depends on host CUDA setup
-        raise RuntimeError(f"GPU compute backend could not initialize device {gpu_device!r}") from exc
-    return _TorchRuntime(torch=torch, device=device)
-
-
-def _grid_tensors(grid: Grid2D, runtime: _TorchRuntime):
-    torch = runtime.torch
-    r = torch.as_tensor(np.asarray(grid.r.coords(), dtype=float), dtype=torch.float64, device=runtime.device)
-    z = torch.as_tensor(np.asarray(grid.z.coords(), dtype=float), dtype=torch.float64, device=runtime.device)
-    return r, z
-
-
-def _limiter_mask_gpu(grid: Grid2D, limiter_poly: np.ndarray, tol: float, runtime: _TorchRuntime):
-    torch = runtime.torch
-    r, z = _grid_tensors(grid, runtime)
-    zz, rr = torch.meshgrid(z, r, indexing="ij")
-    points = torch.stack((rr.reshape(-1), zz.reshape(-1)), dim=1)
-    mask = _points_in_or_on_polygon_gpu(points, limiter_poly, tol, runtime)
-    return mask.reshape(grid.shape)
-
-
-def _points_in_or_on_polygon_gpu(points, polygon: np.ndarray, tol: float, runtime: _TorchRuntime):
-    torch = runtime.torch
-    poly_np = _close_poly(np.asarray(polygon, dtype=float))
-    poly = torch.as_tensor(poly_np, dtype=torch.float64, device=runtime.device)
-    x = points[:, 0]
-    y = points[:, 1]
-    inside = torch.zeros((points.shape[0],), dtype=torch.bool, device=runtime.device)
-    for idx in range(poly.shape[0] - 1):
-        x0 = poly[idx, 0]
-        y0 = poly[idx, 1]
-        x1 = poly[idx + 1, 0]
-        y1 = poly[idx + 1, 1]
-        crosses = (y0 > y) != (y1 > y)
-        x_cross = x0 + (y - y0) * (x1 - x0) / ((y1 - y0) + 1e-30)
-        inside = torch.logical_xor(inside, crosses & (x_cross > x))
-
-    if float(tol) <= 0.0:
-        return inside
-
-    on_edge = torch.zeros_like(inside)
-    tol2 = float(tol) * float(tol)
-    for idx in range(poly.shape[0] - 1):
-        a = poly[idx]
-        b = poly[idx + 1]
-        ab = b - a
-        denom = torch.sum(ab * ab)
-        if float(denom.detach().cpu()) <= 0.0:
-            d2 = torch.sum((points - a) ** 2, dim=1)
-        else:
-            u = torch.clamp(torch.sum((points - a) * ab, dim=1) / denom, 0.0, 1.0)
-            nearest = a + u[:, None] * ab
-            d2 = torch.sum((points - nearest) ** 2, dim=1)
-        on_edge |= d2 <= tol2
-    return inside | on_edge
-
-
-def _find_magnetic_axis_gpu(
+def fixed_angle_boundary_gpu(
     *,
-    psi_t,
+    psi,
     grid: Grid2D,
     center: tuple[float, float],
-    limiter_poly: np.ndarray | None,
-    limiter_tol: float,
-    runtime: _TorchRuntime,
-) -> _MagneticAxis:
-    torch = runtime.torch
-    finite = torch.isfinite(psi_t)
-    if tuple(psi_t.shape) != tuple(grid.shape) or not bool(torch.any(finite).item()):
-        raise BoundaryNotFoundError("No finite psi values available for magnetic axis search")
+    angles_rad,
+    limiter_shape: np.ndarray,
+    boundary_mode: BoundaryMode = "limited",
+    gpu_device: str = "cuda:0",
+    ray_samples: int = 256,
+) -> FixedAngleBoundaryGpuResult:
+    """Return fixed-angle physical boundary samples on CUDA.
 
-    allowed = finite.clone()
-    if limiter_poly is not None:
-        allowed &= _limiter_mask_gpu(grid, limiter_poly, limiter_tol, runtime)
-        if not bool(torch.any(allowed).item()):
-            raise BoundaryNotFoundError("No finite psi values inside limiter for magnetic axis search")
-
-    nz, nr = psi_t.shape
-    r, z = _grid_tensors(grid, runtime)
-    candidates: list[tuple[float, float, float, str, int, int]] = []
-    if nz >= 3 and nr >= 3:
-        import torch.nn.functional as F
-
-        x = psi_t[None, None, :, :]
-        max3 = F.max_pool2d(torch.where(torch.isfinite(x), x, torch.full_like(x, -torch.inf)), 3, stride=1, padding=1)[0, 0]
-        min3 = -F.max_pool2d(torch.where(torch.isfinite(x), -x, torch.full_like(x, -torch.inf)), 3, stride=1, padding=1)[0, 0]
-        interior = torch.zeros_like(allowed)
-        interior[1:-1, 1:-1] = True
-        maxima = allowed & interior & (psi_t >= max3)
-        minima = allowed & interior & (psi_t <= min3)
-        for kind, mask in (("maximum", maxima), ("minimum", minima)):
-            idx = torch.nonzero(mask, as_tuple=False).detach().cpu().numpy()
-            for j, i in idx:
-                candidates.append((float(r[int(i)].detach().cpu()), float(z[int(j)].detach().cpu()), float(psi_t[int(j), int(i)].detach().cpu()), kind, int(j), int(i)))
-
-    if candidates:
-        return _select_axis_candidate_gpu(candidates, center)
-
-    masked = torch.where(allowed, psi_t, torch.full_like(psi_t, torch.nan))
-    finite_masked = torch.isfinite(masked)
-    if not bool(torch.any(finite_masked).item()):
-        raise BoundaryNotFoundError("No finite psi values available for magnetic axis search")
-    max_flat = int(torch.nanargmax(masked).detach().cpu())
-    min_flat = int(torch.nanargmin(masked).detach().cpu())
-    max_j, max_i = divmod(max_flat, nr)
-    min_j, min_i = divmod(min_flat, nr)
-    fallback = [
-        (float(r[max_i].detach().cpu()), float(z[max_j].detach().cpu()), float(masked[max_j, max_i].detach().cpu()), "maximum", max_j, max_i),
-        (float(r[min_i].detach().cpu()), float(z[min_j].detach().cpu()), float(masked[min_j, min_i].detach().cpu()), "minimum", min_j, min_i),
-    ]
-    return _select_axis_candidate_gpu(fallback, center)
-
-
-def _select_axis_candidate_gpu(candidates: list[tuple[float, float, float, str, int, int]], center: tuple[float, float]) -> _MagneticAxis:
-    c = np.asarray(center, dtype=float)
-    best = min(candidates, key=lambda item: (float(np.linalg.norm(np.asarray(item[:2], dtype=float) - c)), item[4], item[5], item[3]))
-    return _MagneticAxis(point=(best[0], best[1]), level=float(best[2]), kind=best[3])  # type: ignore[arg-type]
-
-
-def _limited_boundary_gpu(
-    *,
-    psi_t,
-    grid: Grid2D,
-    axis: _MagneticAxis,
-    limiter_poly: np.ndarray | None,
-    limiter_tol: float,
-    n_levels: int,
-    runtime: _TorchRuntime,
-) -> tuple[np.ndarray, float] | None:
-    if limiter_poly is None:
-        raise RuntimeError("Limited boundary mode requires limiter geometry")
-    contact = _limited_limiter_contact_boundary_gpu(
-        psi_t=psi_t,
-        grid=grid,
-        axis=axis,
-        limiter_poly=limiter_poly,
-        limiter_tol=limiter_tol,
-        runtime=runtime,
-    )
-    if contact is not None:
-        return contact
-    return _outermost_limited_boundary_gpu(
-        psi_t=psi_t,
-        grid=grid,
-        axis=axis,
-        limiter_poly=limiter_poly,
-        limiter_tol=limiter_tol,
-        n_levels=n_levels,
-        runtime=runtime,
-    )
-
-
-def _limited_limiter_contact_boundary_gpu(
-    *,
-    psi_t,
-    grid: Grid2D,
-    axis: _MagneticAxis,
-    limiter_poly: np.ndarray,
-    limiter_tol: float,
-    runtime: _TorchRuntime,
-) -> tuple[np.ndarray, float] | None:
-    with _time_block("limited_contact_levels"):
-        limiter_points = _sample_limiter_points(limiter_poly, grid)
-        limiter_psi = _sample_psi_bilinear_gpu(psi_t, grid, limiter_points, runtime)
-        valid = np.isfinite(limiter_psi)
-    if not bool(np.any(valid)):
-        return None
-
-    points = limiter_points[valid]
-    values = limiter_psi[valid]
-    rounded_values = np.round(values, 14)
-    touch_tol = 2.5 * float(max(abs(float(grid.r.step)), abs(float(grid.z.step)), float(limiter_tol)))
-    levels = _ordered_limiter_contact_levels(values, axis)
-
-    for contact_level in levels:
-        contours = _contours_at_level_gpu(psi_t, grid, float(contact_level), runtime)
-        result = _select_limited_contact_candidate(
-            contours=contours,
-            contact_level=float(contact_level),
-            points=points,
-            rounded_values=rounded_values,
-            axis=axis,
-            limiter_poly=limiter_poly,
-            limiter_tol=limiter_tol,
-            touch_tol=touch_tol,
-        )
-        if result is not None:
-            return result
-    return None
-
-
-def _select_limited_contact_candidate(
-    *,
-    contours: list[np.ndarray],
-    contact_level: float,
-    points: np.ndarray,
-    rounded_values: np.ndarray,
-    axis: _MagneticAxis,
-    limiter_poly: np.ndarray,
-    limiter_tol: float,
-    touch_tol: float,
-) -> tuple[np.ndarray, float] | None:
-        contact_points = points[rounded_values == float(contact_level)]
-        if contact_points.shape[0] == 0:
-            return None
-        candidates: list[tuple[np.ndarray, float]] = []
-        for poly in contours:
-            with _time_block("candidate_filtering"):
-                if not _is_closed_poly(poly):
-                    continue
-                if not _encloses_center(poly, axis.point):
-                    continue
-                closed = _close_poly(poly)
-                if not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
-                    continue
-                contact_dist = _polyline_to_points_distance(closed, contact_points)
-                if contact_dist > touch_tol:
-                    continue
-                candidates.append((closed, float(contact_dist)))
-        if not candidates:
-            return None
-        best_poly, _dist = min(candidates, key=lambda item: item[1])
-        return best_poly, float(contact_level)
-
-
-def _outermost_limited_boundary_gpu(
-    *,
-    psi_t,
-    grid: Grid2D,
-    axis: _MagneticAxis,
-    limiter_poly: np.ndarray,
-    limiter_tol: float,
-    n_levels: int,
-    runtime: _TorchRuntime,
-) -> tuple[np.ndarray, float] | None:
-    levels = _limited_candidate_levels_gpu(
-        psi_t=psi_t,
-        grid=grid,
-        axis=axis,
-        limiter_poly=limiter_poly,
-        limiter_tol=limiter_tol,
-        n_levels=n_levels,
-        runtime=runtime,
-    )
-    if levels.size == 0:
-        return None
-    candidates: list[tuple[np.ndarray, float, float]] = []
-    for level_chunk in _level_chunks(levels):
-        contours_by_level = _contours_at_levels_gpu(psi_t, grid, level_chunk, runtime)
-        for level, contours in zip(level_chunk, contours_by_level, strict=True):
-            for poly in contours:
-                with _time_block("candidate_filtering"):
-                    if not _is_closed_poly(poly):
-                        continue
-                    if not _encloses_center(poly, axis.point):
-                        continue
-                    closed = _close_poly(poly)
-                    if not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
-                        continue
-                    area = abs(_poly_area(closed))
-                    if np.isfinite(area) and area > 0.0:
-                        candidates.append((closed, float(level), float(area)))
-    if not candidates:
-        return None
-    best_poly, best_level, _area = max(candidates, key=lambda item: item[2])
-    return best_poly, best_level
-
-
-def _separatrix_boundary_gpu(
-    *,
-    psi_t,
-    grid: Grid2D,
-    axis: tuple[float, float],
-    limiter_poly: np.ndarray | None,
-    limiter_tol: float,
-    runtime: _TorchRuntime,
-) -> tuple[np.ndarray, float] | None:
-    min_sep = 2.0 * float(max(abs(float(grid.r.step)), abs(float(grid.z.step))))
-    with _time_block("xpoint_search"):
-        x_points = _find_x_points_gpu(psi_t, grid, max_points=8, min_separation=min_sep, runtime=runtime)
-    if x_points.shape[0] == 0:
-        return None
-    candidates: list[tuple[np.ndarray, float, float]] = []
-    for point in x_points:
-        level = _psi_at_nearest_grid_point_gpu(psi_t, grid, (float(point[0]), float(point[1])), runtime)
-        if not np.isfinite(level):
-            continue
-        for poly in _contours_at_level_gpu(psi_t, grid, float(level), runtime):
-            with _time_block("candidate_filtering"):
-                if not _is_closed_poly(poly):
-                    continue
-                if not _encloses_center(poly, axis):
-                    continue
-                closed = _close_poly(poly)
-                if _point_to_polyline_distance(np.asarray(point, dtype=float), closed) > min_sep:
-                    continue
-                if limiter_poly is not None and not _poly_fits_limiter(closed, limiter_poly, tol=limiter_tol):
-                    continue
-                area = abs(_poly_area(closed))
-                if np.isfinite(area) and area > 0.0:
-                    candidates.append((closed, float(level), float(area)))
-    if not candidates:
-        return None
-    best_poly, best_level, _area = max(candidates, key=lambda item: item[2])
-    return best_poly, best_level
-
-
-def _limited_candidate_levels_gpu(
-    *,
-    psi_t,
-    grid: Grid2D,
-    axis: _MagneticAxis,
-    limiter_poly: np.ndarray,
-    limiter_tol: float,
-    n_levels: int,
-    runtime: _TorchRuntime,
-) -> np.ndarray:
-    torch = runtime.torch
-    with _time_block("level_generation"):
-        limiter_mask = _limiter_mask_gpu(grid, limiter_poly, limiter_tol, runtime)
-        inside = psi_t[limiter_mask & torch.isfinite(psi_t)]
-        if int(inside.numel()) == 0:
-            return np.zeros((0,), dtype=float)
-        count = max(int(n_levels), 1024)
-        axis_level = float(axis.level)
-        if axis.kind == "maximum":
-            edge_level = float(torch.min(inside).detach().cpu())
-            if edge_level >= axis_level:
-                return np.zeros((0,), dtype=float)
-            levels = torch.linspace(axis_level, edge_level, count + 2, dtype=torch.float64, device=runtime.device)[1:-1]
-            levels = torch.unique(torch.round(levels * 1.0e14) / 1.0e14)
-            return torch.sort(levels, descending=True).values.detach().cpu().numpy().astype(float, copy=True)
-        edge_level = float(torch.max(inside).detach().cpu())
-        if edge_level <= axis_level:
-            return np.zeros((0,), dtype=float)
-        levels = torch.linspace(axis_level, edge_level, count + 2, dtype=torch.float64, device=runtime.device)[1:-1]
-        levels = torch.unique(torch.round(levels * 1.0e14) / 1.0e14)
-        return torch.sort(levels).values.detach().cpu().numpy().astype(float, copy=True)
-
-
-def _psi_at_nearest_grid_point_gpu(psi_t, grid: Grid2D, point: tuple[float, float], runtime: _TorchRuntime) -> float:
-    torch = runtime.torch
-    r, z = _grid_tensors(grid, runtime)
-    target_r = torch.tensor(float(point[0]), dtype=torch.float64, device=runtime.device)
-    target_z = torch.tensor(float(point[1]), dtype=torch.float64, device=runtime.device)
-    i = int(torch.argmin(torch.abs(r - target_r)).detach().cpu())
-    j = int(torch.argmin(torch.abs(z - target_z)).detach().cpu())
-    if tuple(psi_t.shape) != tuple(grid.shape):
-        return float("nan")
-    return float(psi_t[j, i].detach().cpu())
-
-
-def _sample_psi_bilinear_gpu(psi_t, grid: Grid2D, points: np.ndarray, runtime: _TorchRuntime) -> np.ndarray:
-    torch = runtime.torch
-    pts = torch.as_tensor(np.asarray(points, dtype=float), dtype=torch.float64, device=runtime.device)
-    r, z = _grid_tensors(grid, runtime)
-    out = torch.full((pts.shape[0],), torch.nan, dtype=torch.float64, device=runtime.device)
-    in_bounds = (pts[:, 0] >= r[0]) & (pts[:, 0] <= r[-1]) & (pts[:, 1] >= z[0]) & (pts[:, 1] <= z[-1])
-    if not bool(torch.any(in_bounds).item()):
-        return out.detach().cpu().numpy()
-    idx = torch.nonzero(in_bounds, as_tuple=False).reshape(-1)
-    p = pts[idx]
-    i0 = torch.searchsorted(r, p[:, 0].contiguous(), right=True) - 1
-    j0 = torch.searchsorted(z, p[:, 1].contiguous(), right=True) - 1
-    i0 = torch.clamp(i0, 0, grid.r.size - 2)
-    j0 = torch.clamp(j0, 0, grid.z.size - 2)
-    r0 = r[i0]
-    r1 = r[i0 + 1]
-    z0 = z[j0]
-    z1 = z[j0 + 1]
-    valid = (r1 > r0) & (z1 > z0)
-    if bool(torch.any(valid).item()):
-        vi = idx[valid]
-        i = i0[valid]
-        j = j0[valid]
-        ar = (p[valid, 0] - r0[valid]) / (r1[valid] - r0[valid])
-        az = (p[valid, 1] - z0[valid]) / (z1[valid] - z0[valid])
-        q00 = psi_t[j, i]
-        q10 = psi_t[j, i + 1]
-        q01 = psi_t[j + 1, i]
-        q11 = psi_t[j + 1, i + 1]
-        out[vi] = (1.0 - ar) * (1.0 - az) * q00 + ar * (1.0 - az) * q10 + (1.0 - ar) * az * q01 + ar * az * q11
-    return out.detach().cpu().numpy()
-
-
-def _contours_at_level_gpu(psi_t, grid: Grid2D, level: float, runtime: _TorchRuntime) -> list[np.ndarray]:
-    with _time_block("marching_squares"):
-        segments = _marching_square_segments_gpu(psi_t, grid, float(level), runtime)
-    with _time_block("loop_stitching"):
-        return _stitch_segments_to_polylines(segments)
-
-
-def _contours_at_levels_gpu(psi_t, grid: Grid2D, levels: np.ndarray, runtime: _TorchRuntime) -> list[list[np.ndarray]]:
-    levels_arr = np.ascontiguousarray(np.asarray(levels, dtype=float).reshape(-1))
-    if levels_arr.size == 0:
-        return []
-    if levels_arr.size == 1:
-        return [_contours_at_level_gpu(psi_t, grid, float(levels_arr[0]), runtime)]
-    with _time_block("marching_squares"):
-        grouped_segments = _marching_square_segments_for_levels_gpu(psi_t, grid, levels_arr, runtime)
-    with _time_block("loop_stitching"):
-        return [_stitch_segments_to_polylines(grouped_segments[idx]) for idx in range(levels_arr.size)]
-
-
-def _level_chunks(levels: np.ndarray, *, chunk_size: int = 64):
-    arr = np.ascontiguousarray(np.asarray(levels, dtype=float).reshape(-1))
-    for start in range(0, arr.size, int(chunk_size)):
-        yield arr[start : start + int(chunk_size)]
-
-
-def _marching_square_segments_gpu(psi_t, grid: Grid2D, level: float, runtime: _TorchRuntime) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    torch = runtime.torch
-    r, z = _grid_tensors(grid, runtime)
-    bl = psi_t[:-1, :-1]
-    br = psi_t[:-1, 1:]
-    tr = psi_t[1:, 1:]
-    tl = psi_t[1:, :-1]
-    finite = torch.isfinite(bl) & torch.isfinite(br) & torch.isfinite(tr) & torch.isfinite(tl)
-    above = [bl >= level, br >= level, tr >= level, tl >= level]
-    case = above[0].to(torch.int16) + 2 * above[1].to(torch.int16) + 4 * above[2].to(torch.int16) + 8 * above[3].to(torch.int16)
-    active = finite & (case != 0) & (case != 15)
-    indices = torch.nonzero(active, as_tuple=False)
-    if indices.numel() == 0:
-        return []
-    idx_np = indices.detach().cpu().numpy()
-    case_np = case[active].detach().cpu().numpy().astype(int)
-    bl_np = bl[active].detach().cpu().numpy()
-    br_np = br[active].detach().cpu().numpy()
-    tr_np = tr[active].detach().cpu().numpy()
-    tl_np = tl[active].detach().cpu().numpy()
-    r_np = r.detach().cpu().numpy()
-    z_np = z.detach().cpu().numpy()
-    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
-    for (j_raw, i_raw), c, v_bl, v_br, v_tr, v_tl in zip(idx_np, case_np, bl_np, br_np, tr_np, tl_np, strict=True):
-        j = int(j_raw)
-        i = int(i_raw)
-        pairs = _case_edge_pairs(c, float(v_bl), float(v_br), float(v_tr), float(v_tl), float(level))
-        if not pairs:
-            continue
-        pts = {
-            0: _interp_edge((r_np[i], z_np[j]), (r_np[i + 1], z_np[j]), float(v_bl), float(v_br), float(level)),
-            1: _interp_edge((r_np[i + 1], z_np[j]), (r_np[i + 1], z_np[j + 1]), float(v_br), float(v_tr), float(level)),
-            2: _interp_edge((r_np[i], z_np[j + 1]), (r_np[i + 1], z_np[j + 1]), float(v_tl), float(v_tr), float(level)),
-            3: _interp_edge((r_np[i], z_np[j]), (r_np[i], z_np[j + 1]), float(v_bl), float(v_tl), float(level)),
-        }
-        for ea, eb in pairs:
-            segments.append((pts[ea], pts[eb]))
-    return segments
-
-
-def _marching_square_segments_for_levels_gpu(psi_t, grid: Grid2D, levels: np.ndarray, runtime: _TorchRuntime) -> list[list[tuple[tuple[float, float], tuple[float, float]]]]:
-    torch = runtime.torch
-    levels_arr = np.ascontiguousarray(np.asarray(levels, dtype=float).reshape(-1))
-    level_t = torch.as_tensor(levels_arr, dtype=torch.float64, device=runtime.device)
-    r, z = _grid_tensors(grid, runtime)
-    bl = psi_t[:-1, :-1]
-    br = psi_t[:-1, 1:]
-    tr = psi_t[1:, 1:]
-    tl = psi_t[1:, :-1]
-    finite = torch.isfinite(bl) & torch.isfinite(br) & torch.isfinite(tr) & torch.isfinite(tl)
-    bl_above = bl[None, :, :] >= level_t[:, None, None]
-    br_above = br[None, :, :] >= level_t[:, None, None]
-    tr_above = tr[None, :, :] >= level_t[:, None, None]
-    tl_above = tl[None, :, :] >= level_t[:, None, None]
-    case = bl_above.to(torch.int16) + 2 * br_above.to(torch.int16) + 4 * tr_above.to(torch.int16) + 8 * tl_above.to(torch.int16)
-    active = finite[None, :, :] & (case != 0) & (case != 15)
-    indices = torch.nonzero(active, as_tuple=False)
-    grouped: list[list[tuple[tuple[float, float], tuple[float, float]]]] = [[] for _ in range(levels_arr.size)]
-    if indices.numel() == 0:
-        return grouped
-
-    l_idx = indices[:, 0]
-    j_idx = indices[:, 1]
-    i_idx = indices[:, 2]
-    case_np = case[l_idx, j_idx, i_idx].detach().cpu().numpy().astype(int)
-    l_np = l_idx.detach().cpu().numpy().astype(int)
-    j_np = j_idx.detach().cpu().numpy().astype(int)
-    i_np = i_idx.detach().cpu().numpy().astype(int)
-    bl_np = bl[j_idx, i_idx].detach().cpu().numpy()
-    br_np = br[j_idx, i_idx].detach().cpu().numpy()
-    tr_np = tr[j_idx, i_idx].detach().cpu().numpy()
-    tl_np = tl[j_idx, i_idx].detach().cpu().numpy()
-    r_np = r.detach().cpu().numpy()
-    z_np = z.detach().cpu().numpy()
-
-    for l, j, i, c, v_bl, v_br, v_tr, v_tl in zip(l_np, j_np, i_np, case_np, bl_np, br_np, tr_np, tl_np, strict=True):
-        level = float(levels_arr[int(l)])
-        pairs = _case_edge_pairs(int(c), float(v_bl), float(v_br), float(v_tr), float(v_tl), level)
-        if not pairs:
-            continue
-        pts = {
-            0: _interp_edge((r_np[i], z_np[j]), (r_np[i + 1], z_np[j]), float(v_bl), float(v_br), level),
-            1: _interp_edge((r_np[i + 1], z_np[j]), (r_np[i + 1], z_np[j + 1]), float(v_br), float(v_tr), level),
-            2: _interp_edge((r_np[i], z_np[j + 1]), (r_np[i + 1], z_np[j + 1]), float(v_tl), float(v_tr), level),
-            3: _interp_edge((r_np[i], z_np[j]), (r_np[i], z_np[j + 1]), float(v_bl), float(v_tl), level),
-        }
-        for ea, eb in pairs:
-            grouped[int(l)].append((pts[ea], pts[eb]))
-    return grouped
-
-
-def _case_edge_pairs(case_id: int, bl: float, br: float, tr: float, tl: float, level: float) -> tuple[tuple[int, int], ...]:
-    lookup: dict[int, tuple[tuple[int, int], ...]] = {
-        1: ((3, 0),),
-        2: ((0, 1),),
-        3: ((3, 1),),
-        4: ((1, 2),),
-        6: ((0, 2),),
-        7: ((3, 2),),
-        8: ((2, 3),),
-        9: ((0, 2),),
-        11: ((1, 2),),
-        12: ((1, 3),),
-        13: ((0, 1),),
-        14: ((3, 0),),
-    }
-    if case_id in lookup:
-        return lookup[case_id]
-    if case_id in {5, 10}:
-        center = 0.25 * (float(bl) + float(br) + float(tr) + float(tl))
-        center_above = center >= float(level)
-        if case_id == 5:
-            return ((3, 2), (0, 1)) if center_above else ((3, 0), (1, 2))
-        return ((0, 3), (1, 2)) if center_above else ((0, 1), (2, 3))
-    return ()
-
-
-def _interp_edge(a: tuple[float, float], b: tuple[float, float], va: float, vb: float, level: float) -> tuple[float, float]:
-    denom = float(vb) - float(va)
-    if abs(denom) <= 1e-30:
-        t = 0.5
+    Limited mode uses the flux level sampled on the limiter in outward physical
+    order. The boundary point for each configured angle is the first ray
+    crossing of that limiter-contact level from the magnetic axis outward.
+    """
+    torch = _torch(gpu_device)
+    dev = torch.device(gpu_device)
+    psi_t = torch.as_tensor(psi, dtype=torch.float64, device=dev)
+    if psi_t.ndim == 2:
+        psi_t = psi_t.unsqueeze(0)
+    B = int(psi_t.shape[0])
+    angles = torch.as_tensor(angles_rad, dtype=torch.float64, device=dev).reshape(-1)
+    limiter = torch.as_tensor(np.asarray(limiter_shape, dtype=float).reshape(-1, 2), dtype=torch.float64, device=dev)
+    axis_points, axis_levels, axis_kind = _axis_search(psi_t, grid, center, limiter)
+    if str(boundary_mode) == "limited":
+        limiter_psi = _sample_limiter_psi(psi_t, grid, limiter)
+        high = torch.nanmax(limiter_psi, dim=1).values
+        low = torch.nanmin(limiter_psi, dim=1).values
+        level = torch.where(axis_kind > 0, high, low)
+        status_code = torch.ones((B,), dtype=torch.int64, device=dev)
+    elif str(boundary_mode) == "diverted":
+        level, has_x = _xpoint_level(psi_t, grid, axis_points)
+        status_code = torch.full((B,), 2, dtype=torch.int64, device=dev)
+        level = torch.where(has_x, level, torch.full_like(level, float("nan")))
     else:
-        t = (float(level) - float(va)) / denom
-    t = min(max(float(t), 0.0), 1.0)
-    return (float(a[0]) + t * (float(b[0]) - float(a[0])), float(a[1]) + t * (float(b[1]) - float(a[1])))
+        raise ValueError(f"boundary_mode must be 'limited' or 'diverted', got {boundary_mode!r}")
+    points, radii, found_rays = _ray_crossings(psi_t, grid, axis_points, level, axis_kind, angles, limiter, ray_samples=ray_samples)
+    found = found_rays & torch.isfinite(level) & torch.isfinite(axis_levels)
+    return FixedAngleBoundaryGpuResult(found=found, status_code=status_code, level=level, points=points, radii=radii, axis_points=axis_points)
 
 
-def _stitch_segments_to_polylines(segments: list[tuple[tuple[float, float], tuple[float, float]]]) -> list[np.ndarray]:
-    if not segments:
-        return []
-    adjacency: dict[tuple[int, int], list[int]] = defaultdict(list)
-    keys: list[tuple[tuple[int, int], tuple[int, int]]] = []
-    for idx, (a, b) in enumerate(segments):
-        ka = _point_key(a)
-        kb = _point_key(b)
-        keys.append((ka, kb))
-        adjacency[ka].append(idx)
-        adjacency[kb].append(idx)
-
-    used = np.zeros((len(segments),), dtype=bool)
-    polylines: list[np.ndarray] = []
-    for start_idx in range(len(segments)):
-        if used[start_idx]:
-            continue
-        used[start_idx] = True
-        a, b = segments[start_idx]
-        ka, kb = keys[start_idx]
-        coords = [a, b]
-        _extend_polyline(coords, kb, adjacency, keys, segments, used, append=True)
-        _extend_polyline(coords, ka, adjacency, keys, segments, used, append=False)
-        arr = np.asarray(coords, dtype=float)
-        if arr.ndim == 2 and arr.shape[0] >= 3 and arr.shape[1] == 2:
-            polylines.append(arr)
-    return polylines
-
-
-def _extend_polyline(
-    coords: list[tuple[float, float]],
-    current_key: tuple[int, int],
-    adjacency: dict[tuple[int, int], list[int]],
-    keys: list[tuple[tuple[int, int], tuple[int, int]]],
-    segments: list[tuple[tuple[float, float], tuple[float, float]]],
-    used: np.ndarray,
-    *,
-    append: bool,
-) -> None:
-    while True:
-        next_idx = None
-        for candidate in adjacency.get(current_key, []):
-            if not bool(used[candidate]):
-                next_idx = int(candidate)
-                break
-        if next_idx is None:
-            return
-        used[next_idx] = True
-        ka, kb = keys[next_idx]
-        a, b = segments[next_idx]
-        if ka == current_key:
-            next_point = b
-            current_key = kb
-        else:
-            next_point = a
-            current_key = ka
-        if append:
-            coords.append(next_point)
-        else:
-            coords.insert(0, next_point)
+def _axis_search(psi, grid: Grid2D, center: tuple[float, float], limiter):
+    torch = __import__("torch")
+    B, nz, nr = psi.shape
+    r = torch.linspace(float(grid.r.start), float(grid.r.start) + float(grid.r.step) * (int(grid.r.size) - 1), int(grid.r.size), dtype=psi.dtype, device=psi.device)
+    z = torch.linspace(float(grid.z.start), float(grid.z.start) + float(grid.z.step) * (int(grid.z.size) - 1), int(grid.z.size), dtype=psi.dtype, device=psi.device)
+    Z, R = torch.meshgrid(z, r, indexing="ij")
+    c = torch.tensor(center, dtype=psi.dtype, device=psi.device)
+    dist = (R - c[0]) ** 2 + (Z - c[1]) ** 2
+    finite = torch.isfinite(psi)
+    # Select the nearer of the strongest max/min around the configured center.
+    max_val = torch.where(finite, psi, torch.full_like(psi, -torch.inf))
+    min_val = torch.where(finite, psi, torch.full_like(psi, torch.inf))
+    max_flat = torch.argmax(max_val.reshape(B, -1), dim=1)
+    min_flat = torch.argmin(min_val.reshape(B, -1), dim=1)
+    max_j = max_flat // nr; max_i = max_flat % nr
+    min_j = min_flat // nr; min_i = min_flat % nr
+    b = torch.arange(B, device=psi.device)
+    max_d = dist[max_j, max_i]
+    min_d = dist[min_j, min_i]
+    use_max = max_d <= min_d
+    i = torch.where(use_max, max_i, min_i)
+    j = torch.where(use_max, max_j, min_j)
+    points = torch.stack([r[i], z[j]], dim=1)
+    levels = psi[b, j, i]
+    kind = torch.where(use_max, torch.ones((B,), dtype=torch.int64, device=psi.device), -torch.ones((B,), dtype=torch.int64, device=psi.device))
+    return points, levels, kind
 
 
-def _point_key(point: tuple[float, float]) -> tuple[int, int]:
-    return (int(round(float(point[0]) * 1.0e12)), int(round(float(point[1]) * 1.0e12)))
+def _sample_limiter_psi(psi, grid, limiter):
+    from tokamak_control.core.torch_sampling import bilinear_sample_torch
+    return bilinear_sample_torch(psi, grid, limiter)
 
 
-def _find_x_points_gpu(psi_t, grid: Grid2D, *, max_points: int, min_separation: float | None, runtime: _TorchRuntime) -> np.ndarray:
-    torch = runtime.torch
-    if psi_t.shape[0] < 3 or psi_t.shape[1] < 3:
-        return np.zeros((0, 2), dtype=float)
-    dz = float(grid.z.step)
-    dr = float(grid.r.step)
-    dpsi_dz = torch.gradient(psi_t, spacing=(dz, dr), edge_order=2)[0]
-    dpsi_dr = torch.gradient(psi_t, spacing=(dz, dr), edge_order=2)[1]
-    d2psi_dz2, d2psi_dzdr = torch.gradient(dpsi_dz, spacing=(dz, dr), edge_order=2)
-    d2psi_drdz, d2psi_dr2 = torch.gradient(dpsi_dr, spacing=(dz, dr), edge_order=2)
-    grad_norm = torch.hypot(dpsi_dr, dpsi_dz)
-    det_hessian = d2psi_dr2 * d2psi_dz2 - d2psi_drdz * d2psi_dzdr
-
-    import torch.nn.functional as F
-
-    x = grad_norm[None, None, :, :]
-    local_min = grad_norm <= (-F.max_pool2d(torch.where(torch.isfinite(x), -x, torch.full_like(x, -torch.inf)), 3, stride=1, padding=1)[0, 0])
-    interior = torch.zeros_like(local_min)
-    interior[1:-1, 1:-1] = True
-    mask = interior & torch.isfinite(grad_norm) & torch.isfinite(det_hessian) & (det_hessian < 0.0) & local_min
-    idx = torch.nonzero(mask, as_tuple=False)
-    if idx.numel() == 0:
-        return np.zeros((0, 2), dtype=float)
-    scores = grad_norm[mask]
-    order = torch.argsort(scores)
-    idx_np = idx[order].detach().cpu().numpy()
-    score_np = scores[order].detach().cpu().numpy()
-    r = np.asarray(grid.r.coords(), dtype=float)
-    z = np.asarray(grid.z.coords(), dtype=float)
-    candidates = [(float(score), float(r[int(i)]), float(z[int(j)])) for score, (j, i) in zip(score_np, idx_np, strict=True)]
-    return _select_separated_xpoints(candidates, max_points=max_points, min_separation=min_separation)
+def _xpoint_level(psi, grid: Grid2D, axis_points):
+    torch = __import__("torch")
+    B, nz, nr = psi.shape
+    dz = float(grid.z.step); dr = float(grid.r.step)
+    grad_z, grad_r = torch.gradient(psi, spacing=(dz, dr), dim=(1, 2))
+    score = grad_z[:, 1:-1, 1:-1] ** 2 + grad_r[:, 1:-1, 1:-1] ** 2
+    flat = torch.argmin(score.reshape(B, -1), dim=1)
+    jj = flat // (nr - 2) + 1
+    ii = flat % (nr - 2) + 1
+    b = torch.arange(B, device=psi.device)
+    level = psi[b, jj, ii]
+    has = torch.isfinite(level)
+    return level, has
 
 
-def _select_separated_xpoints(candidates: list[tuple[float, float, float]], *, max_points: int, min_separation: float | None) -> np.ndarray:
-    limit = max(int(max_points), 0)
-    if limit == 0 or not candidates:
-        return np.zeros((0, 2), dtype=float)
-    sep = 0.0 if min_separation is None else max(float(min_separation), 0.0)
-    selected: list[tuple[float, float]] = []
-    for _score, r_value, z_value in candidates:
-        point = (float(r_value), float(z_value))
-        if sep > 0.0 and any(np.hypot(point[0] - old[0], point[1] - old[1]) < sep for old in selected):
-            continue
-        selected.append(point)
-        if len(selected) >= limit:
-            break
-    return np.asarray(selected, dtype=float).reshape(-1, 2)
+def _ray_crossings(psi, grid: Grid2D, axis_points, level, axis_kind, angles, limiter, *, ray_samples: int):
+    torch = __import__("torch")
+    B = int(psi.shape[0]); A = int(angles.numel())
+    dirs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
+    max_radius = torch.max(torch.linalg.norm(limiter[None, :, :] - axis_points[:, None, :], dim=2), dim=1).values
+    t = torch.linspace(0.0, 1.0, int(ray_samples), dtype=psi.dtype, device=psi.device)
+    radii_grid = max_radius[:, None, None] * t[None, None, :]
+    pts = axis_points[:, None, None, :] + radii_grid[..., None] * dirs[None, :, None, :]
+    pts_flat = pts.reshape(B, A * int(ray_samples), 2)
+    vals = bilinear_sample_torch_points(psi, grid, pts_flat).reshape(B, A, int(ray_samples))
+    lv = level[:, None, None]
+    if torch.any(axis_kind > 0):
+        cond_max = vals <= lv
+        cond_min = vals >= lv
+        cond = torch.where((axis_kind[:, None, None] > 0), cond_max, cond_min)
+    else:
+        cond = vals >= lv
+    cond = cond & torch.isfinite(vals)
+    first_idx = torch.argmax(cond.to(torch.int64), dim=2)
+    has = torch.any(cond, dim=2)
+    idx0 = torch.clamp(first_idx - 1, 0, int(ray_samples) - 1)
+    idx1 = first_idx
+    b = torch.arange(B, device=psi.device)[:, None]
+    a = torch.arange(A, device=psi.device)[None, :]
+    v0 = vals[b, a, idx0]
+    v1 = vals[b, a, idx1]
+    r0 = radii_grid[b, 0, idx0]
+    r1 = radii_grid[b, 0, idx1]
+    denom = torch.where(torch.abs(v1 - v0) > 1e-30, v1 - v0, torch.ones_like(v1))
+    frac = torch.clamp((level[:, None] - v0) / denom, 0.0, 1.0)
+    radii = r0 + frac * (r1 - r0)
+    radii = torch.where(has, radii, torch.full_like(radii, float("nan")))
+    points = axis_points[:, None, :] + radii[..., None] * dirs[None, :, :]
+    found = torch.all(has, dim=1)
+    return points, radii, found

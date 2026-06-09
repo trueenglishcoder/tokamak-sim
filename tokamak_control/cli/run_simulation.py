@@ -14,7 +14,7 @@ from typing import Literal
 
 import numpy as np
 
-from tokamak_control.compute import ComputeSettings, ComputeBackend, compute_runtime_metadata
+from tokamak_control.compute import ComputeBackend, ComputeSettings, compute_runtime_metadata, normalize_compute_backend
 from tokamak_control.config.scenarios import Scenario, ScenarioName, make_scenario
 from tokamak_control.control.base import ControlAction, Controller
 from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
@@ -23,6 +23,7 @@ from tokamak_control.control.registry import (
     make_controller,
     normalize_controller_launch,
 )
+from tokamak_control.core.gpu_plasma_model import GpuPlasmaModel
 from tokamak_control.core.plasma_model import (
     PlasmaModel,
     configure_plasma_model_profiling,
@@ -138,6 +139,14 @@ class _StepRecord:
     ip_ref_log: float
     sensors: SensorRealismResult
     disturbances_applied: list[str]
+
+
+
+def _as_numpy_psi(psi: object) -> np.ndarray:
+    """Return a CPU NumPy psi array from either NumPy or Torch input."""
+    if hasattr(psi, "detach"):
+        return np.asarray(psi.detach().cpu().numpy(), dtype=float)
+    return np.asarray(psi, dtype=float)
 
 
 def _coerce_value(token: str) -> object:
@@ -360,23 +369,34 @@ def _effective_config_for_controller(
     return out, overrides
 
 
+def _model_compute_psi_for_boundary(model: PlasmaModel | GpuPlasmaModel):
+    """Return psi in the backend-native form used by boundary dispatch."""
+    if isinstance(model, GpuPlasmaModel):
+        return model.compute_psi_tensor()
+    return model.compute_psi()
+
+
 def _prepare(
     cfg: LoadedConfig,
     *,
     M_angles: int,
     scenario_name: ScenarioName,
     scenario_params: Mapping[str, object] | None,
-) -> tuple[PlasmaModel, np.ndarray, Scenario, np.ndarray]:
-    model = PlasmaModel.from_settings(
-        grid=cfg.grid,
-        pfc=cfg.pfc,
-        sol=cfg.sol,
-        settings=cfg.physics,
-    )
+) -> tuple[PlasmaModel | GpuPlasmaModel, np.ndarray, Scenario, np.ndarray]:
+    model: PlasmaModel | GpuPlasmaModel
+    if cfg.compute.backend == "gpu":
+        model = GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, gpu_device=cfg.compute.gpu_device)
+    else:
+        model = PlasmaModel.from_settings(
+            grid=cfg.grid,
+            pfc=cfg.pfc,
+            sol=cfg.sol,
+            settings=cfg.physics,
+        )
 
     angles = np.linspace(-np.pi, np.pi, M_angles, endpoint=False, dtype=float)
 
-    psi0 = model.compute_psi()
+    psi0 = _model_compute_psi_for_boundary(model)
     center = (model.R0, model.Z0)
 
     try:
@@ -540,8 +560,8 @@ def _construct_controller(
 
 def _initial_boundary_tracker(
     *,
-    model: PlasmaModel,
-    psi_true: np.ndarray,
+    model: PlasmaModel | GpuPlasmaModel,
+    psi_true: object,
     center: tuple[float, float],
     target_mean_radius: float | None,
     limiter_shape: np.ndarray | None,
@@ -596,8 +616,8 @@ def _scenario_refs(scenario: Scenario, angles: np.ndarray, t_now: float) -> _Ste
 def _sensor_measurements(
     *,
     realism: RealismRuntime | None,
-    model: PlasmaModel,
-    psi_true: np.ndarray,
+    model: PlasmaModel | GpuPlasmaModel,
+    psi_true: object,
     boundary_poly: np.ndarray | None,
     radii_true: np.ndarray,
     center: tuple[float, float],
@@ -626,8 +646,8 @@ def _sensor_measurements(
             measured_boundary_poly=None if true_boundary_poly is None else true_boundary_poly.copy(),
             true_radii=np.asarray(radii_true, dtype=float).reshape(-1).copy(),
             measured_radii=np.asarray(radii_true, dtype=float).reshape(-1).copy(),
-            true_psi=np.asarray(psi_true, dtype=float).copy(),
-            measured_psi=np.asarray(psi_true, dtype=float).copy(),
+            true_psi=_as_numpy_psi(psi_true).copy(),
+            measured_psi=_as_numpy_psi(psi_true).copy(),
         )
     with run_profiler.time_block(profile_key):
         return realism.measure(
@@ -635,7 +655,7 @@ def _sensor_measurements(
             true_active_currents=true_currents,
             true_boundary_poly=boundary_poly,
             true_radii=radii_true,
-            true_psi=psi_true,
+            true_psi=_as_numpy_psi(psi_true),
             model=model,
             center=center,
             angles_rad=angles,
@@ -650,12 +670,15 @@ def _compute_controller_commands(
     *,
     controller: Controller,
     controller_name: str,
-    model: PlasmaModel,
+    model: PlasmaModel | GpuPlasmaModel,
     psi_meas: np.ndarray,
     boundary_meas: np.ndarray | None,
     center: tuple[float, float],
     angles: np.ndarray,
     refs: _StepRefs,
+    scenario: Scenario,
+    max_episode_steps: int,
+    sensors: SensorRealismResult,
     run_profiler: Profiler,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Вызвать регулятор и вернуть команды производных токов."""
@@ -667,6 +690,11 @@ def _compute_controller_commands(
         "measure_angles": angles,
         "ref_radii": refs.ref_radii,
         "Ip_ref": refs.ip_ref,
+        "scenario": scenario,
+        "max_episode_steps": int(max_episode_steps),
+        "measured_ip": float(sensors.measured_ip),
+        "measured_active_currents": np.asarray(sensors.measured_active_currents, dtype=float),
+        "measured_radii": None if sensors.measured_radii is None else np.asarray(sensors.measured_radii, dtype=float),
     }
     with run_profiler.time_block("step_controller"):
         ctrl_kwargs = build_controller_runtime_call(controller_name, runtime_context)
@@ -693,7 +721,7 @@ def _effective_commands(
 
 def _advance_model_state(
     *,
-    model: PlasmaModel,
+    model: PlasmaModel | GpuPlasmaModel,
     commands: _StepCommands,
     step_index: int,
     steps: int,
@@ -717,16 +745,17 @@ def _advance_model_state(
         )
         model.state = state
     with run_profiler.time_block("step_compute_psi_post"):
-        psi_true = model.compute_psi()
-        model.state.psi = psi_true
+        psi_true = _model_compute_psi_for_boundary(model)
+        if not isinstance(model, GpuPlasmaModel):
+            model.state.psi = psi_true
     return state, disturbances_applied, psi_true
 
 
 def _update_boundary_tracker(
     *,
     tracker: _BoundaryTracker,
-    model: PlasmaModel,
-    psi_true: np.ndarray,
+    model: PlasmaModel | GpuPlasmaModel,
+    psi_true: object,
     center: tuple[float, float],
     refs: _StepRefs,
     limiter_shape: np.ndarray | None,
@@ -822,7 +851,7 @@ def _write_step_record(
     writer: RunWriter,
     record: _StepRecord,
     tracker: _BoundaryTracker,
-    psi_true: np.ndarray,
+    psi_true: object,
     snapshot_every: int,
     step_index: int,
     run_profiler: Profiler,
@@ -841,12 +870,12 @@ def _write_step_record(
             pfc_derivs=np.asarray(state.pfc_current_derivs, dtype=float),
             sol_currents=np.asarray(state.sol_currents, dtype=float),
             sol_derivs=np.asarray(state.sol_current_derivs, dtype=float),
-            psi=(psi_true if snapshot_every > 0 and ((step_index + 1) % snapshot_every == 0) else None),
+            psi=(_as_numpy_psi(psi_true) if snapshot_every > 0 and ((step_index + 1) % snapshot_every == 0) else None),
             pfc_derivs_cmd=commands.pfc_cmd,
             sol_derivs_cmd=commands.sol_cmd,
             pfc_derivs_eff=commands.pfc_eff,
             sol_derivs_eff=commands.sol_eff,
-            psi_latest=psi_true,
+            psi_latest=_as_numpy_psi(psi_true),
             step=int(state.step),
             Ip_ref=record.ip_ref_log,
             radii_ref=record.ref_radii_log,
@@ -880,14 +909,14 @@ def _run_single_step(
     *,
     step_index: int,
     steps: int,
-    model: PlasmaModel,
+    model: PlasmaModel | GpuPlasmaModel,
     scenario: Scenario,
     scenario_name: ScenarioName,
     controller: Controller,
     controller_name: str,
     realism: RealismRuntime | None,
     tracker: _BoundaryTracker,
-    psi_true: np.ndarray,
+    psi_true: object,
     center: tuple[float, float],
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
@@ -929,11 +958,14 @@ def _run_single_step(
         controller=controller,
         controller_name=controller_name,
         model=model,
-        psi_meas=np.asarray(sensors_pre.measured_psi if sensors_pre.measured_psi is not None else psi_true, dtype=float),
+        psi_meas=np.asarray(sensors_pre.measured_psi if sensors_pre.measured_psi is not None else _as_numpy_psi(psi_true), dtype=float),
         boundary_meas=boundary_meas,
         center=center,
         angles=angles,
         refs=refs,
+        scenario=scenario,
+        max_episode_steps=steps,
+        sensors=sensors_pre,
         run_profiler=run_profiler,
     )
     commands = _effective_commands(
@@ -1095,17 +1127,6 @@ def run(
 
     logger.info("Loading configuration")
     cfg, config_source = _load_config_for_run(config, initial_currents_path=initial_currents_path, run_profiler=run_profiler)
-    if compute_backend is not None or gpu_device is not None:
-        cfg = replace(
-            cfg,
-            compute=ComputeSettings(
-                backend=(cfg.compute.backend if compute_backend is None else compute_backend),
-                gpu_device=(cfg.compute.gpu_device if gpu_device is None else str(gpu_device)),
-                boundary_equivalence_mode=cfg.compute.boundary_equivalence_mode,
-            ),
-        )
-    compute_runtime_metadata(cfg.compute, validate=True)
-
     logger.info("Normalizing controller launch: %s", controller_name)
     canonical_controller_name, normalized_controller_params, ctor_kwargs = _normalize_controller_for_run(
         controller_name,
@@ -1116,6 +1137,16 @@ def run(
         cfg,
         controller_name=canonical_controller_name,
     )
+    if compute_backend is not None or gpu_device is not None:
+        cfg_runtime = replace(
+            cfg_runtime,
+            compute=ComputeSettings(
+                backend=cfg_runtime.compute.backend if compute_backend is None else normalize_compute_backend(compute_backend),
+                gpu_device=cfg_runtime.compute.gpu_device if gpu_device is None else str(gpu_device),
+            ),
+        )
+    cfg_runtime.compute.validate(require_available=(cfg_runtime.compute.backend == "gpu"))
+
     if runtime_overrides:
         logger.info("Applying runtime overrides for %s", canonical_controller_name)
 
@@ -1185,7 +1216,7 @@ def run(
 
     center = (model.R0, model.Z0)
     with run_profiler.time_block("initial_compute_psi"):
-        psi_true = model.compute_psi()
+        psi_true = _model_compute_psi_for_boundary(model)
     initial_refs = _scenario_refs(scenario, angles, float(model.state.t))
     tracker = _initial_boundary_tracker(
         model=model,

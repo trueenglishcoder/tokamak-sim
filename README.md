@@ -14,11 +14,6 @@ python -m venv .venv
 python -m pip install -e ".[dev]"
 ```
 
-For the optional CUDA boundary backend, install Torch as well:
-
-```bash
-python -m pip install -e ".[dev,gpu]"
-```
 
 The runnable examples below assume local config and data folders are present:
 
@@ -98,42 +93,6 @@ python scripts/run_simulation_artifacts.py \
 
 If the selected physical boundary rule cannot find a boundary, the run stops cleanly, writes partial artifacts, and logs a `boundary_missing` event. It does not draw, reuse, or invent a boundary.
 
-## Compute Backend
-
-The simulator defaults to CPU mode. CPU mode uses the established NumPy/SciPy/contourpy path and remains the reference implementation.
-
-GPU mode is explicit:
-
-```toml
-[compute]
-backend = "gpu"
-gpu_device = "cuda:0"
-boundary_equivalence_mode = "strict"
-```
-
-or from the CLI:
-
-```bash
-python scripts/run_simulation_artifacts.py \
-  --config configs/T15MD_new_data.toml \
-  --steps 20 \
-  --controller lqr_boundary \
-  --angles 32 \
-  --scenario nominal \
-  --compute-backend gpu \
-  --gpu-device cuda:0
-```
-
-GPU mode requires `tokamak-sim[gpu]` and a working CUDA Torch installation. If GPU mode is requested and CUDA is unavailable, the run fails clearly before simulation work starts. Run artifacts record the selected backend, Torch version, CUDA availability, and GPU name.
-
-To compare GPU boundary finding against the CPU reference on stored run artifacts:
-
-```bash
-python scripts/check_boundary_gpu_equivalence.py \
-  --run-npz runs/example/run123.npz \
-  --out output/boundary_gpu_equivalence.json \
-  --gpu-device cuda:0
-```
 
 Synthetic fitting data:
 

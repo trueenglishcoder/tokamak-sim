@@ -9,6 +9,7 @@ import numpy as np
 
 from tokamak_control.control.base import Controller
 from tokamak_control.control.coil_replay import CoilReplayController
+from tokamak_control.control.learned_magnetic_controller import LearnedMagneticController
 from tokamak_control.control.hinf_boundary import HinftyBoundaryController
 from tokamak_control.control.hinf_current import HinftyCurrentController
 from tokamak_control.control.hinf_joint import HinftyJointController
@@ -152,6 +153,12 @@ _T15MD_REPLAY_PARAMS: tuple[ControllerLaunchParam, ...] = (
     ControllerLaunchParam("u_clip", float | None, False, None, _validate_finite_positive("u_clip")),
 )
 
+_LEARNED_MAGNETIC_CONTROLLER_PARAMS: tuple[ControllerLaunchParam, ...] = (
+    ControllerLaunchParam("export_dir", Path, True, None, _validate_existing_path("export_dir")),
+    ControllerLaunchParam("target_preview_stride", int | None, False, None, _validate_positive_int("target_preview_stride")),
+    ControllerLaunchParam("action_clip", float, False, 1.0, _validate_finite_positive("action_clip")),
+)
+
 
 
 _RUNTIME_INPUTS: dict[str, tuple[str, ...]] = {
@@ -164,6 +171,18 @@ _RUNTIME_INPUTS: dict[str, tuple[str, ...]] = {
     "lqr_joint": ("model", "psi", "boundary_poly", "center", "measure_angles", "ref_radii", "Ip_ref"),
     "hinf_joint": ("model", "psi", "boundary_poly", "center", "measure_angles", "ref_radii", "Ip_ref"),
     "qp_joint": ("model", "psi", "boundary_poly", "center", "measure_angles", "ref_radii", "Ip_ref"),
+    "learned_magnetic_controller": (
+        "model",
+        "psi",
+        "center",
+        "measure_angles",
+        "ref_radii",
+        "Ip_ref",
+        "scenario",
+        "max_episode_steps",
+        "measured_ip",
+        "measured_active_currents",
+    ),
 }
 
 _SPECS: dict[str, ControllerSpec] = {
@@ -229,6 +248,13 @@ _SPECS: dict[str, ControllerSpec] = {
         controller_cls=QPJointController,
         launch_params=_ANALYTIC_PARAMS["qp_joint"],
         runtime_inputs=_RUNTIME_INPUTS["qp_joint"],
+    ),
+    "learned_magnetic_controller": ControllerSpec(
+        name="learned_magnetic_controller",
+        family="learned_magnetic",
+        controller_cls=LearnedMagneticController,
+        launch_params=_LEARNED_MAGNETIC_CONTROLLER_PARAMS,
+        runtime_inputs=_RUNTIME_INPUTS["learned_magnetic_controller"],
     ),
 }
 

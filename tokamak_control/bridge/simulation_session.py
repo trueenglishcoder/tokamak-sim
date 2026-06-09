@@ -122,11 +122,11 @@ class SimulationSession:
                 compute=ComputeSettings(
                     backend=(cfg.compute.backend if self.compute_backend is None else self.compute_backend),
                     gpu_device=(cfg.compute.gpu_device if self.gpu_device is None else str(self.gpu_device)),
-                    boundary_equivalence_mode=cfg.compute.boundary_equivalence_mode,
                 ),
             )
+        cfg.compute.validate(require_available=(cfg.compute.backend == "gpu"))
+        compute_meta = compute_runtime_metadata(cfg.compute, validate=(cfg.compute.backend == "gpu"))
         cfg = _apply_initial_state_override(cfg, active_initial_override)
-        compute_meta = compute_runtime_metadata(cfg.compute, validate=True)
         model = _make_model(cfg)
         active_realism_settings = realism_settings if realism_settings is not None else (self.realism_settings if self.realism_settings is not None else cfg.realism)
         active_realism_settings.validate()
@@ -370,13 +370,7 @@ class SimulationSession:
 
 def _make_model(cfg: LoadedConfig) -> PlasmaModel | GpuPlasmaModel:
     if cfg.compute.backend == "gpu":
-        return GpuPlasmaModel.from_settings(
-            grid=cfg.grid,
-            pfc=cfg.pfc,
-            sol=cfg.sol,
-            settings=cfg.physics,
-            gpu_device=cfg.compute.gpu_device,
-        )
+        return GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, gpu_device=cfg.compute.gpu_device)
     return PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
 
 

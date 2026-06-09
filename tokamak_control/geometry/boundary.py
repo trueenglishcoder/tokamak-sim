@@ -17,30 +17,19 @@ from tokamak_control.geometry.boundary_cpu import (
     find_plasma_boundary_cpu_with_status,
     log_boundary_profiling_summary as log_boundary_cpu_profiling_summary,
 )
-from tokamak_control.geometry.boundary_gpu import (
-    boundary_gpu_profiling_snapshot,
-    configure_boundary_gpu_profiling,
-    find_plasma_boundary_gpu_with_status,
-    log_boundary_gpu_profiling_summary,
-)
+from tokamak_control.geometry.boundary_gpu import find_plasma_boundary_gpu_with_status
 
 
 def configure_boundary_profiling(*, enabled: bool, summary_every: int = 0, reset: bool = True) -> None:
     configure_boundary_cpu_profiling(enabled=enabled, summary_every=summary_every, reset=reset)
-    configure_boundary_gpu_profiling(enabled=enabled, summary_every=summary_every, reset=reset)
 
 
 def boundary_profiling_snapshot() -> dict[str, object]:
-    return {
-        "title": "boundary",
-        "cpu": boundary_cpu_profiling_snapshot(),
-        "gpu": boundary_gpu_profiling_snapshot(),
-    }
+    return boundary_cpu_profiling_snapshot()
 
 
 def log_boundary_profiling_summary() -> None:
     log_boundary_cpu_profiling_summary()
-    log_boundary_gpu_profiling_summary()
 
 
 def find_plasma_boundary_with_status(
@@ -63,8 +52,8 @@ def find_plasma_boundary_with_status(
     gpu_device: str = "cuda:0",
 ) -> tuple[np.ndarray, float, BoundaryStatus]:
     backend = normalize_compute_backend(compute_backend)
-    if backend == "cpu":
-        return find_plasma_boundary_cpu_with_status(
+    if backend == "gpu":
+        return find_plasma_boundary_gpu_with_status(
             psi,
             grid,
             center,
@@ -80,8 +69,9 @@ def find_plasma_boundary_with_status(
             local_bbox_pad_z=local_bbox_pad_z,
             limiter_shape=limiter_shape,
             boundary_mode=boundary_mode,
+            gpu_device=gpu_device,
         )
-    return find_plasma_boundary_gpu_with_status(
+    return find_plasma_boundary_cpu_with_status(
         psi,
         grid,
         center,
@@ -97,7 +87,6 @@ def find_plasma_boundary_with_status(
         local_bbox_pad_z=local_bbox_pad_z,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
-        gpu_device=gpu_device,
     )
 
 
@@ -106,16 +95,13 @@ __all__ = [
     "BoundaryNotFoundError",
     "BoundaryStatus",
     "boundary_cpu_profiling_snapshot",
-    "boundary_gpu_profiling_snapshot",
     "boundary_profiling_snapshot",
     "boundary_status_is_real",
     "configure_boundary_cpu_profiling",
-    "configure_boundary_gpu_profiling",
     "configure_boundary_profiling",
     "find_plasma_boundary_cpu_with_status",
     "find_plasma_boundary_gpu_with_status",
     "find_plasma_boundary_with_status",
     "log_boundary_cpu_profiling_summary",
-    "log_boundary_gpu_profiling_summary",
     "log_boundary_profiling_summary",
 ]

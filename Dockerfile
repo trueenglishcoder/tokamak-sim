@@ -1,15 +1,13 @@
 FROM python:3.11-bookworm
 
-ARG INSTALL_GPU=0
-ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu121"
-ARG PYTORCH_VERSION="2.5.1+cu121"
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     MPLCONFIGDIR=/tmp/matplotlib
 
 WORKDIR /app
+
+ARG INSTALL_GPU=false
 
 RUN apt-get -o Acquire::Retries=5 update \
     && apt-get install -y --no-install-recommends -o Acquire::Retries=5 ffmpeg \
@@ -21,9 +19,7 @@ COPY scripts ./scripts
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install . \
-    && if [ "$INSTALL_GPU" = "1" ]; then \
-        python -m pip install --index-url "$PYTORCH_INDEX_URL" "torch==$PYTORCH_VERSION"; \
-    fi
+    && if [ "$INSTALL_GPU" = "true" ]; then python -m pip install ".[gpu]"; fi
 
 COPY docs ./docs
 
