@@ -174,14 +174,13 @@ _RUNTIME_INPUTS: dict[str, tuple[str, ...]] = {
     "learned_magnetic_controller": (
         "model",
         "psi",
+        "boundary_poly",
         "center",
         "measure_angles",
         "ref_radii",
         "Ip_ref",
         "scenario",
         "max_episode_steps",
-        "measured_ip",
-        "measured_active_currents",
     ),
 }
 

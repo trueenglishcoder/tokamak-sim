@@ -35,8 +35,7 @@ def default_t15_diagnostic_layout(
 ) -> MagneticDiagnosticLayout:
     """Create a deterministic virtual T15-like magnetic diagnostic layout.
 
-    The actor observes these diagnostics instead of reconstructed boundary/radii.
-    Points are fixed machine diagnostics, not target-dependent samples.
+    Legacy helper for virtual diagnostic experiments. Learned magnetic controllers now use the reconstructed boundary and full psi field instead.
     """
     if limiter_shape is not None and np.asarray(limiter_shape).size:
         limiter = np.asarray(limiter_shape, dtype=float).reshape(-1, 2)

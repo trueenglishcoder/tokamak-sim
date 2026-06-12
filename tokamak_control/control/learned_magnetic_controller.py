@@ -2,20 +2,36 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Mapping
 
 import numpy as np
 
 from tokamak_control.control.base import ControlAction, Controller
-from tokamak_control.diagnostics import MagneticDiagnosticLayout, magnetic_diagnostics_numpy
+from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
+
+
+OBSERVATION_KIND = "joint_state_v1"
+EXPECTED_FEATURE_ORDER = [
+    "step_norm",
+    "ip",
+    "ip_ref",
+    "ip_error",
+    "active_currents",
+    "active_current_derivs",
+    "psi_flat",
+    "measured_boundary_radii",
+    "ref_radii",
+    "boundary_radii_error",
+    "boundary_found",
+    "target_preview",
+]
 
 
 class LearnedMagneticController(Controller):
-    """Deterministic magnetic controller backed by an exported actor bundle.
+    """Deterministic learned magnetic controller backed by an exported actor bundle.
 
-    The observation is restricted to target references, virtual magnetic
-    diagnostics, measured Ip, active coil currents, and previous action. It
-    never consumes reconstructed measured boundary/radii.
+    The actor observation is the fixed-size tensor form of the state supplied to
+    joint boundary controllers: full psi, reconstructed boundary radii, target
+    radii, Ip target, active coil currents, and applied current derivatives.
     """
 
     def __init__(
@@ -29,6 +45,7 @@ class LearnedMagneticController(Controller):
         if not self.export_dir.is_dir():
             raise FileNotFoundError(f"learned controller export directory does not exist: {self.export_dir}")
         self.schema = _read_json(_first_existing(self.export_dir, ("controller_schema.json", "schema.json")))
+        self._validate_observation_schema()
         self.normalization = _read_json(self.export_dir / "normalization.json")
         self.metadata = _read_json(self.export_dir / "metadata.json")
         with np.load(self.export_dir / "policy_weights.npz", allow_pickle=False) as data:
@@ -40,6 +57,10 @@ class LearnedMagneticController(Controller):
         self.n_pfc = int(self.schema.get("n_pfc", -1))
         self.n_sol = int(self.schema.get("n_sol", -1))
         self.n_angles = int(self.schema["n_angles"])
+        grid_shape = np.asarray(self.schema["grid_shape"], dtype=int).reshape(-1)
+        if grid_shape.shape != (2,) or np.any(grid_shape <= 0):
+            raise ValueError("controller schema grid_shape must contain positive [nz, nr]")
+        self.grid_shape = (int(grid_shape[0]), int(grid_shape[1]))
         self.target_preview_steps = int(self.schema.get("target_preview_steps", 0))
         self.target_preview_stride = int(target_preview_stride if target_preview_stride is not None else self.schema.get("target_preview_stride", 1))
         if self.target_preview_steps < 0:
@@ -47,42 +68,31 @@ class LearnedMagneticController(Controller):
         if self.target_preview_stride <= 0:
             raise ValueError("target_preview_stride must be > 0")
 
-        diag = _diagnostic_layout_from_schema(self.schema)
-        self.diagnostic_layout = diag
-        self.flux_count = diag.flux_count
-        self.field_count = diag.field_count
         self.layer_norm_eps = float(self.metadata.get("layer_norm_eps", 1.0e-5))
         self.ip_scale = _positive_scale(self.normalization.get("ip_scale", 1.0), "ip_scale")
         self.radius_scale = _positive_scale(self.normalization.get("radius_scale", 1.0), "radius_scale")
-        self.flux_scale = _positive_scale(self.normalization.get("flux_scale", 1.0), "flux_scale")
-        self.field_scale = _positive_scale(self.normalization.get("field_scale", 1.0), "field_scale")
-        self.bdot_scale = _positive_scale(self.normalization.get("bdot_scale", 1.0), "bdot_scale")
+        self.psi_scale = _positive_scale(self.normalization.get("psi_scale", 1.0), "psi_scale")
         self.current_scale = _scale_array(self.normalization["current_scale"], self.n_active_total, "current_scale")
         self.derivative_scale = _scale_array(self.normalization["derivative_scale"], self.action_dim, "derivative_scale")
         self.action_clip = _positive_scale(action_clip, "action_clip")
         self._validate_weights()
-        self.previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
-        self.previous_flux: np.ndarray | None = None
 
     def reset(self) -> None:
-        self.previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
-        self.previous_flux = None
+        return None
 
     def compute_control(
         self,
         *,
         model,
         psi: np.ndarray,
+        boundary_poly: np.ndarray | None,
         center: tuple[float, float],
         measure_angles: np.ndarray,
         ref_radii: np.ndarray,
         Ip_ref: float,
         scenario,
         max_episode_steps: int,
-        measured_ip: float,
-        measured_active_currents: np.ndarray,
     ) -> ControlAction:
-        del center
         n_pfc = int(model.pfc.n_coils)
         n_sol = int(model.sol.n_coils)
         if self.n_pfc >= 0 and n_pfc != self.n_pfc:
@@ -94,17 +104,16 @@ class LearnedMagneticController(Controller):
         obs = self._observation(
             model=model,
             psi=np.asarray(psi, dtype=float),
+            boundary_poly=boundary_poly,
+            center=center,
             measure_angles=measure_angles,
             ref_radii=ref_radii,
             ip_ref=float(Ip_ref),
             scenario=scenario,
             max_episode_steps=int(max_episode_steps),
-            measured_ip=float(measured_ip),
-            measured_active_currents=measured_active_currents,
         )
         action_norm = self._deterministic_action(obs.reshape(1, -1))[0]
         action_norm = np.clip(action_norm, -self.action_clip, self.action_clip).astype(np.float32, copy=False)
-        self.previous_action_norm = action_norm.copy()
         physical = np.asarray(action_norm, dtype=float) * self.derivative_scale
         return ControlAction(pfc_derivs=physical[:n_pfc].copy(), sol_derivs=physical[n_pfc:].copy())
 
@@ -113,49 +122,58 @@ class LearnedMagneticController(Controller):
         *,
         model,
         psi: np.ndarray,
+        boundary_poly: np.ndarray | None,
+        center: tuple[float, float],
         measure_angles: np.ndarray,
         ref_radii: np.ndarray,
         ip_ref: float,
         scenario,
         max_episode_steps: int,
-        measured_ip: float,
-        measured_active_currents: np.ndarray,
     ) -> np.ndarray:
         angles = np.asarray(measure_angles, dtype=float).reshape(-1)
         ref = np.asarray(ref_radii, dtype=float).reshape(-1)
-        currents = np.asarray(measured_active_currents, dtype=float).reshape(-1)
         if angles.shape != (self.n_angles,):
             raise ValueError(f"controller expected {self.n_angles} reference angles, got {angles.shape[0]}")
         if ref.shape != (self.n_angles,):
             raise ValueError(f"controller expected {self.n_angles} target radii, got {ref.shape[0]}")
+        psi_arr = np.asarray(psi, dtype=float)
+        if psi_arr.shape != self.grid_shape:
+            raise ValueError(f"controller expected psi grid {self.grid_shape}, got {psi_arr.shape}")
+        currents = np.concatenate([
+            np.asarray(model.state.pfc_currents, dtype=float).reshape(-1),
+            np.asarray(model.state.sol_currents, dtype=float).reshape(-1),
+        ])
+        derivs = np.concatenate([
+            np.asarray(model.state.pfc_current_derivs, dtype=float).reshape(-1),
+            np.asarray(model.state.sol_current_derivs, dtype=float).reshape(-1),
+        ])
         if currents.shape != (self.n_active_total,):
             raise ValueError(f"controller expected {self.n_active_total} active currents, got {currents.shape[0]}")
-        diagnostics = magnetic_diagnostics_numpy(
-            psi=psi,
-            grid=model.grid,
-            layout=self.diagnostic_layout,
-            previous_flux=self.previous_flux,
-            dt=float(model.t_step),
-        )
-        self.previous_flux = np.asarray(diagnostics["flux"], dtype=float).copy()
+        if derivs.shape != (self.action_dim,):
+            raise ValueError(f"controller expected {self.action_dim} active current derivatives, got {derivs.shape[0]}")
+        if boundary_poly is None:
+            measured_radii = np.zeros((self.n_angles,), dtype=float)
+            boundary_found = 0.0
+        else:
+            measured_radii = radii_from_polyline_ray_intersections(np.asarray(boundary_poly, dtype=float), center, angles)
+            measured_radii = np.nan_to_num(measured_radii, nan=0.0, posinf=0.0, neginf=0.0)
+            boundary_found = 1.0
         current_scale = np.where(self.current_scale > 0.0, self.current_scale, 1.0)
+        derivative_scale = np.where(self.derivative_scale > 0.0, self.derivative_scale, 1.0)
+        measured_ip = float(model.state.Ip)
         parts = [
-            np.array(
-                [
-                    float(model.state.step) / max(float(max_episode_steps), 1.0),
-                    float(measured_ip) / self.ip_scale,
-                    float(ip_ref) / self.ip_scale,
-                    (float(measured_ip) - float(ip_ref)) / self.ip_scale,
-                ],
-                dtype=float,
-            ),
+            np.array([float(model.state.step) / max(float(max_episode_steps), 1.0)], dtype=float),
+            np.array([measured_ip / self.ip_scale], dtype=float),
+            np.array([float(ip_ref) / self.ip_scale], dtype=float),
+            np.array([(measured_ip - float(ip_ref)) / self.ip_scale], dtype=float),
             currents / current_scale,
-            np.asarray(diagnostics["flux"], dtype=float).reshape(-1) / self.flux_scale,
-            np.asarray(diagnostics["field"], dtype=float).reshape(-1) / self.field_scale,
-            np.asarray(diagnostics["bdot"], dtype=float).reshape(-1) / self.bdot_scale,
+            derivs / derivative_scale,
+            psi_arr.reshape(-1) / self.psi_scale,
+            measured_radii / self.radius_scale,
             ref / self.radius_scale,
+            (ref - measured_radii) / self.radius_scale,
+            np.array([boundary_found], dtype=float),
             self._reference_preview(model=model, scenario=scenario, angles=angles, max_episode_steps=max_episode_steps),
-            np.clip(self.previous_action_norm.astype(float, copy=False), -1.0, 1.0),
         ]
         obs = np.concatenate(parts).astype(np.float32, copy=False)
         if obs.shape != (self.obs_dim,):
@@ -185,6 +203,16 @@ class LearnedMagneticController(Controller):
         mean = _linear(x, self.weights["mean_head.weight"], self.weights["mean_head.bias"])
         return np.tanh(mean).astype(np.float32, copy=False)
 
+    def _validate_observation_schema(self) -> None:
+        kind = self.schema.get("observation_kind")
+        if kind != OBSERVATION_KIND:
+            if "diagnostics" in self.schema:
+                raise ValueError("learned_magnetic_controller export uses the old virtual-diagnostic observation schema; retrain and export with observation_kind='joint_state_v1'")
+            raise ValueError(f"learned_magnetic_controller requires observation_kind='{OBSERVATION_KIND}', got {kind!r}")
+        order = list(self.schema.get("feature_order", []))
+        if order != EXPECTED_FEATURE_ORDER:
+            raise ValueError("controller schema feature_order does not match joint_state_v1")
+
     def _validate_weights(self) -> None:
         required = {"input.weight", "input.bias", "input_norm.weight", "input_norm.bias", "hidden1.weight", "hidden1.bias", "mean_head.weight", "mean_head.bias"}
         missing = sorted(required - set(self.weights))
@@ -194,18 +222,6 @@ class LearnedMagneticController(Controller):
             raise ValueError("controller input weight shape does not match obs_dim")
         if self.weights["mean_head.weight"].shape[0] != self.action_dim:
             raise ValueError("controller mean head shape does not match action_dim")
-
-
-def _diagnostic_layout_from_schema(schema: Mapping[str, object]) -> MagneticDiagnosticLayout:
-    diagnostics = schema.get("diagnostics")
-    if not isinstance(diagnostics, Mapping):
-        raise ValueError("controller schema must include diagnostics geometry")
-    flux_points = np.asarray(diagnostics["flux_points"], dtype=float).reshape(-1, 2)
-    field_points = np.asarray(diagnostics["field_points"], dtype=float).reshape(-1, 2)
-    field_angles = np.asarray(diagnostics["field_angles"], dtype=float).reshape(-1)
-    if field_points.shape[0] != field_angles.shape[0]:
-        raise ValueError("diagnostic field_points and field_angles size mismatch")
-    return MagneticDiagnosticLayout(flux_points=flux_points, field_points=field_points, field_angles=field_angles)
 
 
 def _first_existing(root: Path, names: tuple[str, ...]) -> Path:

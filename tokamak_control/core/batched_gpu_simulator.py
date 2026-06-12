@@ -9,7 +9,6 @@ from tokamak_control.config.settings import PhysicsSettings
 from tokamak_control.core.coils import CoilGroup
 from tokamak_control.core.green import build_green_for_coils, build_green_for_eind, build_green_for_plasma_center
 from tokamak_control.core.grid import Grid2D
-from tokamak_control.diagnostics import MagneticDiagnosticLayout, default_t15_diagnostic_layout, magnetic_diagnostics_torch
 from tokamak_control.geometry.boundary_gpu import FixedAngleBoundaryGpuResult, fixed_angle_boundary_gpu
 
 
@@ -29,7 +28,6 @@ class BatchedGpuPlantState:
 class BatchedGpuSimulatorResult:
     state: BatchedGpuPlantState
     boundary: FixedAngleBoundaryGpuResult
-    diagnostics: dict[str, object]
 
 
 class BatchedGpuTokamakSimulator:
@@ -46,7 +44,6 @@ class BatchedGpuTokamakSimulator:
         angles_rad: np.ndarray,
         limiter_shape: np.ndarray,
         gpu_device: str = "cuda:0",
-        diagnostic_layout: MagneticDiagnosticLayout | None = None,
     ) -> None:
         if int(batch_size) <= 0:
             raise ValueError("batch_size must be > 0")
@@ -63,7 +60,6 @@ class BatchedGpuTokamakSimulator:
         self.angles_rad = np.asarray(angles_rad, dtype=float).reshape(-1)
         self.limiter_shape = np.asarray(limiter_shape, dtype=float).reshape(-1, 2)
         self.center = (float(settings.R0), float(settings.Z0))
-        self.diagnostic_layout = diagnostic_layout or default_t15_diagnostic_layout(grid=grid, limiter_shape=self.limiter_shape, center=self.center)
         R, Z = grid.mesh()
         self.G_pfc = torch.as_tensor(build_green_for_coils(R, Z, pfc.element_positions, pfc.element_weights) if pfc.n_coils else np.zeros((0, *grid.shape)), dtype=self.dtype, device=self.device)
         self.G_sol = torch.as_tensor(build_green_for_coils(R, Z, sol.element_positions, sol.element_weights) if sol.n_coils else np.zeros((0, *grid.shape)), dtype=self.dtype, device=self.device)
@@ -77,7 +73,6 @@ class BatchedGpuTokamakSimulator:
         self.g_pfc = torch.as_tensor(gp, dtype=self.dtype, device=self.device)
         self.g_sol = torch.as_tensor(gs, dtype=self.dtype, device=self.device)
         self.angles_t = torch.as_tensor(self.angles_rad, dtype=self.dtype, device=self.device)
-        self.previous_flux = None
         self.reset()
 
     @classmethod
@@ -98,7 +93,6 @@ class BatchedGpuTokamakSimulator:
         self.step_index = torch.zeros((B,), dtype=torch.int64, device=self.device)
         self.time_s = torch.zeros((B,), dtype=self.dtype, device=self.device)
         self.psi = self.compose_psi(self.Ip, self.pfc_currents, self.sol_currents)
-        self.previous_flux = None
         return self._result()
 
     def reset_indices(self, indices: list[int], *, ip, pfc_currents, sol_currents) -> BatchedGpuSimulatorResult:
@@ -114,7 +108,6 @@ class BatchedGpuTokamakSimulator:
         self.step_index[idx] = 0
         self.time_s[idx] = 0.0
         self.psi[idx] = self.compose_psi(self.Ip[idx], self.pfc_currents[idx], self.sol_currents[idx])
-        self.previous_flux = None
         return self._result()
 
     def step(self, active_current_derivs) -> BatchedGpuSimulatorResult:
@@ -165,15 +158,6 @@ class BatchedGpuTokamakSimulator:
             boundary_mode="limited",
             gpu_device=str(self.device),
         )
-        diagnostics = magnetic_diagnostics_torch(
-            psi=self.psi,
-            grid=self.grid,
-            layout=self.diagnostic_layout,
-            previous_flux=self.previous_flux,
-            dt=float(self.settings.t_step),
-            device=str(self.device),
-        )
-        self.previous_flux = diagnostics["flux"].detach().clone()
         state = BatchedGpuPlantState(
             t=self.time_s,
             step=self.step_index,
@@ -184,7 +168,7 @@ class BatchedGpuTokamakSimulator:
             sol_current_derivs=self.sol_derivs,
             psi=self.psi,
         )
-        return BatchedGpuSimulatorResult(state=state, boundary=boundary, diagnostics=diagnostics)
+        return BatchedGpuSimulatorResult(state=state, boundary=boundary)
 
     def _clip_currents(self, values, limit: float | None):
         if limit is None or float(limit) <= 0.0:
