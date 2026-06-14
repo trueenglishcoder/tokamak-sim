@@ -92,7 +92,8 @@ class HinftyCurrentController(Controller):
             if Ip_ref is not None
             else (float(self.ip_ref) if self.ip_ref is not None else float(model.Ip0))
         )
-        e = float(model.state.Ip - ip_target)
+        ip_next0 = float(model.predict_Ip_decay_baseline_next())
+        e = float(ip_target - ip_next0)
 
         B_ip = np.asarray(model.get_ip_B_row(), dtype=float).reshape(-1)
         if B_ip.size != n_u:
@@ -101,9 +102,9 @@ class HinftyCurrentController(Controller):
                 f"for {n_pfc} PFC and {n_sol} SOL inputs"
             )
 
-        dt = float(model.t_step)
-        # Error model: e_{k+1} ≈ e_k - B u, with B = -dt * B_ip
-        B = (-dt * B_ip).reshape(1, -1)
+        # Same one-step derivative-input convention as LQRCurrentController:
+        # Ip_{k+1} ≈ ip_next0 + B_ip u, so target error is e - B_ip u.
+        B = B_ip.reshape(1, -1)
 
         Q = self.q_ip * np.eye(1, dtype=float)
 

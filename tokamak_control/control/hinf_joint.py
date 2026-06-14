@@ -147,10 +147,13 @@ class HinftyJointController(Controller):
             if Ip_ref is not None
             else (float(self.ip_ref) if self.ip_ref is not None else float(model.Ip0))
         )
-        e_ip = float(model.state.Ip - ip_target)
+        ip_next0 = float(model.predict_Ip_decay_baseline_next())
+        e_ip = float(ip_target - ip_next0)
 
-        # Fit current error into e_{k+1} ≈ e_k - B u
-        B_ip_row = (-dt * B_ip).reshape(1, -1)
+        # Same one-step derivative-input convention as LQRJointController:
+        # boundary target error is ref_radii - radii, and Ip target error is
+        # ip_target - ip_next0. Both are modeled as e_{k+1} ≈ e_k - B u.
+        B_ip_row = B_ip.reshape(1, -1)
 
         if e_r.size:
             e = np.concatenate([e_r, np.asarray([e_ip], dtype=float)], axis=0)
