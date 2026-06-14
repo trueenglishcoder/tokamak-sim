@@ -74,6 +74,10 @@ class LearnedMagneticController(Controller):
         self.psi_scale = _positive_scale(self.normalization.get("psi_scale", 1.0), "psi_scale")
         self.current_scale = _scale_array(self.normalization["current_scale"], self.n_active_total, "current_scale")
         self.derivative_scale = _scale_array(self.normalization["derivative_scale"], self.action_dim, "derivative_scale")
+        self.current_projection_enabled = bool(self.normalization.get("current_projection_enabled", False))
+        self.current_projection_margin_fraction = float(self.normalization.get("current_projection_margin_fraction", 0.0))
+        if not np.isfinite(self.current_projection_margin_fraction) or not 0.0 <= self.current_projection_margin_fraction < 1.0:
+            raise ValueError("current_projection_margin_fraction must be finite and in [0, 1)")
         self.action_clip = _positive_scale(action_clip, "action_clip")
         self._validate_weights()
 
@@ -115,7 +119,34 @@ class LearnedMagneticController(Controller):
         action_norm = self._deterministic_action(obs.reshape(1, -1))[0]
         action_norm = np.clip(action_norm, -self.action_clip, self.action_clip).astype(np.float32, copy=False)
         physical = np.asarray(action_norm, dtype=float) * self.derivative_scale
+        physical = self._project_physical_derivatives(model=model, physical=physical)
         return ControlAction(pfc_derivs=physical[:n_pfc].copy(), sol_derivs=physical[n_pfc:].copy())
+
+    def _project_physical_derivatives(self, *, model, physical: np.ndarray) -> np.ndarray:
+        if not self.current_projection_enabled:
+            return np.asarray(physical, dtype=float)
+        currents = np.concatenate([
+            np.asarray(model.state.pfc_currents, dtype=float).reshape(-1),
+            np.asarray(model.state.sol_currents, dtype=float).reshape(-1),
+        ])
+        previous_derivs = np.concatenate([
+            np.asarray(model.state.pfc_current_derivs, dtype=float).reshape(-1),
+            np.asarray(model.state.sol_current_derivs, dtype=float).reshape(-1),
+        ])
+        if currents.shape != (self.action_dim,) or previous_derivs.shape != (self.action_dim,):
+            raise ValueError("controller current projection state shape does not match action_dim")
+        dt = max(float(getattr(model, "t_step")), 1.0e-12)
+        tau = float(getattr(model, "actuator_tau", 0.0))
+        alpha = 0.0 if tau <= 0.0 else float(np.exp(-dt / tau))
+        beta = max(1.0 - alpha, 1.0e-12)
+        limits = np.maximum(self.current_scale * (1.0 - self.current_projection_margin_fraction), 1.0e-12)
+        lower_applied = (-limits - currents) / dt
+        upper_applied = (limits - currents) / dt
+        lower_command = (lower_applied - alpha * previous_derivs) / beta
+        upper_command = (upper_applied - alpha * previous_derivs) / beta
+        lower = np.minimum(lower_command, upper_command)
+        upper = np.maximum(lower_command, upper_command)
+        return np.clip(np.asarray(physical, dtype=float), lower, upper)
 
     def _observation(
         self,
