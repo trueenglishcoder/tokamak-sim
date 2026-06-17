@@ -9,8 +9,7 @@ from tokamak_control.control.base import ControlAction, Controller
 from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
 
 
-OBSERVATION_KIND = "joint_state_v1"
-EXPECTED_FEATURE_ORDER = [
+JOINT_STATE_V1_FEATURE_ORDER = [
     "step_norm",
     "ip",
     "ip_ref",
@@ -24,6 +23,28 @@ EXPECTED_FEATURE_ORDER = [
     "boundary_found",
     "target_preview",
 ]
+CONTROLLER_STATE_V2_FEATURE_ORDER = [
+    "step_norm",
+    "ip",
+    "ip_ref",
+    "ip_error",
+    "active_currents",
+    "active_current_derivs",
+    "measured_boundary_radii",
+    "ref_radii",
+    "boundary_radii_error",
+    "boundary_found",
+    "previous_action",
+    "target_preview",
+]
+COMPACT_JOINT_STATE_V2_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
+OBSERVATION_KIND = "controller_state_v2"
+EXPECTED_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
+SUPPORTED_FEATURE_ORDERS = {
+    "joint_state_v1": JOINT_STATE_V1_FEATURE_ORDER,
+    "compact_joint_state_v2": CONTROLLER_STATE_V2_FEATURE_ORDER,
+    "controller_state_v2": CONTROLLER_STATE_V2_FEATURE_ORDER,
+}
 
 
 class LearnedMagneticController(Controller):
@@ -80,8 +101,10 @@ class LearnedMagneticController(Controller):
             raise ValueError("current_projection_margin_fraction must be finite and in [0, 1)")
         self.action_clip = _positive_scale(action_clip, "action_clip")
         self._validate_weights()
+        self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
 
     def reset(self) -> None:
+        self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
         return None
 
     def compute_control(
@@ -120,6 +143,7 @@ class LearnedMagneticController(Controller):
         action_norm = np.clip(action_norm, -self.action_clip, self.action_clip).astype(np.float32, copy=False)
         physical = np.asarray(action_norm, dtype=float) * self.derivative_scale
         physical = self._project_physical_derivatives(model=model, physical=physical)
+        self._previous_action_norm = action_norm.astype(np.float32, copy=True)
         return ControlAction(pfc_derivs=physical[:n_pfc].copy(), sol_derivs=physical[n_pfc:].copy())
 
     def _project_physical_derivatives(self, *, model, physical: np.ndarray) -> np.ndarray:
@@ -168,8 +192,9 @@ class LearnedMagneticController(Controller):
         if ref.shape != (self.n_angles,):
             raise ValueError(f"controller expected {self.n_angles} target radii, got {ref.shape[0]}")
         psi_arr = np.asarray(psi, dtype=float)
-        if psi_arr.shape != self.grid_shape:
-            raise ValueError(f"controller expected psi grid {self.grid_shape}, got {psi_arr.shape}")
+        if "psi_flat" in self.schema.get("feature_order", []):
+            if psi_arr.shape != self.grid_shape:
+                raise ValueError(f"controller expected psi grid {self.grid_shape}, got {psi_arr.shape}")
         currents = np.concatenate([
             np.asarray(model.state.pfc_currents, dtype=float).reshape(-1),
             np.asarray(model.state.sol_currents, dtype=float).reshape(-1),
@@ -192,21 +217,23 @@ class LearnedMagneticController(Controller):
         current_scale = np.where(self.current_scale > 0.0, self.current_scale, 1.0)
         derivative_scale = np.where(self.derivative_scale > 0.0, self.derivative_scale, 1.0)
         measured_ip = float(model.state.Ip)
-        parts = [
-            np.array([float(model.state.step) / max(float(max_episode_steps), 1.0)], dtype=float),
-            np.array([measured_ip / self.ip_scale], dtype=float),
-            np.array([float(ip_ref) / self.ip_scale], dtype=float),
-            np.array([(measured_ip - float(ip_ref)) / self.ip_scale], dtype=float),
-            currents / current_scale,
-            derivs / derivative_scale,
-            psi_arr.reshape(-1) / self.psi_scale,
-            measured_radii / self.radius_scale,
-            ref / self.radius_scale,
-            (ref - measured_radii) / self.radius_scale,
-            np.array([boundary_found], dtype=float),
-            self._reference_preview(model=model, scenario=scenario, angles=angles, max_episode_steps=max_episode_steps),
-        ]
-        obs = np.concatenate(parts).astype(np.float32, copy=False)
+        features = {
+            "step_norm": np.array([float(model.state.step) / max(float(max_episode_steps), 1.0)], dtype=float),
+            "ip": np.array([measured_ip / self.ip_scale], dtype=float),
+            "ip_ref": np.array([float(ip_ref) / self.ip_scale], dtype=float),
+            "ip_error": np.array([(measured_ip - float(ip_ref)) / self.ip_scale], dtype=float),
+            "active_currents": currents / current_scale,
+            "active_current_derivs": derivs / derivative_scale,
+            "psi_flat": psi_arr.reshape(-1) / self.psi_scale,
+            "measured_boundary_radii": measured_radii / self.radius_scale,
+            "ref_radii": ref / self.radius_scale,
+            "boundary_radii_error": (ref - measured_radii) / self.radius_scale,
+            "boundary_found": np.array([boundary_found], dtype=float),
+            "previous_action": self._previous_action_norm.astype(float, copy=False),
+            "target_preview": self._reference_preview(model=model, scenario=scenario, angles=angles, max_episode_steps=max_episode_steps),
+        }
+        order = list(self.schema.get("feature_order", []))
+        obs = np.concatenate([np.asarray(features[name], dtype=float).reshape(-1) for name in order]).astype(np.float32, copy=False)
         if obs.shape != (self.obs_dim,):
             raise ValueError(f"controller observation shape {obs.shape} != ({self.obs_dim},)")
         if not np.all(np.isfinite(obs)):
@@ -236,13 +263,13 @@ class LearnedMagneticController(Controller):
 
     def _validate_observation_schema(self) -> None:
         kind = self.schema.get("observation_kind")
-        if kind != OBSERVATION_KIND:
+        if kind not in SUPPORTED_FEATURE_ORDERS:
             if "diagnostics" in self.schema:
                 raise ValueError("learned_magnetic_controller export uses the old virtual-diagnostic observation schema; retrain and export with observation_kind='joint_state_v1'")
-            raise ValueError(f"learned_magnetic_controller requires observation_kind='{OBSERVATION_KIND}', got {kind!r}")
+            raise ValueError(f"learned_magnetic_controller requires one of {sorted(SUPPORTED_FEATURE_ORDERS)}, got {kind!r}")
         order = list(self.schema.get("feature_order", []))
-        if order != EXPECTED_FEATURE_ORDER:
-            raise ValueError("controller schema feature_order does not match joint_state_v1")
+        if order != SUPPORTED_FEATURE_ORDERS[str(kind)]:
+            raise ValueError(f"controller schema feature_order does not match {kind}")
 
     def _validate_weights(self) -> None:
         required = {"input.weight", "input.bias", "input_norm.weight", "input_norm.bias", "hidden1.weight", "hidden1.bias", "mean_head.weight", "mean_head.bias"}
