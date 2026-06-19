@@ -95,6 +95,12 @@ class LearnedMagneticController(Controller):
         self.psi_scale = _positive_scale(self.normalization.get("psi_scale", 1.0), "psi_scale")
         self.current_scale = _scale_array(self.normalization["current_scale"], self.n_active_total, "current_scale")
         self.derivative_scale = _scale_array(self.normalization["derivative_scale"], self.action_dim, "derivative_scale")
+        raw_saturation_fraction = self.normalization.get("current_saturation_fraction")
+        self.current_saturation_fraction = None if raw_saturation_fraction is None else float(raw_saturation_fraction)
+        if self.current_saturation_fraction is not None and (
+            not np.isfinite(self.current_saturation_fraction) or self.current_saturation_fraction < 1.0
+        ):
+            raise ValueError("current_saturation_fraction must be finite and >= 1")
         self.current_projection_enabled = bool(self.normalization.get("current_projection_enabled", False))
         self.current_projection_margin_fraction = float(self.normalization.get("current_projection_margin_fraction", 0.0))
         if not np.isfinite(self.current_projection_margin_fraction) or not 0.0 <= self.current_projection_margin_fraction < 1.0:
@@ -139,16 +145,25 @@ class LearnedMagneticController(Controller):
             scenario=scenario,
             max_episode_steps=int(max_episode_steps),
         )
-        action_norm = self._deterministic_action(obs.reshape(1, -1))[0]
-        action_norm = np.clip(action_norm, -self.action_clip, self.action_clip).astype(np.float32, copy=False)
-        physical = np.asarray(action_norm, dtype=float) * self.derivative_scale
+        requested_action_norm = self._deterministic_action(obs.reshape(1, -1))[0]
+        requested_action_norm = np.clip(requested_action_norm, -self.action_clip, self.action_clip).astype(np.float32, copy=False)
+        physical = np.asarray(requested_action_norm, dtype=float) * self.derivative_scale
         physical = self._project_physical_derivatives(model=model, physical=physical)
-        self._previous_action_norm = action_norm.astype(np.float32, copy=True)
+        derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
+        applied_action_norm = np.clip(physical / derivative_scale, -1.0, 1.0)
+        self._previous_action_norm = applied_action_norm.astype(np.float32, copy=True)
         return ControlAction(pfc_derivs=physical[:n_pfc].copy(), sol_derivs=physical[n_pfc:].copy())
 
     def _project_physical_derivatives(self, *, model, physical: np.ndarray) -> np.ndarray:
+        if self.current_saturation_fraction is not None:
+            limits = np.maximum(self.current_scale * float(self.current_saturation_fraction), 1.0e-12)
+            return self._clip_physical_to_current_envelope(model=model, physical=physical, limits=limits)
         if not self.current_projection_enabled:
             return np.asarray(physical, dtype=float)
+        limits = np.maximum(self.current_scale * (1.0 - self.current_projection_margin_fraction), 1.0e-12)
+        return self._clip_physical_to_current_envelope(model=model, physical=physical, limits=limits)
+
+    def _clip_physical_to_current_envelope(self, *, model, physical: np.ndarray, limits: np.ndarray) -> np.ndarray:
         currents = np.concatenate([
             np.asarray(model.state.pfc_currents, dtype=float).reshape(-1),
             np.asarray(model.state.sol_currents, dtype=float).reshape(-1),
@@ -163,7 +178,6 @@ class LearnedMagneticController(Controller):
         tau = float(getattr(model, "actuator_tau", 0.0))
         alpha = 0.0 if tau <= 0.0 else float(np.exp(-dt / tau))
         beta = max(1.0 - alpha, 1.0e-12)
-        limits = np.maximum(self.current_scale * (1.0 - self.current_projection_margin_fraction), 1.0e-12)
         lower_applied = (-limits - currents) / dt
         upper_applied = (limits - currents) / dt
         lower_command = (lower_applied - alpha * previous_derivs) / beta
