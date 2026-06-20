@@ -318,6 +318,52 @@ def test_learned_controller_tcv_derivative_contract_skips_current_saturation(tmp
     assert controller._previous_action_norm[0] == pytest.approx(np.tanh(8.0), rel=1.0e-6)
 
 
+def test_learned_controller_delta_jdot_contract_accumulates_command(tmp_path: Path) -> None:
+    """Delta-Jdot exports accumulate actor deltas into the derivative command."""
+    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    n_pfc = cfg.pfc.n_coils
+    n_sol = cfg.sol.n_coils
+    action_dim = n_pfc + n_sol
+    n_angles = 4
+    grid_shape = model.state.psi.shape
+    slices = _feature_slices(action_dim=action_dim, psi_size=model.state.psi.size, n_angles=n_angles, preview_steps=0)
+    obs_dim = slices["target_preview"][1]
+    derivative_scale = np.full((action_dim,), 1.0e7, dtype=float)
+    delta_limits = np.linspace(1.0e5, 9.0e5, action_dim, dtype=float)
+    export = tmp_path / "export"
+    _write_joint_state_export(
+        export,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        n_pfc=n_pfc,
+        n_sol=n_sol,
+        n_angles=n_angles,
+        grid_shape=grid_shape,
+        slices=slices,
+        normalization={
+            "derivative_scale": derivative_scale.tolist(),
+            "delta_derivative_limits_aps": delta_limits.tolist(),
+        },
+        mean_bias=np.full((action_dim,), 0.5, dtype=np.float32),
+        action_contract="delta_jdot_derivative_command_v2",
+    )
+    controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
+    angles = np.linspace(-np.pi, np.pi, n_angles, endpoint=False, dtype=float)
+    poly, _level, _status = find_plasma_boundary_with_status(model.state.psi, model.grid, (model.R0, model.Z0), limiter_shape=cfg.limiter_shape, boundary_mode=cfg.boundary_mode)
+    ref_radii = radii_from_polyline_ray_intersections(poly, (model.R0, model.Z0), angles)
+    scenario = make_scenario("nominal", ref_radii, model.Ip0, params={}, center=(model.R0, model.Z0))
+
+    first = controller.compute_control(model=model, psi=model.compute_psi(), boundary_poly=poly, center=(model.R0, model.Z0), measure_angles=angles, ref_radii=ref_radii, Ip_ref=model.Ip0, scenario=scenario, max_episode_steps=10)
+    second = controller.compute_control(model=model, psi=model.compute_psi(), boundary_poly=poly, center=(model.R0, model.Z0), measure_angles=angles, ref_radii=ref_radii, Ip_ref=model.Ip0, scenario=scenario, max_episode_steps=10)
+    first_physical = np.concatenate([first.pfc_derivs, first.sol_derivs])
+    second_physical = np.concatenate([second.pfc_derivs, second.sol_derivs])
+    expected_delta = np.tanh(0.5) * delta_limits[0]
+    assert first_physical[0] == pytest.approx(expected_delta, rel=1.0e-6)
+    assert second_physical[0] == pytest.approx(2.0 * expected_delta, rel=1.0e-6)
+    assert controller._previous_action_norm[0] == pytest.approx(2.0 * expected_delta / derivative_scale[0], rel=1.0e-6)
+
+
 def test_learned_controller_accepts_compact_joint_state_export(tmp_path: Path) -> None:
     cfg = load_config(CONFIG, initial_currents_path=INITIAL)
     model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)

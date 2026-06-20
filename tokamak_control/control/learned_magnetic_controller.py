@@ -68,7 +68,7 @@ class LearnedMagneticController(Controller):
         self.schema = _read_json(_first_existing(self.export_dir, ("controller_schema.json", "schema.json")))
         self._validate_observation_schema()
         self.action_contract = str(self.schema.get("action_contract", "requested_with_current_aware_saturation_v2"))
-        if self.action_contract not in {"requested_with_current_aware_saturation_v2", "tcv_derivative_v1"}:
+        if self.action_contract not in {"requested_with_current_aware_saturation_v2", "tcv_derivative_v1", "delta_jdot_derivative_command_v1", "delta_jdot_derivative_command_v2"}:
             raise ValueError(f"unsupported learned-controller action_contract: {self.action_contract!r}")
         self.normalization = _read_json(self.export_dir / "normalization.json")
         self.metadata = _read_json(self.export_dir / "metadata.json")
@@ -98,6 +98,20 @@ class LearnedMagneticController(Controller):
         self.psi_scale = _positive_scale(self.normalization.get("psi_scale", 1.0), "psi_scale")
         self.current_scale = _scale_array(self.normalization["current_scale"], self.n_active_total, "current_scale")
         self.derivative_scale = _scale_array(self.normalization["derivative_scale"], self.action_dim, "derivative_scale")
+        if self.action_contract == "delta_jdot_derivative_command_v2":
+            if "delta_derivative_limits_aps" not in self.normalization:
+                raise ValueError("delta_jdot_derivative_command_v2 requires delta_derivative_limits_aps in normalization.json")
+            self.delta_derivative_limits_aps = _scale_array(self.normalization["delta_derivative_limits_aps"], self.action_dim, "delta_derivative_limits_aps")
+            self.delta_derivative_scale_aps = float(np.max(self.delta_derivative_limits_aps))
+        elif self.action_contract == "delta_jdot_derivative_command_v1":
+            if "delta_derivative_scale_aps" not in self.normalization:
+                raise ValueError("delta_jdot_derivative_command_v1 requires delta_derivative_scale_aps in normalization.json")
+            self.delta_derivative_scale_aps = _positive_scale(self.normalization["delta_derivative_scale_aps"], "delta_derivative_scale_aps")
+            self.delta_derivative_limits_aps = np.full((self.action_dim,), self.delta_derivative_scale_aps, dtype=float)
+        else:
+            raw_delta_scale = self.normalization.get("delta_derivative_scale_aps")
+            self.delta_derivative_scale_aps = 0.0 if raw_delta_scale is None else _positive_scale(raw_delta_scale, "delta_derivative_scale_aps")
+            self.delta_derivative_limits_aps = np.full((self.action_dim,), self.delta_derivative_scale_aps, dtype=float)
         raw_saturation_fraction = self.normalization.get("current_saturation_fraction")
         self.current_saturation_fraction = None if raw_saturation_fraction is None else float(raw_saturation_fraction)
         if self.current_saturation_fraction is not None and (
@@ -150,7 +164,8 @@ class LearnedMagneticController(Controller):
         )
         requested_action_norm = self._deterministic_action(obs.reshape(1, -1))[0]
         requested_action_norm = np.clip(requested_action_norm, -self.action_clip, self.action_clip).astype(np.float32, copy=False)
-        physical = np.asarray(requested_action_norm, dtype=float) * self.derivative_scale
+        command_norm = self._command_from_actor_action(requested_action_norm)
+        physical = np.asarray(command_norm, dtype=float) * self.derivative_scale
         physical = self._project_physical_derivatives(model=model, physical=physical)
         derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
         applied_action_norm = np.clip(physical / derivative_scale, -1.0, 1.0)
@@ -159,6 +174,14 @@ class LearnedMagneticController(Controller):
         else:
             self._previous_action_norm = applied_action_norm.astype(np.float32, copy=True)
         return ControlAction(pfc_derivs=physical[:n_pfc].copy(), sol_derivs=physical[n_pfc:].copy())
+
+    def _command_from_actor_action(self, requested_action_norm: np.ndarray) -> np.ndarray:
+        """Convert the actor output into the normalized derivative command sent to the plant."""
+        if self.action_contract not in {"delta_jdot_derivative_command_v1", "delta_jdot_derivative_command_v2"}:
+            return np.asarray(requested_action_norm, dtype=float)
+        derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
+        delta_norm = np.asarray(requested_action_norm, dtype=float) * self.delta_derivative_limits_aps / derivative_scale
+        return np.clip(self._previous_action_norm.astype(float, copy=False) + delta_norm, -1.0, 1.0)
 
     def _project_physical_derivatives(self, *, model, physical: np.ndarray) -> np.ndarray:
         """Apply the exported action contract to physical derivative commands."""
