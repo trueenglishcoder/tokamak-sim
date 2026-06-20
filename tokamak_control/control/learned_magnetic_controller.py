@@ -67,6 +67,9 @@ class LearnedMagneticController(Controller):
             raise FileNotFoundError(f"learned controller export directory does not exist: {self.export_dir}")
         self.schema = _read_json(_first_existing(self.export_dir, ("controller_schema.json", "schema.json")))
         self._validate_observation_schema()
+        self.action_contract = str(self.schema.get("action_contract", "requested_with_current_aware_saturation_v2"))
+        if self.action_contract not in {"requested_with_current_aware_saturation_v2", "tcv_derivative_v1"}:
+            raise ValueError(f"unsupported learned-controller action_contract: {self.action_contract!r}")
         self.normalization = _read_json(self.export_dir / "normalization.json")
         self.metadata = _read_json(self.export_dir / "metadata.json")
         with np.load(self.export_dir / "policy_weights.npz", allow_pickle=False) as data:
@@ -151,10 +154,16 @@ class LearnedMagneticController(Controller):
         physical = self._project_physical_derivatives(model=model, physical=physical)
         derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
         applied_action_norm = np.clip(physical / derivative_scale, -1.0, 1.0)
-        self._previous_action_norm = applied_action_norm.astype(np.float32, copy=True)
+        if self.action_contract == "tcv_derivative_v1":
+            self._previous_action_norm = requested_action_norm.astype(np.float32, copy=True)
+        else:
+            self._previous_action_norm = applied_action_norm.astype(np.float32, copy=True)
         return ControlAction(pfc_derivs=physical[:n_pfc].copy(), sol_derivs=physical[n_pfc:].copy())
 
     def _project_physical_derivatives(self, *, model, physical: np.ndarray) -> np.ndarray:
+        """Apply the exported action contract to physical derivative commands."""
+        if self.action_contract == "tcv_derivative_v1":
+            return np.asarray(physical, dtype=float)
         if self.current_saturation_fraction is not None:
             limits = np.maximum(self.current_scale * float(self.current_saturation_fraction), 1.0e-12)
             return self._clip_physical_to_current_envelope(model=model, physical=physical, limits=limits)

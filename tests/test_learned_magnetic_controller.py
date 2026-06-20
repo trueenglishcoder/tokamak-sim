@@ -43,7 +43,20 @@ def _feature_slices(*, action_dim: int, psi_size: int, n_angles: int, preview_st
     return out
 
 
-def _write_joint_state_export(export: Path, *, obs_dim: int, action_dim: int, n_pfc: int, n_sol: int, n_angles: int, grid_shape: tuple[int, int], slices: dict[str, list[int]], normalization: dict[str, object] | None = None, mean_bias: np.ndarray | None = None) -> None:
+def _write_joint_state_export(
+    export: Path,
+    *,
+    obs_dim: int,
+    action_dim: int,
+    n_pfc: int,
+    n_sol: int,
+    n_angles: int,
+    grid_shape: tuple[int, int],
+    slices: dict[str, list[int]],
+    normalization: dict[str, object] | None = None,
+    mean_bias: np.ndarray | None = None,
+    action_contract: str | None = None,
+) -> None:
     export.mkdir()
     schema = {
         "observation_kind": "joint_state_v1",
@@ -60,6 +73,8 @@ def _write_joint_state_export(export: Path, *, obs_dim: int, action_dim: int, n_
         "target_preview_steps": 0,
         "target_preview_stride": 1,
     }
+    if action_contract is not None:
+        schema["action_contract"] = action_contract
     (export / "controller_schema.json").write_text(json.dumps(schema), encoding="utf-8")
     norm = {
         "ip_scale": 5.0e5,
@@ -258,6 +273,49 @@ def test_learned_controller_applies_exported_current_saturation(tmp_path: Path) 
     assert np.max(np.abs(next_current) - 1.05 * current_limits) <= 1.0e-6
     assert physical[0] < derivative_scale[0] * 0.5
     assert controller._previous_action_norm[0] == pytest.approx(physical[0] / derivative_scale[0])
+
+
+def test_learned_controller_tcv_derivative_contract_skips_current_saturation(tmp_path: Path) -> None:
+    """TCV derivative exports clip derivative command only, not next-step current."""
+    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    n_pfc = cfg.pfc.n_coils
+    n_sol = cfg.sol.n_coils
+    action_dim = n_pfc + n_sol
+    n_angles = 4
+    grid_shape = model.state.psi.shape
+    slices = _feature_slices(action_dim=action_dim, psi_size=model.state.psi.size, n_angles=n_angles, preview_steps=0)
+    obs_dim = slices["target_preview"][1]
+    current_limits = np.full((action_dim,), 1.0e5, dtype=float)
+    derivative_scale = np.full((action_dim,), 1.0e7, dtype=float)
+    export = tmp_path / "export"
+    _write_joint_state_export(
+        export,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        n_pfc=n_pfc,
+        n_sol=n_sol,
+        n_angles=n_angles,
+        grid_shape=grid_shape,
+        slices=slices,
+        normalization={
+            "current_scale": current_limits.tolist(),
+            "derivative_scale": derivative_scale.tolist(),
+        },
+        mean_bias=np.full((action_dim,), 8.0, dtype=np.float32),
+        action_contract="tcv_derivative_v1",
+    )
+    model.state.pfc_currents[0] = 1.049 * current_limits[0]
+    controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
+    angles = np.linspace(-np.pi, np.pi, n_angles, endpoint=False, dtype=float)
+    poly, _level, _status = find_plasma_boundary_with_status(model.state.psi, model.grid, (model.R0, model.Z0), limiter_shape=cfg.limiter_shape, boundary_mode=cfg.boundary_mode)
+    ref_radii = radii_from_polyline_ray_intersections(poly, (model.R0, model.Z0), angles)
+    scenario = make_scenario("nominal", ref_radii, model.Ip0, params={}, center=(model.R0, model.Z0))
+    action = controller.compute_control(model=model, psi=model.compute_psi(), boundary_poly=poly, center=(model.R0, model.Z0), measure_angles=angles, ref_radii=ref_radii, Ip_ref=model.Ip0, scenario=scenario, max_episode_steps=10)
+    physical = np.concatenate([action.pfc_derivs, action.sol_derivs])
+    assert physical[0] == pytest.approx(derivative_scale[0] * np.tanh(8.0), rel=1.0e-6)
+    assert physical[0] > derivative_scale[0] * 0.99
+    assert controller._previous_action_norm[0] == pytest.approx(np.tanh(8.0), rel=1.0e-6)
 
 
 def test_learned_controller_accepts_compact_joint_state_export(tmp_path: Path) -> None:
