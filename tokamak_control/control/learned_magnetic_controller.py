@@ -37,6 +37,21 @@ CONTROLLER_STATE_V2_FEATURE_ORDER = [
     "previous_action",
     "target_preview",
 ]
+CONTROLLER_STATE_V3_FEATURE_ORDER = [
+    "step_norm",
+    "ip",
+    "ip_ref",
+    "ip_error",
+    "active_currents",
+    "active_current_derivs",
+    "measured_boundary_radii",
+    "ref_radii",
+    "boundary_radii_error",
+    "boundary_found",
+    "previous_action",
+    "previous_derivative_command",
+    "target_preview",
+]
 COMPACT_JOINT_STATE_V2_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
 OBSERVATION_KIND = "controller_state_v2"
 EXPECTED_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
@@ -68,7 +83,7 @@ class LearnedMagneticController(Controller):
         self.schema = _read_json(_first_existing(self.export_dir, ("controller_schema.json", "schema.json")))
         self._validate_observation_schema()
         self.action_contract = str(self.schema.get("action_contract", "requested_with_current_aware_saturation_v2"))
-        if self.action_contract not in {"requested_with_current_aware_saturation_v2", "tcv_derivative_v1", "delta_jdot_derivative_command_v1", "delta_jdot_derivative_command_v2"}:
+        if self.action_contract not in {"requested_with_current_aware_saturation_v2", "tcv_derivative_v1", "delta_jdot_derivative_command_v1", "delta_jdot_derivative_command_v2", "delta_jdot_derivative_command_v3"}:
             raise ValueError(f"unsupported learned-controller action_contract: {self.action_contract!r}")
         self.normalization = _read_json(self.export_dir / "normalization.json")
         self.metadata = _read_json(self.export_dir / "metadata.json")
@@ -98,9 +113,9 @@ class LearnedMagneticController(Controller):
         self.psi_scale = _positive_scale(self.normalization.get("psi_scale", 1.0), "psi_scale")
         self.current_scale = _scale_array(self.normalization["current_scale"], self.n_active_total, "current_scale")
         self.derivative_scale = _scale_array(self.normalization["derivative_scale"], self.action_dim, "derivative_scale")
-        if self.action_contract == "delta_jdot_derivative_command_v2":
+        if self.action_contract in {"delta_jdot_derivative_command_v2", "delta_jdot_derivative_command_v3"}:
             if "delta_derivative_limits_aps" not in self.normalization:
-                raise ValueError("delta_jdot_derivative_command_v2 requires delta_derivative_limits_aps in normalization.json")
+                raise ValueError(f"{self.action_contract} requires delta_derivative_limits_aps in normalization.json")
             self.delta_derivative_limits_aps = _scale_array(self.normalization["delta_derivative_limits_aps"], self.action_dim, "delta_derivative_limits_aps")
             self.delta_derivative_scale_aps = float(np.max(self.delta_derivative_limits_aps))
         elif self.action_contract == "delta_jdot_derivative_command_v1":
@@ -125,9 +140,13 @@ class LearnedMagneticController(Controller):
         self.action_clip = _positive_scale(action_clip, "action_clip")
         self._validate_weights()
         self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
+        self._previous_requested_delta_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
+        self._previous_derivative_command_norm = np.zeros((self.action_dim,), dtype=np.float32)
 
     def reset(self) -> None:
         self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
+        self._previous_requested_delta_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
+        self._previous_derivative_command_norm = np.zeros((self.action_dim,), dtype=np.float32)
         return None
 
     def compute_control(
@@ -169,7 +188,11 @@ class LearnedMagneticController(Controller):
         physical = self._project_physical_derivatives(model=model, physical=physical)
         derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
         applied_action_norm = np.clip(physical / derivative_scale, -1.0, 1.0)
-        if self.action_contract == "tcv_derivative_v1":
+        if self.action_contract == "delta_jdot_derivative_command_v3":
+            self._previous_requested_delta_action_norm = requested_action_norm.astype(np.float32, copy=True)
+            self._previous_derivative_command_norm = applied_action_norm.astype(np.float32, copy=True)
+            self._previous_action_norm = self._previous_requested_delta_action_norm.copy()
+        elif self.action_contract == "tcv_derivative_v1":
             self._previous_action_norm = requested_action_norm.astype(np.float32, copy=True)
         else:
             self._previous_action_norm = applied_action_norm.astype(np.float32, copy=True)
@@ -177,11 +200,15 @@ class LearnedMagneticController(Controller):
 
     def _command_from_actor_action(self, requested_action_norm: np.ndarray) -> np.ndarray:
         """Convert the actor output into the normalized derivative command sent to the plant."""
-        if self.action_contract not in {"delta_jdot_derivative_command_v1", "delta_jdot_derivative_command_v2"}:
+        if self.action_contract not in {"delta_jdot_derivative_command_v1", "delta_jdot_derivative_command_v2", "delta_jdot_derivative_command_v3"}:
             return np.asarray(requested_action_norm, dtype=float)
         derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
         delta_norm = np.asarray(requested_action_norm, dtype=float) * self.delta_derivative_limits_aps / derivative_scale
-        return np.clip(self._previous_action_norm.astype(float, copy=False) + delta_norm, -1.0, 1.0)
+        if self.action_contract == "delta_jdot_derivative_command_v3":
+            previous_command = self._previous_derivative_command_norm.astype(float, copy=False)
+        else:
+            previous_command = self._previous_action_norm.astype(float, copy=False)
+        return np.clip(previous_command + delta_norm, -1.0, 1.0)
 
     def _project_physical_derivatives(self, *, model, physical: np.ndarray) -> np.ndarray:
         """Apply the exported action contract to physical derivative commands."""
@@ -275,7 +302,12 @@ class LearnedMagneticController(Controller):
             "ref_radii": ref / self.radius_scale,
             "boundary_radii_error": (ref - measured_radii) / self.radius_scale,
             "boundary_found": np.array([boundary_found], dtype=float),
-            "previous_action": self._previous_action_norm.astype(float, copy=False),
+            "previous_action": (
+                self._previous_requested_delta_action_norm.astype(float, copy=False)
+                if self.action_contract == "delta_jdot_derivative_command_v3"
+                else self._previous_action_norm.astype(float, copy=False)
+            ),
+            "previous_derivative_command": self._previous_derivative_command_norm.astype(float, copy=False),
             "target_preview": self._reference_preview(model=model, scenario=scenario, angles=angles, max_episode_steps=max_episode_steps),
         }
         order = list(self.schema.get("feature_order", []))
@@ -314,7 +346,10 @@ class LearnedMagneticController(Controller):
                 raise ValueError("learned_magnetic_controller export uses the old virtual-diagnostic observation schema; retrain and export with observation_kind='joint_state_v1'")
             raise ValueError(f"learned_magnetic_controller requires one of {sorted(SUPPORTED_FEATURE_ORDERS)}, got {kind!r}")
         order = list(self.schema.get("feature_order", []))
-        if order != SUPPORTED_FEATURE_ORDERS[str(kind)]:
+        expected_orders = [SUPPORTED_FEATURE_ORDERS[str(kind)]]
+        if kind == "controller_state_v2":
+            expected_orders.append(CONTROLLER_STATE_V3_FEATURE_ORDER)
+        if order not in expected_orders:
             raise ValueError(f"controller schema feature_order does not match {kind}")
 
     def _validate_weights(self) -> None:

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from tokamak_control.config.scenarios import make_scenario
-from tokamak_control.control.learned_magnetic_controller import COMPACT_JOINT_STATE_V2_FEATURE_ORDER, JOINT_STATE_V1_FEATURE_ORDER
+from tokamak_control.control.learned_magnetic_controller import COMPACT_JOINT_STATE_V2_FEATURE_ORDER, CONTROLLER_STATE_V3_FEATURE_ORDER, JOINT_STATE_V1_FEATURE_ORDER
 from tokamak_control.control.registry import build_controller_runtime_call, controller_runtime_inputs, make_controller
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.geometry.boundary import find_plasma_boundary_with_status
@@ -362,6 +362,99 @@ def test_learned_controller_delta_jdot_contract_accumulates_command(tmp_path: Pa
     assert first_physical[0] == pytest.approx(expected_delta, rel=1.0e-6)
     assert second_physical[0] == pytest.approx(2.0 * expected_delta, rel=1.0e-6)
     assert controller._previous_action_norm[0] == pytest.approx(2.0 * expected_delta / derivative_scale[0], rel=1.0e-6)
+
+
+def test_learned_controller_delta_jdot_v3_tracks_delta_and_command_state(tmp_path: Path) -> None:
+    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    n_pfc = cfg.pfc.n_coils
+    n_sol = cfg.sol.n_coils
+    action_dim = n_pfc + n_sol
+    n_angles = 8
+    sizes = [
+        ("step_norm", 1),
+        ("ip", 1),
+        ("ip_ref", 1),
+        ("ip_error", 1),
+        ("active_currents", action_dim),
+        ("active_current_derivs", action_dim),
+        ("measured_boundary_radii", n_angles),
+        ("ref_radii", n_angles),
+        ("boundary_radii_error", n_angles),
+        ("boundary_found", 1),
+        ("previous_action", action_dim),
+        ("previous_derivative_command", action_dim),
+        ("target_preview", 0),
+    ]
+    slices: dict[str, list[int]] = {}
+    cursor = 0
+    for name, size in sizes:
+        slices[name] = [cursor, cursor + int(size)]
+        cursor += int(size)
+    derivative_scale = np.full((action_dim,), 1.0e7, dtype=float)
+    delta_limits = np.linspace(1.0e5, 9.0e5, action_dim, dtype=float)
+    export = tmp_path / "export_v3"
+    export.mkdir()
+    schema = {
+        "observation_kind": "controller_state_v2",
+        "obs_dim": cursor,
+        "action_dim": action_dim,
+        "n_active_total": action_dim,
+        "n_pfc": n_pfc,
+        "n_sol": n_sol,
+        "n_angles": n_angles,
+        "angles_rad": np.linspace(-np.pi, np.pi, n_angles, endpoint=False, dtype=float).tolist(),
+        "grid_shape": list(model.state.psi.shape),
+        "feature_order": CONTROLLER_STATE_V3_FEATURE_ORDER,
+        "feature_slices": slices,
+        "target_preview_steps": 0,
+        "target_preview_stride": 1,
+        "action_contract": "delta_jdot_derivative_command_v3",
+    }
+    (export / "controller_schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    (export / "normalization.json").write_text(
+        json.dumps(
+            {
+                "ip_scale": 5.0e5,
+                "radius_scale": 1.0,
+                "current_scale": [1.0e6] * action_dim,
+                "derivative_scale": derivative_scale.tolist(),
+                "delta_derivative_limits_aps": delta_limits.tolist(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (export / "metadata.json").write_text(json.dumps({"layer_norm_eps": 1.0e-5}), encoding="utf-8")
+    hidden = 8
+    np.savez(
+        export / "policy_weights.npz",
+        **{
+            "input.weight": np.zeros((hidden, cursor), dtype=np.float32),
+            "input.bias": np.zeros((hidden,), dtype=np.float32),
+            "input_norm.weight": np.ones((hidden,), dtype=np.float32),
+            "input_norm.bias": np.zeros((hidden,), dtype=np.float32),
+            "hidden1.weight": np.zeros((hidden, hidden), dtype=np.float32),
+            "hidden1.bias": np.zeros((hidden,), dtype=np.float32),
+            "mean_head.weight": np.zeros((action_dim, hidden), dtype=np.float32),
+            "mean_head.bias": np.full((action_dim,), 0.5, dtype=np.float32),
+        },
+    )
+    controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
+    angles = np.linspace(-np.pi, np.pi, n_angles, endpoint=False, dtype=float)
+    poly, _level, _status = find_plasma_boundary_with_status(model.state.psi, model.grid, (model.R0, model.Z0), limiter_shape=cfg.limiter_shape, boundary_mode=cfg.boundary_mode)
+    ref_radii = radii_from_polyline_ray_intersections(poly, (model.R0, model.Z0), angles)
+    scenario = make_scenario("nominal", ref_radii, model.Ip0, params={}, center=(model.R0, model.Z0))
+
+    first = controller.compute_control(model=model, psi=model.compute_psi(), boundary_poly=poly, center=(model.R0, model.Z0), measure_angles=angles, ref_radii=ref_radii, Ip_ref=model.Ip0, scenario=scenario, max_episode_steps=10)
+    second = controller.compute_control(model=model, psi=model.compute_psi(), boundary_poly=poly, center=(model.R0, model.Z0), measure_angles=angles, ref_radii=ref_radii, Ip_ref=model.Ip0, scenario=scenario, max_episode_steps=10)
+    first_physical = np.concatenate([first.pfc_derivs, first.sol_derivs])
+    second_physical = np.concatenate([second.pfc_derivs, second.sol_derivs])
+    requested_delta = np.tanh(0.5)
+    expected_delta = requested_delta * delta_limits[0]
+    assert first_physical[0] == pytest.approx(expected_delta, rel=1.0e-6)
+    assert second_physical[0] == pytest.approx(2.0 * expected_delta, rel=1.0e-6)
+    assert controller._previous_requested_delta_action_norm[0] == pytest.approx(requested_delta, rel=1.0e-6)
+    assert controller._previous_derivative_command_norm[0] == pytest.approx(2.0 * expected_delta / derivative_scale[0], rel=1.0e-6)
 
 
 def test_learned_controller_accepts_compact_joint_state_export(tmp_path: Path) -> None:
