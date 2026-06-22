@@ -55,8 +55,8 @@ class GpuPlasmaModel:
             gs = np.asarray(self.settings.ip_coupling_sol, dtype=float).reshape(-1)
         self.g = torch.as_tensor(gp, dtype=self.dtype, device=self.device)
         self.g2 = torch.as_tensor(gs, dtype=self.dtype, device=self.device)
-        pfc0 = self._clip_currents(torch.as_tensor(self.pfc.initial_currents, dtype=self.dtype, device=self.device), self.settings.pfc_current_limit)
-        sol0 = self._clip_currents(torch.as_tensor(self.sol.initial_currents, dtype=self.dtype, device=self.device), self.settings.sol_current_limit)
+        pfc0 = torch.as_tensor(self.pfc.initial_currents, dtype=self.dtype, device=self.device)
+        sol0 = torch.as_tensor(self.sol.initial_currents, dtype=self.dtype, device=self.device)
         ip0 = torch.tensor(float(self.Ip0), dtype=self.dtype, device=self.device)
         self._ip = ip0
         self._pfc = pfc0.clone()
@@ -90,14 +90,18 @@ class GpuPlasmaModel:
         return float(np.exp(-float(self.t_step) / tau))
 
     def decay_factor(self, dt: float | None = None) -> float:
-        tau = max(float(self.sigma * self.inductance_L), 1e-30)
-        return float(np.exp(-float(self.t_step if dt is None else dt) / tau))
+        """Return the one-step explicit-Euler passive Ip multiplier."""
+        tau = max(float(self.sigma * self.inductance_L), 1.0e-30)
+        return float(1.0 - float(self.t_step if dt is None else dt) / tau)
 
     def predict_Ip_decay_baseline_next(self) -> float:
-        return float((self._ip * self.decay_factor(float(self.t_step))).detach().cpu().item())
+        """Return next-step passive-only Ip from the current state."""
+        return float(self._ip.detach().cpu().item()) * self.decay_factor()
 
     def get_ip_B_row(self) -> np.ndarray:
-        row = float(self.t_step) * float(self.ip_coupling_sign) * (self.mu0 * self.sigma / self.R0) * self.torch.cat([self.g, self.g2])
+        """Return one-step Ip sensitivity to derivative commands [PFC..., SOL...]."""
+        scale = float(self.ip_coupling_sign) * (float(self.mu0) * float(self.sigma) / float(self.R0))
+        row = float(self.t_step) * scale * self.torch.cat([self.g, self.g2])
         return row.detach().cpu().numpy().astype(float)
 
     def _compose_psi_tensor(self, ip, pfc, sol):
@@ -114,25 +118,21 @@ class GpuPlasmaModel:
     def compute_psi(self) -> np.ndarray:
         return self.compute_psi_tensor().detach().cpu().numpy().astype(float)
 
-    def step(self, pfc_current_derivs=None, sol_current_derivs=None) -> PlasmaState:
+    def step_currents(self, pfc_currents_next=None, sol_currents_next=None) -> PlasmaState:
+        """Advance one old-parity step from absolute next coil currents."""
         torch = self.torch
-        cmd_pfc = torch.zeros((self.pfc.n_coils,), dtype=self.dtype, device=self.device) if pfc_current_derivs is None else torch.as_tensor(pfc_current_derivs, dtype=self.dtype, device=self.device).reshape(self.pfc.n_coils)
-        cmd_sol = torch.zeros((self.sol.n_coils,), dtype=self.dtype, device=self.device) if sol_current_derivs is None else torch.as_tensor(sol_current_derivs, dtype=self.dtype, device=self.device).reshape(self.sol.n_coils)
-        cmd_pfc = self._clip_derivs(cmd_pfc, self.settings.pfc_deriv_limit)
-        cmd_sol = self._clip_derivs(cmd_sol, self.settings.sol_deriv_limit)
-        alpha = self._actuator_alpha()
-        applied_pfc = self._clip_derivs(alpha * self._pfc_deriv + (1.0 - alpha) * cmd_pfc, self.settings.pfc_deriv_limit)
-        applied_sol = self._clip_derivs(alpha * self._sol_deriv + (1.0 - alpha) * cmd_sol, self.settings.sol_deriv_limit)
-        next_pfc = self._clip_currents(self._pfc + float(self.t_step) * applied_pfc, self.settings.pfc_current_limit)
-        next_sol = self._clip_currents(self._sol + float(self.t_step) * applied_sol, self.settings.sol_current_limit)
-        delta_pfc = next_pfc - self._pfc
-        delta_sol = next_sol - self._sol
-        control = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+        next_pfc = self._pfc.clone() if pfc_currents_next is None else torch.as_tensor(pfc_currents_next, dtype=self.dtype, device=self.device).reshape(self.pfc.n_coils)
+        next_sol = self._sol.clone() if sol_currents_next is None else torch.as_tensor(sol_currents_next, dtype=self.dtype, device=self.device).reshape(self.sol.n_coils)
+        applied_pfc = (next_pfc - self._pfc) / float(self.t_step)
+        applied_sol = (next_sol - self._sol) / float(self.t_step)
+        drive = torch.as_tensor(0.0, dtype=self.dtype, device=self.device)
         if self.g.numel():
-            control = control + torch.dot(self.g, delta_pfc)
+            drive = drive + self.torch.dot(self.g, applied_pfc)
         if self.g2.numel():
-            control = control + torch.dot(self.g2, delta_sol)
-        ip_next = self._ip * self.decay_factor(float(self.t_step)) + float(self.ip_coupling_sign) * (self.mu0 * self.sigma / self.R0) * control
+            drive = drive + self.torch.dot(self.g2, applied_sol)
+        scale = float(self.ip_coupling_sign) * (float(self.mu0) * float(self.sigma) / float(self.R0))
+        d_ip_dt = -self._ip / max(float(self.sigma * self.inductance_L), 1.0e-30) + scale * drive
+        ip_next = self._ip + float(self.t_step) * d_ip_dt
         self._ip = ip_next
         self._pfc = next_pfc
         self._sol = next_sol
@@ -142,6 +142,10 @@ class GpuPlasmaModel:
         self._time += float(self.t_step)
         self.state = self._snapshot_state()
         return self.state
+
+    def step(self, *args, **kwargs) -> PlasmaState:
+        """Reject the removed derivative-command API."""
+        raise RuntimeError("GpuPlasmaModel.step() was removed; use step_currents(J_next) with absolute next currents")
 
     def snapshot_state(self) -> PlasmaState:
         return self._snapshot_state().copied()

@@ -24,7 +24,7 @@ Core fitting loop
 - For each (sigma, inductance_L) candidate:
     * override model sigma and inductance_L
     * initialize the model from the first sample of each shot
-    * replay measured coil currents by feeding per-step derivatives into PlasmaModel.step()
+    * replay measured coil currents through PlasmaModel.step_currents()
     * score mean RMSE and mean NRMSE across shots
 
 Fitting semantics
@@ -292,18 +292,17 @@ def _resample_matrix(t_src: np.ndarray, y_src: np.ndarray, t_dst: np.ndarray) ->
 
 
 def _split_sol_group_sizes(cfg: LoadedConfig) -> list[int]:
-    """Определить размеры пропорциональных SOL-групп по разрывам координат Z."""
-    z = np.asarray([float(group[0, 1]) for group in cfg.sol.element_positions], dtype=float)
-    if z.size < 2:
-        return [int(z.size)]
-    jumps = np.where(np.diff(z) < -1.0)[0]
-    starts = [0] + (jumps + 1).astype(int).tolist()
-    ends = (jumps + 1).astype(int).tolist() + [int(z.size)]
-    return [int(e - s) for s, e in zip(starts, ends, strict=True)]
+    """Return the physical split-element count for each runtime SOL actuator."""
+    return [int(np.asarray(group, dtype=float).reshape(-1, 2).shape[0]) for group in cfg.sol.element_positions]
 
 
 def _expand_split_sol_rows(sol_raw: np.ndarray, group_sizes: list[int]) -> np.ndarray:
-    """Развернуть токи исходных SOL-групп в токи split-элементов."""
+    """
+    Expand SOL actuator currents into per-element currents for legacy fits.
+
+    Each split point receives ``group_current / n_elements`` so the total
+    current of the volumetric SOL actuator is conserved.
+    """
     source = np.asarray(sol_raw, dtype=float)
     if source.ndim != 2 or source.shape[1] != len(group_sizes):
         raise ValueError("source SOL matrix shape does not match split group count")
@@ -513,10 +512,10 @@ def _simulate_shot_record(
     sol_used[0] = np.asarray(s0.sol_currents, dtype=float)
 
     for k in range(T - 1):
-        pfc_deriv = (shot.pfc_curr[k + 1] - shot.pfc_curr[k]) / dt
-        sol_deriv = (shot.sol_curr[k + 1] - shot.sol_curr[k]) / dt
-
-        state = model.step(pfc_deriv, sol_deriv)
+        state = model.step_currents(
+            pfc_currents_next=shot.pfc_curr[k + 1],
+            sol_currents_next=shot.sol_curr[k + 1],
+        )
 
         ip_pred[k + 1] = float(state.Ip)
         pfc_used[k + 1] = np.asarray(state.pfc_currents, dtype=float)
@@ -785,7 +784,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
             "Grid-search sigma and inductance_L by replaying preprocessed measured T15MD coil "
-            "currents through PlasmaModel.step(). Input CSV time is interpreted as seconds."
+            "currents through PlasmaModel.step_currents(). Input CSV time is interpreted as seconds."
         )
     )
     ap.add_argument("--config", required=True)

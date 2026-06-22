@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tokamak_control.bridge import DerivativeAction, InitialStateOverride, SimulationSession
+from tokamak_control.bridge import CurrentAction, InitialStateOverride, SimulationSession
 from tokamak_control.config.settings import PhysicsSettings
 from tokamak_control.core.coils import Coil, CoilActuator, CoilGroup
 from tokamak_control.core.grid import Grid1D, Grid2D
@@ -54,7 +54,7 @@ def _write_bridge_config(path: Path, *, realism: RealismSettings | None = None) 
         physics=physics,
         realism=realism,
         limiter_name="T15MD",
-        boundary_mode="limited",
+        boundary_mode="legacy_contour",
     )
 
 
@@ -125,10 +125,11 @@ def test_simulation_session_reset_and_step_shapes(tmp_path: Path) -> None:
     assert reset.machine.n_active_total == 3
     assert reset.machine.active_order == ("pfc_0", "pfc_1", "sol_0")
     assert reset.observation_snapshot.true_radii is not None
-    assert reset.observation_snapshot.true_radii.shape == (8,)
+    assert reset.observation_snapshot.true_radii.shape == reset.machine.angles_rad.shape
 
-    action = DerivativeAction(np.array([1000.0, -2000.0, 500.0], dtype=float))
-    step = session.step_derivatives(action)
+    requested_derivs = np.array([1000.0, -2000.0, 500.0], dtype=float)
+    action = CurrentAction(reset.observation_snapshot.true_active_currents + reset.machine.t_step * requested_derivs)
+    step = session.step_currents(action)
 
     assert not step.terminated
     assert not step.truncated
@@ -137,7 +138,7 @@ def test_simulation_session_reset_and_step_shapes(tmp_path: Path) -> None:
     assert step.snapshot.applied_active_derivatives.shape == (3,)
     assert step.snapshot.previous_applied_active_derivatives.shape == (3,)
     assert step.snapshot.true_active_currents.shape == (3,)
-    assert step.snapshot.reference.radii_ref.shape == (8,)
+    assert step.snapshot.reference.radii_ref.shape == reset.machine.angles_rad.shape
     assert step.snapshot.true_boundary_poly is not None
     assert step.snapshot.true_boundary_poly.shape[1] == 2
 
@@ -176,7 +177,7 @@ def test_simulation_session_accepts_zero_initial_state_override(tmp_path: Path) 
         "ip_scale": 5.0e5,
     }
 
-    step = session.step_derivatives(DerivativeAction(np.zeros((reset.machine.n_active_total,), dtype=float)))
+    step = session.step_currents(CurrentAction(reset.observation_snapshot.true_active_currents.copy()))
 
     assert not step.terminated
     assert step.snapshot.step_index == 1
@@ -266,7 +267,7 @@ def test_reference_at_time_matches_step_snapshot_reference(tmp_path: Path) -> No
     assert np.isclose(reset_ref.ip_ref, reset.observation_snapshot.reference.ip_ref)
     assert np.allclose(reset_ref.radii_ref, reset.observation_snapshot.reference.radii_ref)
 
-    step = session.step_derivatives(DerivativeAction(np.zeros((reset.machine.n_active_total,), dtype=float)))
+    step = session.step_currents(CurrentAction(reset.observation_snapshot.true_active_currents.copy()))
     step_ref = session.reference_at_time(step.snapshot.time_s)
 
     assert np.isclose(step_ref.ip_ref, step.snapshot.reference.ip_ref)
@@ -278,9 +279,10 @@ def test_simulation_session_truncates_at_configured_steps(tmp_path: Path) -> Non
     config_path = tmp_path / "bridge_machine.toml"
     _write_bridge_config(config_path)
     session = SimulationSession.from_paths(config_path, None, "nominal", {}, 8, 1)
-    machine = session.reset().machine
+    reset = session.reset()
+    machine = reset.machine
 
-    result = session.step_derivatives(DerivativeAction(np.zeros((machine.n_active_total,), dtype=float)))
+    result = session.step_currents(CurrentAction(reset.observation_snapshot.true_active_currents.copy()))
 
     assert result.truncated
     assert not result.terminated

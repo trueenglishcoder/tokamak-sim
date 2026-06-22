@@ -10,18 +10,18 @@ import numpy as np
 @dataclass(slots=True)
 class ControlAction:
     """
-    Container for coil derivative commands.
+    Container for old-parity next-current commands.
 
     Attributes
     ----------
-    pfc_derivs : np.ndarray
-        PFC current derivatives (A/s), shape (n_pfc,).
-    sol_derivs : np.ndarray
-        SOL current derivatives (A/s), shape (n_sol,).
+    pfc_currents_next : np.ndarray
+        Absolute PFC currents for the next simulation step (A), shape (n_pfc,).
+    sol_currents_next : np.ndarray
+        Absolute SOL currents for the next simulation step (A), shape (n_sol,).
     """
 
-    pfc_derivs: np.ndarray
-    sol_derivs: np.ndarray
+    pfc_currents_next: np.ndarray
+    sol_currents_next: np.ndarray
 
 
 class Controller(ABC):
@@ -48,7 +48,7 @@ class Controller(ABC):
     @abstractmethod
     def compute_control(self, **runtime_inputs: object) -> ControlAction:
         """
-        Compute coil current derivatives for one control step.
+        Compute absolute next coil currents for one control step.
 
         Parameters
         ----------
@@ -59,6 +59,6 @@ class Controller(ABC):
         Returns
         -------
         ControlAction
-            Coil derivatives for PFC and SOL coils in A/s.
+            Absolute next-step currents for PFC and SOL coils in A.
         """
         ...

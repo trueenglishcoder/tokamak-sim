@@ -9,8 +9,13 @@ import numpy as np
 from tokamak_control.core.grid import Grid2D
 
 
-BoundaryMode = Literal["limited", "diverted"]
-BoundaryStatus = Literal["limited_success", "separatrix_success"]
+BoundaryMode = Literal["legacy_contour", "legacy_contour_limited", "tracked_flux_contour"]
+BoundaryStatus = Literal[
+    "legacy_contour_success",
+    "legacy_contour_limited_success",
+    "tracked_flux_contour_success",
+    "tracked_flux_contour_reset",
+]
 
 
 class BoundaryNotFoundError(RuntimeError):
@@ -25,13 +30,24 @@ class MagneticAxis:
 
 
 def boundary_status_is_real(status: BoundaryStatus) -> bool:
-    return status in {"limited_success", "separatrix_success"}
+    """Return True when a boundary status string represents a found boundary."""
+    return status in {
+        "legacy_contour_success",
+        "legacy_contour_limited_success",
+        "tracked_flux_contour_success",
+        "tracked_flux_contour_reset",
+    }
 
 
 def normalize_boundary_mode(mode: BoundaryMode | str) -> BoundaryMode:
+    """Normalize and validate the old-parity boundary extraction mode."""
     mode_text = str(mode).strip().lower()
-    if mode_text not in {"limited", "diverted"}:
-        raise ValueError(f"boundary_mode must be 'limited' or 'diverted', got {mode!r}")
+    if mode_text not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour"}:
+        raise ValueError(
+            "boundary_mode must be 'legacy_contour', 'legacy_contour_limited', "
+            "or 'tracked_flux_contour', "
+            f"got {mode!r}"
+        )
     return cast(BoundaryMode, mode_text)
 
 

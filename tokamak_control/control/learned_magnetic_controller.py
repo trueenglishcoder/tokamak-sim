@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from tokamak_control.control.base import ControlAction, Controller
-from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
+from tokamak_control.geometry.legacy_metrics import legacy_radii_at_angles
 
 
 JOINT_STATE_V1_FEATURE_ORDER = [
@@ -53,12 +53,10 @@ CONTROLLER_STATE_V3_FEATURE_ORDER = [
     "target_preview",
 ]
 COMPACT_JOINT_STATE_V2_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
-OBSERVATION_KIND = "controller_state_v2"
-EXPECTED_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
+OBSERVATION_KIND = "controller_state_v3"
+EXPECTED_FEATURE_ORDER = CONTROLLER_STATE_V3_FEATURE_ORDER
 SUPPORTED_FEATURE_ORDERS = {
-    "joint_state_v1": JOINT_STATE_V1_FEATURE_ORDER,
-    "compact_joint_state_v2": CONTROLLER_STATE_V2_FEATURE_ORDER,
-    "controller_state_v2": CONTROLLER_STATE_V2_FEATURE_ORDER,
+    "controller_state_v3": CONTROLLER_STATE_V3_FEATURE_ORDER,
 }
 
 
@@ -82,9 +80,12 @@ class LearnedMagneticController(Controller):
             raise FileNotFoundError(f"learned controller export directory does not exist: {self.export_dir}")
         self.schema = _read_json(_first_existing(self.export_dir, ("controller_schema.json", "schema.json")))
         self._validate_observation_schema()
-        self.action_contract = str(self.schema.get("action_contract", "requested_with_current_aware_saturation_v2"))
-        if self.action_contract not in {"requested_with_current_aware_saturation_v2", "tcv_derivative_v1", "delta_jdot_derivative_command_v1", "delta_jdot_derivative_command_v2", "delta_jdot_derivative_command_v3"}:
-            raise ValueError(f"unsupported learned-controller action_contract: {self.action_contract!r}")
+        self.action_contract = str(self.schema.get("action_contract", ""))
+        if self.action_contract != "delta_jdot_derivative_command_v3":
+            raise ValueError(
+                "learned-controller exports must use action_contract='delta_jdot_derivative_command_v3'; "
+                f"got {self.action_contract!r}"
+            )
         self.normalization = _read_json(self.export_dir / "normalization.json")
         self.metadata = _read_json(self.export_dir / "metadata.json")
         with np.load(self.export_dir / "policy_weights.npz", allow_pickle=False) as data:
@@ -113,30 +114,10 @@ class LearnedMagneticController(Controller):
         self.psi_scale = _positive_scale(self.normalization.get("psi_scale", 1.0), "psi_scale")
         self.current_scale = _scale_array(self.normalization["current_scale"], self.n_active_total, "current_scale")
         self.derivative_scale = _scale_array(self.normalization["derivative_scale"], self.action_dim, "derivative_scale")
-        if self.action_contract in {"delta_jdot_derivative_command_v2", "delta_jdot_derivative_command_v3"}:
-            if "delta_derivative_limits_aps" not in self.normalization:
-                raise ValueError(f"{self.action_contract} requires delta_derivative_limits_aps in normalization.json")
-            self.delta_derivative_limits_aps = _scale_array(self.normalization["delta_derivative_limits_aps"], self.action_dim, "delta_derivative_limits_aps")
-            self.delta_derivative_scale_aps = float(np.max(self.delta_derivative_limits_aps))
-        elif self.action_contract == "delta_jdot_derivative_command_v1":
-            if "delta_derivative_scale_aps" not in self.normalization:
-                raise ValueError("delta_jdot_derivative_command_v1 requires delta_derivative_scale_aps in normalization.json")
-            self.delta_derivative_scale_aps = _positive_scale(self.normalization["delta_derivative_scale_aps"], "delta_derivative_scale_aps")
-            self.delta_derivative_limits_aps = np.full((self.action_dim,), self.delta_derivative_scale_aps, dtype=float)
-        else:
-            raw_delta_scale = self.normalization.get("delta_derivative_scale_aps")
-            self.delta_derivative_scale_aps = 0.0 if raw_delta_scale is None else _positive_scale(raw_delta_scale, "delta_derivative_scale_aps")
-            self.delta_derivative_limits_aps = np.full((self.action_dim,), self.delta_derivative_scale_aps, dtype=float)
-        raw_saturation_fraction = self.normalization.get("current_saturation_fraction")
-        self.current_saturation_fraction = None if raw_saturation_fraction is None else float(raw_saturation_fraction)
-        if self.current_saturation_fraction is not None and (
-            not np.isfinite(self.current_saturation_fraction) or self.current_saturation_fraction < 1.0
-        ):
-            raise ValueError("current_saturation_fraction must be finite and >= 1")
-        self.current_projection_enabled = bool(self.normalization.get("current_projection_enabled", False))
-        self.current_projection_margin_fraction = float(self.normalization.get("current_projection_margin_fraction", 0.0))
-        if not np.isfinite(self.current_projection_margin_fraction) or not 0.0 <= self.current_projection_margin_fraction < 1.0:
-            raise ValueError("current_projection_margin_fraction must be finite and in [0, 1)")
+        if "delta_derivative_limits_aps" not in self.normalization:
+            raise ValueError("delta_jdot_derivative_command_v3 requires delta_derivative_limits_aps in normalization.json")
+        self.delta_derivative_limits_aps = _scale_array(self.normalization["delta_derivative_limits_aps"], self.action_dim, "delta_derivative_limits_aps")
+        self.delta_derivative_scale_aps = float(np.max(self.delta_derivative_limits_aps))
         self.action_clip = _positive_scale(action_clip, "action_clip")
         self._validate_weights()
         self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
@@ -188,39 +169,30 @@ class LearnedMagneticController(Controller):
         physical = self._project_physical_derivatives(model=model, physical=physical)
         derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
         applied_action_norm = np.clip(physical / derivative_scale, -1.0, 1.0)
-        if self.action_contract == "delta_jdot_derivative_command_v3":
-            self._previous_requested_delta_action_norm = requested_action_norm.astype(np.float32, copy=True)
-            self._previous_derivative_command_norm = applied_action_norm.astype(np.float32, copy=True)
-            self._previous_action_norm = self._previous_requested_delta_action_norm.copy()
-        elif self.action_contract == "tcv_derivative_v1":
-            self._previous_action_norm = requested_action_norm.astype(np.float32, copy=True)
-        else:
-            self._previous_action_norm = applied_action_norm.astype(np.float32, copy=True)
-        return ControlAction(pfc_derivs=physical[:n_pfc].copy(), sol_derivs=physical[n_pfc:].copy())
+        self._previous_requested_delta_action_norm = requested_action_norm.astype(np.float32, copy=True)
+        self._previous_derivative_command_norm = applied_action_norm.astype(np.float32, copy=True)
+        self._previous_action_norm = self._previous_requested_delta_action_norm.copy()
+        currents_now = np.concatenate([
+            np.asarray(model.state.pfc_currents, dtype=float).reshape(-1),
+            np.asarray(model.state.sol_currents, dtype=float).reshape(-1),
+        ])
+        currents_next = currents_now + float(getattr(model, "t_step")) * physical
+        return ControlAction(
+            pfc_currents_next=currents_next[:n_pfc].copy(),
+            sol_currents_next=currents_next[n_pfc:].copy(),
+        )
 
     def _command_from_actor_action(self, requested_action_norm: np.ndarray) -> np.ndarray:
         """Convert the actor output into the normalized derivative command sent to the plant."""
-        if self.action_contract not in {"delta_jdot_derivative_command_v1", "delta_jdot_derivative_command_v2", "delta_jdot_derivative_command_v3"}:
-            return np.asarray(requested_action_norm, dtype=float)
         derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
         delta_norm = np.asarray(requested_action_norm, dtype=float) * self.delta_derivative_limits_aps / derivative_scale
-        if self.action_contract == "delta_jdot_derivative_command_v3":
-            previous_command = self._previous_derivative_command_norm.astype(float, copy=False)
-        else:
-            previous_command = self._previous_action_norm.astype(float, copy=False)
+        previous_command = self._previous_derivative_command_norm.astype(float, copy=False)
         return np.clip(previous_command + delta_norm, -1.0, 1.0)
 
     def _project_physical_derivatives(self, *, model, physical: np.ndarray) -> np.ndarray:
         """Apply the exported action contract to physical derivative commands."""
-        if self.action_contract == "tcv_derivative_v1":
-            return np.asarray(physical, dtype=float)
-        if self.current_saturation_fraction is not None:
-            limits = np.maximum(self.current_scale * float(self.current_saturation_fraction), 1.0e-12)
-            return self._clip_physical_to_current_envelope(model=model, physical=physical, limits=limits)
-        if not self.current_projection_enabled:
-            return np.asarray(physical, dtype=float)
-        limits = np.maximum(self.current_scale * (1.0 - self.current_projection_margin_fraction), 1.0e-12)
-        return self._clip_physical_to_current_envelope(model=model, physical=physical, limits=limits)
+        del model
+        return np.asarray(physical, dtype=float)
 
     def _clip_physical_to_current_envelope(self, *, model, physical: np.ndarray, limits: np.ndarray) -> np.ndarray:
         currents = np.concatenate([
@@ -284,7 +256,7 @@ class LearnedMagneticController(Controller):
             measured_radii = np.zeros((self.n_angles,), dtype=float)
             boundary_found = 0.0
         else:
-            measured_radii = radii_from_polyline_ray_intersections(np.asarray(boundary_poly, dtype=float), center, angles)
+            measured_radii = legacy_radii_at_angles(np.asarray(boundary_poly, dtype=float), center, angles)
             measured_radii = np.nan_to_num(measured_radii, nan=0.0, posinf=0.0, neginf=0.0)
             boundary_found = 1.0
         current_scale = np.where(self.current_scale > 0.0, self.current_scale, 1.0)
@@ -302,11 +274,7 @@ class LearnedMagneticController(Controller):
             "ref_radii": ref / self.radius_scale,
             "boundary_radii_error": (ref - measured_radii) / self.radius_scale,
             "boundary_found": np.array([boundary_found], dtype=float),
-            "previous_action": (
-                self._previous_requested_delta_action_norm.astype(float, copy=False)
-                if self.action_contract == "delta_jdot_derivative_command_v3"
-                else self._previous_action_norm.astype(float, copy=False)
-            ),
+            "previous_action": self._previous_requested_delta_action_norm.astype(float, copy=False),
             "previous_derivative_command": self._previous_derivative_command_norm.astype(float, copy=False),
             "target_preview": self._reference_preview(model=model, scenario=scenario, angles=angles, max_episode_steps=max_episode_steps),
         }
@@ -343,13 +311,10 @@ class LearnedMagneticController(Controller):
         kind = self.schema.get("observation_kind")
         if kind not in SUPPORTED_FEATURE_ORDERS:
             if "diagnostics" in self.schema:
-                raise ValueError("learned_magnetic_controller export uses the old virtual-diagnostic observation schema; retrain and export with observation_kind='joint_state_v1'")
+                raise ValueError("learned_magnetic_controller export uses an old virtual-diagnostic observation schema; retrain under controller_state_v3")
             raise ValueError(f"learned_magnetic_controller requires one of {sorted(SUPPORTED_FEATURE_ORDERS)}, got {kind!r}")
         order = list(self.schema.get("feature_order", []))
-        expected_orders = [SUPPORTED_FEATURE_ORDERS[str(kind)]]
-        if kind == "controller_state_v2":
-            expected_orders.append(CONTROLLER_STATE_V3_FEATURE_ORDER)
-        if order not in expected_orders:
+        if order != SUPPORTED_FEATURE_ORDERS[str(kind)]:
             raise ValueError(f"controller schema feature_order does not match {kind}")
 
     def _validate_weights(self) -> None:

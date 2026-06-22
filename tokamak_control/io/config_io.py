@@ -28,7 +28,17 @@ class LoadedConfig:
     physics: PhysicsSettings
     compute: ComputeSettings = ComputeSettings()
     realism: RealismSettings = RealismSettings()
-    boundary_mode: BoundaryMode = "limited"
+    boundary_mode: BoundaryMode = "legacy_contour"
+    boundary_base_mode: BoundaryMode = "legacy_contour_limited"
+    boundary_legacy_precision_index2: float = 1.0e-3
+    boundary_track_level: bool = False
+    boundary_level_smoothing_alpha: float = 1.0
+    boundary_level_search_span_fraction: float = 0.02
+    boundary_continuity_weight_radii: float = 1.0
+    boundary_continuity_weight_mean_radius: float = 0.3
+    boundary_continuity_weight_center: float = 0.2
+    boundary_continuity_weight_area: float = 0.2
+    boundary_continuity_weight_level: float = 0.1
     limiter_name: str | None = None
     limiter_shape: np.ndarray | None = None
     pfc_active_mask: np.ndarray | None = None
@@ -94,8 +104,10 @@ def _coerce_boundary_mode(value: object, name: str) -> BoundaryMode:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
     mode = value.strip().lower()
-    if mode not in {"limited", "diverted"}:
-        raise ValueError(f"{name} must be 'limited' or 'diverted', got {value!r}")
+    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour"}:
+        raise ValueError(
+            f"{name} must be 'legacy_contour', 'legacy_contour_limited', or 'tracked_flux_contour', got {value!r}"
+        )
     return cast(BoundaryMode, mode)
 
 
@@ -408,9 +420,47 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         raise ValueError(
             f"physics.ip_coupling_sol length {len(physics.ip_coupling_sol)} != number of SOL actuators {sol.n_coils}"
         )
-
     boundary_node = _require_mapping(cfg.get("boundary", {}), "boundary")
-    boundary_mode = _coerce_boundary_mode(boundary_node.get("mode", "limited"), "boundary.mode")
+    boundary_mode = _coerce_boundary_mode(boundary_node.get("mode", "legacy_contour"), "boundary.mode")
+    boundary_base_mode = _coerce_boundary_mode(
+        boundary_node.get("base_mode", "legacy_contour_limited"),
+        "boundary.base_mode",
+    )
+    if boundary_mode == "tracked_flux_contour" and boundary_base_mode == "tracked_flux_contour":
+        raise ValueError("boundary.base_mode must be a strict legacy mode when boundary.mode='tracked_flux_contour'")
+    boundary_legacy_precision_index2 = _coerce_float(
+        boundary_node.get("legacy_precision_index2", 1.0e-3),
+        "boundary.legacy_precision_index2",
+    )
+    if boundary_legacy_precision_index2 <= 0.0:
+        raise ValueError("boundary.legacy_precision_index2 must be > 0")
+    boundary_track_level = _coerce_bool(boundary_node.get("track_level", False), "boundary.track_level")
+    boundary_level_smoothing_alpha = _coerce_float(
+        boundary_node.get("level_smoothing_alpha", 1.0),
+        "boundary.level_smoothing_alpha",
+    )
+    if boundary_level_smoothing_alpha < 0.0 or boundary_level_smoothing_alpha > 1.0:
+        raise ValueError("boundary.level_smoothing_alpha must be in [0, 1]")
+    boundary_level_search_span_fraction = _coerce_float(
+        boundary_node.get("level_search_span_fraction", 0.02),
+        "boundary.level_search_span_fraction",
+    )
+    if boundary_level_search_span_fraction < 0.0:
+        raise ValueError("boundary.level_search_span_fraction must be >= 0")
+    boundary_continuity_weight_radii = _coerce_float(boundary_node.get("continuity_weight_radii", 1.0), "boundary.continuity_weight_radii")
+    boundary_continuity_weight_mean_radius = _coerce_float(boundary_node.get("continuity_weight_mean_radius", 0.3), "boundary.continuity_weight_mean_radius")
+    boundary_continuity_weight_center = _coerce_float(boundary_node.get("continuity_weight_center", 0.2), "boundary.continuity_weight_center")
+    boundary_continuity_weight_area = _coerce_float(boundary_node.get("continuity_weight_area", 0.2), "boundary.continuity_weight_area")
+    boundary_continuity_weight_level = _coerce_float(boundary_node.get("continuity_weight_level", 0.1), "boundary.continuity_weight_level")
+    for name, value in {
+        "boundary.continuity_weight_radii": boundary_continuity_weight_radii,
+        "boundary.continuity_weight_mean_radius": boundary_continuity_weight_mean_radius,
+        "boundary.continuity_weight_center": boundary_continuity_weight_center,
+        "boundary.continuity_weight_area": boundary_continuity_weight_area,
+        "boundary.continuity_weight_level": boundary_continuity_weight_level,
+    }.items():
+        if value < 0.0:
+            raise ValueError(f"{name} must be >= 0")
 
     limiter_name: str | None = None
     limiter_shape: np.ndarray | None = None
@@ -430,6 +480,16 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         compute=compute,
         realism=realism,
         boundary_mode=boundary_mode,
+        boundary_base_mode=boundary_base_mode,
+        boundary_legacy_precision_index2=boundary_legacy_precision_index2,
+        boundary_track_level=boundary_track_level,
+        boundary_level_smoothing_alpha=boundary_level_smoothing_alpha,
+        boundary_level_search_span_fraction=boundary_level_search_span_fraction,
+        boundary_continuity_weight_radii=boundary_continuity_weight_radii,
+        boundary_continuity_weight_mean_radius=boundary_continuity_weight_mean_radius,
+        boundary_continuity_weight_center=boundary_continuity_weight_center,
+        boundary_continuity_weight_area=boundary_continuity_weight_area,
+        boundary_continuity_weight_level=boundary_continuity_weight_level,
         limiter_name=limiter_name,
         limiter_shape=limiter_shape,
         pfc_active_mask=pfc_active_mask.copy(),
@@ -447,7 +507,17 @@ def dump_config(
     compute: ComputeSettings | None = None,
     realism: RealismSettings | None = None,
     limiter_name: str | None = None,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
+    boundary_base_mode: BoundaryMode = "legacy_contour_limited",
+    boundary_legacy_precision_index2: float = 1.0e-3,
+    boundary_track_level: bool = False,
+    boundary_level_smoothing_alpha: float = 1.0,
+    boundary_level_search_span_fraction: float = 0.02,
+    boundary_continuity_weight_radii: float = 1.0,
+    boundary_continuity_weight_mean_radius: float = 0.3,
+    boundary_continuity_weight_center: float = 0.2,
+    boundary_continuity_weight_area: float = 0.2,
+    boundary_continuity_weight_level: float = 0.1,
 ) -> None:
     """Записать TOML-конфигурацию текущей расчетной схемы."""
     path = Path(path)
@@ -516,6 +586,16 @@ def dump_config(
         },
         "boundary": {
             "mode": str(boundary_mode),
+            "base_mode": str(boundary_base_mode),
+            "legacy_precision_index2": float(boundary_legacy_precision_index2),
+            "track_level": bool(boundary_track_level),
+            "level_smoothing_alpha": float(boundary_level_smoothing_alpha),
+            "level_search_span_fraction": float(boundary_level_search_span_fraction),
+            "continuity_weight_radii": float(boundary_continuity_weight_radii),
+            "continuity_weight_mean_radius": float(boundary_continuity_weight_mean_radius),
+            "continuity_weight_center": float(boundary_continuity_weight_center),
+            "continuity_weight_area": float(boundary_continuity_weight_area),
+            "continuity_weight_level": float(boundary_continuity_weight_level),
         },
         "coils": {
             "pfc": {

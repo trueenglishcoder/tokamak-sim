@@ -1,15 +1,19 @@
 # tokamak_control/geometry/boundary_cpu.py
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, cast
-
+from typing import Literal
 import numpy as np
 from contourpy import contour_generator
 
 from tokamak_control.core.grid import Grid2D
-from tokamak_control.geometry.boundary_common import BoundaryNotFoundError as _SharedBoundaryNotFoundError
+from tokamak_control.geometry.boundary_common import (
+    BoundaryMode,
+    BoundaryStatus,
+    BoundaryNotFoundError as _SharedBoundaryNotFoundError,
+    normalize_boundary_mode,
+)
 from tokamak_control.geometry.xpoints import find_x_points
 from tokamak_control.io.logger import get_logger
 from tokamak_control.io.profiling import Profiler
@@ -22,17 +26,7 @@ _PROFILER = Profiler(
 )
 _time_block = _PROFILER.time_block
 _record_path = _PROFILER.record_path
-
-BoundaryMode = Literal[
-    "limited",
-    "diverted",
-]
-
-BoundaryStatus = Literal[
-    "limited_success",
-    "separatrix_success",
-]
-
+_LEGACY_LIMITER_CONTAINMENT_TOL_M = 1.0e-9
 
 class BoundaryNotFoundError(_SharedBoundaryNotFoundError):
     """Ошибка отсутствия физически определенной границы плазмы."""
@@ -68,14 +62,14 @@ def boundary_profiling_snapshot() -> dict[str, object]:
         total_key="boundary_total",
         keys=(
             "axis_search",
-            "limited_contact_levels",
             "contours_at_level",
-            "candidate_filtering",
-            "xpoint_search",
+            "legacy_contour_search",
         ),
         path_keys=(
-            "limited_success",
-            "separatrix_success",
+            "legacy_contour_success",
+            "legacy_contour_limited_success",
+            "tracked_flux_contour_success",
+            "tracked_flux_contour_reset",
         ),
         title="boundary",
     )
@@ -87,14 +81,14 @@ def log_boundary_profiling_summary() -> None:
         total_key="boundary_total",
         keys=(
             "axis_search",
-            "limited_contact_levels",
             "contours_at_level",
-            "candidate_filtering",
-            "xpoint_search",
+            "legacy_contour_search",
         ),
         path_keys=(
-            "limited_success",
-            "separatrix_success",
+            "legacy_contour_success",
+            "legacy_contour_limited_success",
+            "tracked_flux_contour_success",
+            "tracked_flux_contour_reset",
         ),
         title="boundary",
     )
@@ -115,75 +109,362 @@ def find_plasma_boundary_cpu_with_status(
     local_bbox_pad_r: float | None = None,
     local_bbox_pad_z: float | None = None,
     limiter_shape: np.ndarray | None = None,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
+    boundary_base_mode: BoundaryMode = "legacy_contour_limited",
+    legacy_precision_index2: float = 1.0e-3,
+    track_level: bool = False,
+    level_smoothing_alpha: float = 1.0,
+    level_search_span_fraction: float = 0.02,
+    continuity_weight_radii: float = 1.0,
+    continuity_weight_mean_radius: float = 0.3,
+    continuity_weight_center: float = 0.2,
+    continuity_weight_area: float = 0.2,
+    continuity_weight_level: float = 0.1,
 ) -> tuple[np.ndarray, float, BoundaryStatus]:
-    """Найти контур границы плазмы по полю psi.
-
-    В режиме ``limited`` граница задается внешней валидной замкнутой flux-
-    поверхностью вокруг магнитной оси, которая целиком лежит внутри лимитера.
-    В режиме ``diverted`` граница задается сепаратрисой на уровне X-point.
-    Если выбранное физическое правило не дает контура, граница не считается
-    найденной.
-    """
-    mode = _normalize_boundary_mode(boundary_mode)
+    """Найти старый MATLAB ``PlasmaBoundary``-контур по полю psi."""
+    mode = normalize_boundary_mode(boundary_mode)
+    base_mode = normalize_boundary_mode(boundary_base_mode)
+    if mode == "tracked_flux_contour" and base_mode == "tracked_flux_contour":
+        raise ValueError("tracked_flux_contour boundary mode requires a strict legacy base_mode")
 
     with _time_block("boundary_total"):
         if psi.shape != grid.shape:
             raise ValueError(f"psi shape {psi.shape} != grid shape {grid.shape}")
 
-        limiter_poly = _prepare_limiter_shape(limiter_shape)
-        limiter_tol = 0.5 * min(abs(float(grid.r.step)), abs(float(grid.z.step)))
-        with _time_block("axis_search"):
-            axis = _find_magnetic_axis(
+        del n_levels, local_n_levels, local_span_frac
+        del target_mean_radius, target_switch_ratio, target_switch_abs_delta
+        del local_bbox_pad_r, local_bbox_pad_z
+        limiter_poly = None
+        strict_mode = base_mode if mode == "tracked_flux_contour" else mode
+        if strict_mode == "legacy_contour_limited":
+            limiter_poly = _prepare_limiter_shape(limiter_shape)
+            if limiter_poly is None:
+                raise BoundaryNotFoundError(f"{strict_mode} boundary mode requires limiter geometry")
+        should_track = mode == "tracked_flux_contour" or bool(track_level)
+        if should_track and prev_poly is not None and prev_level is not None and np.isfinite(float(prev_level)):
+            tracked_boundary = _legacy_tracked_contour_boundary(
                 psi=psi,
                 grid=grid,
                 center=center,
+                prev_level=float(prev_level),
+                prev_poly=np.asarray(prev_poly, dtype=float),
+                level_smoothing_alpha=float(level_smoothing_alpha),
+                level_search_span_fraction=float(level_search_span_fraction),
                 limiter_poly=limiter_poly,
-                limiter_tol=limiter_tol,
+                continuity_weight_radii=float(continuity_weight_radii),
+                continuity_weight_mean_radius=float(continuity_weight_mean_radius),
+                continuity_weight_center=float(continuity_weight_center),
+                continuity_weight_area=float(continuity_weight_area),
+                continuity_weight_level=float(continuity_weight_level),
             )
-        search_center = axis.point
-
-        if mode == "limited":
-            limited_boundary = _limited_boundary(
-                psi=psi,
-                grid=grid,
-                axis=axis,
-                limiter_poly=limiter_poly,
-                limiter_tol=limiter_tol,
-                n_levels=n_levels,
-            )
-            if limited_boundary is not None:
-                poly, level = limited_boundary
-                _record_path("limited_success")
-                return _close_poly(poly), float(level), "limited_success"
-            raise BoundaryNotFoundError("No limited plasma boundary found inside limiter")
-
-        separatrix = _separatrix_boundary(
+            if tracked_boundary is None and float(level_search_span_fraction) > 0.0:
+                tracked_boundary = _legacy_tracked_contour_boundary(
+                    psi=psi,
+                    grid=grid,
+                    center=center,
+                    prev_level=float(prev_level),
+                    prev_poly=np.asarray(prev_poly, dtype=float),
+                    level_smoothing_alpha=float(level_smoothing_alpha),
+                    level_search_span_fraction=3.0 * float(level_search_span_fraction),
+                    limiter_poly=limiter_poly,
+                    continuity_weight_radii=float(continuity_weight_radii),
+                    continuity_weight_mean_radius=float(continuity_weight_mean_radius),
+                    continuity_weight_center=float(continuity_weight_center),
+                    continuity_weight_area=float(continuity_weight_area),
+                    continuity_weight_level=float(continuity_weight_level),
+                )
+            if tracked_boundary is not None:
+                poly, level = tracked_boundary
+                status: BoundaryStatus = "tracked_flux_contour_success" if mode == "tracked_flux_contour" else ("legacy_contour_limited_success" if limiter_poly is not None else "legacy_contour_success")
+                _record_path(status)
+                return _close_poly(poly), float(level), status
+            if mode != "tracked_flux_contour":
+                raise BoundaryNotFoundError(f"No tracked {strict_mode} plasma boundary found")
+        legacy_boundary = _legacy_contour_boundary(
             psi=psi,
             grid=grid,
-            axis=search_center,
+            center=center,
+            precision_index2=legacy_precision_index2,
             limiter_poly=limiter_poly,
-            limiter_tol=limiter_tol,
         )
-        if separatrix is not None:
-            poly, level = separatrix
-            _record_path("separatrix_success")
-            return _close_poly(poly), float(level), "separatrix_success"
+        if legacy_boundary is not None:
+            poly, level = legacy_boundary
+            if mode == "tracked_flux_contour":
+                status = "tracked_flux_contour_reset"
+            else:
+                status = "legacy_contour_limited_success" if limiter_poly is not None else "legacy_contour_success"
+            _record_path(status)
+            return _close_poly(poly), float(level), status
 
-        raise BoundaryNotFoundError("No diverted plasma separatrix boundary found")
+        raise BoundaryNotFoundError(f"No {mode} plasma boundary found")
 
 
 def boundary_status_is_real(status: BoundaryStatus) -> bool:
     """Вернуть True для статусов реально найденной границы."""
-    return status in {"limited_success", "separatrix_success"}
+    return status in {
+        "legacy_contour_success",
+        "legacy_contour_limited_success",
+        "tracked_flux_contour_success",
+        "tracked_flux_contour_reset",
+    }
 
 
-def _normalize_boundary_mode(mode: BoundaryMode | str) -> BoundaryMode:
-    """Нормализовать режим физического определения границы."""
-    mode_text = str(mode).strip().lower()
-    if mode_text not in {"limited", "diverted"}:
-        raise ValueError(f"boundary_mode must be 'limited' or 'diverted', got {mode!r}")
-    return cast(BoundaryMode, mode_text)
+def _legacy_contour_boundary(
+    *,
+    psi: np.ndarray,
+    grid: Grid2D,
+    center: tuple[float, float],
+    precision_index2: float,
+    limiter_poly: np.ndarray | None = None,
+) -> tuple[np.ndarray, float] | None:
+    """Reproduce tokamak-sim-0 MATLAB ``PlasmaBoundary`` in index space."""
+    psi_arr = np.asarray(psi, dtype=float)
+    if psi_arr.shape != grid.shape or not bool(np.any(np.isfinite(psi_arr))):
+        return None
+    precision = float(precision_index2)
+    if not np.isfinite(precision) or precision <= 0.0:
+        raise ValueError(f"legacy_precision_index2 must be finite and > 0, got {precision_index2!r}")
+
+    o = _physical_center_to_legacy_index(grid, center)
+    if not np.all(np.isfinite(o)):
+        return None
+
+    p = o.copy()
+    new_step = -o / 2.0
+    best_poly_index: np.ndarray | None = None
+    best_level: float | None = None
+    best_len = 0
+
+    def contour_fits_limiter(contour_index: np.ndarray) -> bool:
+        if limiter_poly is None:
+            return True
+        contour_physical = _legacy_index_poly_to_physical(grid, contour_index)
+        return _poly_fits_limiter(
+            _close_poly(contour_physical),
+            limiter_poly,
+            tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
+        )
+
+    with _time_block("legacy_contour_search"):
+        while float(np.dot(new_step, new_step)) >= precision and p[0] >= 1.0 and p[1] >= 1.0:
+            p = p + new_step
+            level = _legacy_sample_center_level(psi_arr, p)
+            if level is None:
+                break
+
+            accepted = _legacy_first_accepted_contour(psi_arr, level, o, accept_predicate=contour_fits_limiter)
+            if accepted is not None:
+                length, contour = accepted
+                if int(length) > best_len:
+                    best_len = int(length)
+                    best_poly_index = np.asarray(contour, dtype=float)
+                    best_level = float(level)
+                new_step = -np.abs(new_step) / 2.0
+            else:
+                new_step = np.abs(new_step) / 2.0
+
+    if best_poly_index is None or best_level is None or best_poly_index.shape[0] < 3:
+        return None
+    return _legacy_index_poly_to_physical(grid, best_poly_index), float(best_level)
+
+
+def _legacy_tracked_contour_boundary(
+    *,
+    psi: np.ndarray,
+    grid: Grid2D,
+    center: tuple[float, float],
+    prev_level: float,
+    prev_poly: np.ndarray,
+    level_smoothing_alpha: float,
+    level_search_span_fraction: float,
+    limiter_poly: np.ndarray | None,
+    continuity_weight_radii: float,
+    continuity_weight_mean_radius: float,
+    continuity_weight_center: float,
+    continuity_weight_area: float,
+    continuity_weight_level: float,
+) -> tuple[np.ndarray, float] | None:
+    """Continue the previous flux-surface identity with real current-frame contours."""
+    psi_arr = np.asarray(psi, dtype=float)
+    prev = _close_poly(np.asarray(prev_poly, dtype=float).reshape(-1, 2))
+    if psi_arr.shape != grid.shape or prev.shape[0] < 4:
+        return None
+    alpha = float(np.clip(level_smoothing_alpha, 0.0, 1.0))
+    span_fraction = max(float(level_search_span_fraction), 0.0)
+    prev_center = np.asarray(center, dtype=float).reshape(1, 2)
+    current_center = np.asarray(center, dtype=float).reshape(1, 2)
+    predicted_prev = _close_poly(current_center + (prev - prev_center))
+    sampled = _sample_psi_bilinear(psi_arr, grid, predicted_prev[:-1])
+    sampled = sampled[np.isfinite(sampled)]
+    if sampled.size == 0:
+        return None
+
+    continued_level = float(np.median(sampled))
+    if np.isfinite(prev_level):
+        level0 = alpha * float(prev_level) + (1.0 - alpha) * continued_level
+    else:
+        level0 = continued_level
+    if not np.isfinite(level0):
+        return None
+
+    finite_values = psi_arr[np.isfinite(psi_arr)]
+    if finite_values.size == 0:
+        return None
+    value_span = float(np.nanmax(finite_values) - np.nanmin(finite_values))
+    level_span = span_fraction * max(value_span, abs(level0), 1.0e-12)
+    offsets = np.asarray([0.0], dtype=float)
+    if level_span > 0.0:
+        offsets = np.asarray([0.0, -0.25, 0.25, -0.5, 0.5, -0.75, 0.75, -1.0, 1.0], dtype=float) * level_span
+
+    o = _physical_center_to_legacy_index(grid, center)
+    if not np.all(np.isfinite(o)):
+        return None
+
+    def contour_fits_limiter(contour_index: np.ndarray) -> bool:
+        if limiter_poly is None:
+            return True
+        contour_physical = _legacy_index_poly_to_physical(grid, contour_index)
+        return _poly_fits_limiter(
+            _close_poly(contour_physical),
+            limiter_poly,
+            tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
+        )
+
+    best: tuple[float, np.ndarray, float] | None = None
+    for level in level0 + offsets:
+        if not np.isfinite(float(level)):
+            continue
+        for contour in _legacy_accepted_contours(psi_arr, float(level), o, accept_predicate=contour_fits_limiter):
+            contour_physical = _close_poly(_legacy_index_poly_to_physical(grid, contour))
+            score = _contour_continuity_score(
+                contour_physical,
+                predicted_prev,
+                center,
+                level=float(level),
+                level_guess=float(level0),
+                level_span=float(max(level_span, 1.0e-12)),
+                continuity_weight_radii=float(continuity_weight_radii),
+                continuity_weight_mean_radius=float(continuity_weight_mean_radius),
+                continuity_weight_center=float(continuity_weight_center),
+                continuity_weight_area=float(continuity_weight_area),
+                continuity_weight_level=float(continuity_weight_level),
+            )
+            if best is None or score < best[0]:
+                best = (float(score), contour_physical, float(level))
+
+    if best is None:
+        return None
+    _score, poly, level = best
+    return poly, level
+
+
+def _physical_center_to_legacy_index(grid: Grid2D, center: tuple[float, float]) -> np.ndarray:
+    """Convert physical ``(R, Z)`` into MATLAB/contourc 1-based coordinates."""
+    r0 = float(grid.r.coords()[0])
+    z0 = float(grid.z.coords()[0])
+    return np.asarray(
+        [
+            1.0 + (float(center[0]) - r0) / float(grid.r.step),
+            1.0 + (float(center[1]) - z0) / float(grid.z.step),
+        ],
+        dtype=float,
+    )
+
+
+def _legacy_sample_center_level(psi: np.ndarray, p: np.ndarray) -> float | None:
+    """Sample psi exactly like the old MATLAB ``PlasmaBoundary`` diagonal interpolation."""
+    rows, cols = psi.shape
+    p = np.asarray(p, dtype=float).reshape(2)
+    r1 = np.floor(p).astype(int)
+    r2 = np.ceil(p).astype(int)
+    if r1[0] < 1 or r1[1] < 1:
+        r1 = r2.copy()
+    if r1[0] < 1 or r1[1] < 1 or r2[0] < 1 or r2[1] < 1:
+        return None
+    if r1[0] > cols or r2[0] > cols or r1[1] > rows or r2[1] > rows:
+        return None
+
+    value1 = float(psi[r1[1] - 1, r1[0] - 1])
+    value2 = float(psi[r2[1] - 1, r2[0] - 1])
+    if not np.isfinite(value1) or not np.isfinite(value2):
+        return None
+
+    rr1 = float(np.dot(r1.astype(float), r1.astype(float)))
+    rr2 = float(np.dot(r2.astype(float), r2.astype(float)))
+    rr = float(np.dot(p, p))
+    if rr2 > rr1:
+        return float(((rr2 - rr) * value1 + (rr - rr1) * value2) / (rr2 - rr1))
+    return value2
+
+
+def _legacy_first_accepted_contour(
+    psi: np.ndarray,
+    level: float,
+    center_index: np.ndarray,
+    accept_predicate: Callable[[np.ndarray], bool] | None = None,
+) -> tuple[int, np.ndarray] | None:
+    """Equivalent of old ``LineIsOk`` for contourpy-separated contours."""
+    for contour in _legacy_accepted_contours(psi, float(level), center_index, accept_predicate=accept_predicate):
+        return int(contour.shape[0]), contour
+    return None
+
+
+def _legacy_accepted_contours(
+    psi: np.ndarray,
+    level: float,
+    center_index: np.ndarray,
+    accept_predicate: Callable[[np.ndarray], bool] | None = None,
+) -> list[np.ndarray]:
+    contours = _contours_at_level_index_space(psi, float(level))
+    o = np.asarray(center_index, dtype=float).reshape(2)
+    accepted: list[np.ndarray] = []
+    for contour in contours:
+        if contour.shape[0] < 3:
+            continue
+        if not _legacy_contour_is_closed(contour):
+            continue
+        points = contour[:-1] if np.allclose(contour[0], contour[-1]) else contour
+        min_values = np.min(points, axis=0)
+        max_values = np.max(points, axis=0)
+        if bool(np.all(min_values < o) and np.all(o < max_values)):
+            if accept_predicate is not None and not bool(accept_predicate(contour)):
+                continue
+            accepted.append(np.asarray(contour, dtype=float))
+    return accepted
+
+
+def _legacy_contour_is_closed(contour: np.ndarray) -> bool:
+    arr = np.asarray(contour, dtype=float)
+    if arr.shape[0] < 3:
+        return False
+    return bool(np.allclose(arr[0], arr[-1], rtol=0.0, atol=1.0e-9))
+
+
+def _contours_at_level_index_space(psi: np.ndarray, level: float) -> list[np.ndarray]:
+    """Build contours in MATLAB ``contourc(Z)`` coordinates: x=1..n, y=1..m."""
+    with _time_block("contours_at_level"):
+        psi_view = np.asarray(psi, dtype=float)
+        if psi_view.shape[0] < 2 or psi_view.shape[1] < 2:
+            return []
+        x = np.arange(1, psi_view.shape[1] + 1, dtype=float)
+        y = np.arange(1, psi_view.shape[0] + 1, dtype=float)
+        cg = contour_generator(x=x, y=y, z=psi_view, name="serial", line_type="Separate")
+        out: list[np.ndarray] = []
+        for contour in cg.lines(float(level)):
+            arr = np.asarray(contour, dtype=float)
+            if arr.ndim == 2 and arr.shape[0] >= 3 and arr.shape[1] == 2:
+                out.append(arr)
+        return out
+
+
+def _legacy_index_poly_to_physical(grid: Grid2D, poly_index: np.ndarray) -> np.ndarray:
+    arr = np.asarray(poly_index, dtype=float).reshape(-1, 2)
+    r0 = float(grid.r.coords()[0])
+    z0 = float(grid.z.coords()[0])
+    out = np.empty_like(arr, dtype=float)
+    out[:, 0] = r0 + (arr[:, 0] - 1.0) * float(grid.r.step)
+    out[:, 1] = z0 + (arr[:, 1] - 1.0) * float(grid.z.step)
+    return out
 
 
 def _find_magnetic_axis(
@@ -610,6 +891,66 @@ def _close_poly(poly: np.ndarray) -> np.ndarray:
     if np.allclose(poly[0], poly[-1]):
         return np.asarray(poly, dtype=float)
     return np.vstack([np.asarray(poly, dtype=float), np.asarray(poly[0], dtype=float)])
+
+
+def _contour_continuity_score(
+    candidate: np.ndarray,
+    previous: np.ndarray,
+    center: tuple[float, float],
+    *,
+    level: float,
+    level_guess: float,
+    level_span: float,
+    continuity_weight_radii: float,
+    continuity_weight_mean_radius: float,
+    continuity_weight_center: float,
+    continuity_weight_area: float,
+    continuity_weight_level: float,
+) -> float:
+    """Score real contours by continuity to the previous extracted boundary."""
+    cand = _close_poly(np.asarray(candidate, dtype=float).reshape(-1, 2))
+    prev = _close_poly(np.asarray(previous, dtype=float).reshape(-1, 2))
+    if cand.shape[0] < 4 or prev.shape[0] < 4:
+        return float("inf")
+    angles = np.linspace(-np.pi, np.pi, 96, endpoint=False, dtype=float)
+    cand_r = _radii_at_angles_for_score(cand, center, angles)
+    prev_r = _radii_at_angles_for_score(prev, center, angles)
+    finite = np.isfinite(cand_r) & np.isfinite(prev_r)
+    if not bool(np.any(finite)):
+        return float("inf")
+    rmse = float(np.sqrt(np.mean((cand_r[finite] - prev_r[finite]) ** 2)))
+    mean_term = abs(float(np.nanmean(cand_r[finite])) - float(np.nanmean(prev_r[finite])))
+    center_term = float(np.linalg.norm(np.nanmean(cand[:-1], axis=0) - np.nanmean(prev[:-1], axis=0)))
+    cand_area = abs(_poly_area(cand))
+    prev_area = abs(_poly_area(prev))
+    if cand_area > 0.0 and prev_area > 0.0:
+        area_term = abs(float(np.log(cand_area / prev_area)))
+    else:
+        area_term = float("inf")
+    level_term = abs(float(level) - float(level_guess)) / max(float(level_span), 1.0e-12)
+    return (
+        max(float(continuity_weight_radii), 0.0) * rmse
+        + max(float(continuity_weight_mean_radius), 0.0) * mean_term
+        + max(float(continuity_weight_center), 0.0) * center_term
+        + max(float(continuity_weight_area), 0.0) * area_term
+        + max(float(continuity_weight_level), 0.0) * level_term
+    )
+
+
+def _radii_at_angles_for_score(poly: np.ndarray, center: tuple[float, float], angles: np.ndarray) -> np.ndarray:
+    pts = np.asarray(poly, dtype=float)
+    c = np.asarray(center, dtype=float).reshape(1, 2)
+    rel = pts - c
+    theta = np.arctan2(rel[:, 1], rel[:, 0])
+    radii = np.sqrt(np.sum(rel * rel, axis=1))
+    order = np.argsort(theta)
+    theta_sorted = theta[order]
+    radii_sorted = radii[order]
+    if theta_sorted.size == 0:
+        return np.full_like(angles, np.nan, dtype=float)
+    theta_ext = np.concatenate([theta_sorted - 2.0 * np.pi, theta_sorted, theta_sorted + 2.0 * np.pi])
+    radii_ext = np.concatenate([radii_sorted, radii_sorted, radii_sorted])
+    return np.interp(np.asarray(angles, dtype=float), theta_ext, radii_ext)
 
 
 def _is_closed_poly(poly: np.ndarray, *, tol: float = 2.5e-2) -> bool:

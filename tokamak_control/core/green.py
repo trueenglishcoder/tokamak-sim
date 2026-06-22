@@ -62,7 +62,13 @@ def _normalize_grouped_weights(
     grouped_positions: Sequence[np.ndarray],
     coil_element_weights: Sequence[np.ndarray] | None,
 ) -> list[np.ndarray]:
-    """Нормализовать веса физических элементов в список векторов по актуаторам."""
+    """
+    Normalize physical-element weights into one vector per runtime actuator.
+
+    The values are not renormalized here. A caller that wants a split coil to
+    behave as one volumetric actuator should pass fractional weights that sum
+    to 1 for that actuator. The T15 SOL configuration does this explicitly.
+    """
     if coil_element_weights is None:
         return [np.ones((group.shape[0],), dtype=float) for group in grouped_positions]
     if len(coil_element_weights) != len(grouped_positions):
@@ -85,7 +91,12 @@ def build_green_for_coils(
     coil_element_positions: Sequence[np.ndarray] | np.ndarray,
     coil_element_weights: Sequence[np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Precompute one Green-response field per runtime actuator."""
+    """
+    Precompute one Green-response field per runtime actuator.
+
+    For grouped/split coils the returned field is the weighted response to one
+    unit of the actuator current, not one unit in every split element.
+    """
     grouped = _normalize_grouped_positions(coil_element_positions)
     grouped_weights = _normalize_grouped_weights(grouped, coil_element_weights)
     nz, nr = Z_grid.shape
@@ -114,7 +125,12 @@ def build_green_for_eind(
     coil_element_positions: Sequence[np.ndarray] | np.ndarray,
     coil_element_weights: Sequence[np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Compute the Ip-to-actuator coupling vector at ``(R0, Z0)``."""
+    """
+    Compute the Ip-to-actuator coupling vector at ``(R0, Z0)``.
+
+    Each entry is the weighted split-element response to one unit of runtime
+    actuator current.
+    """
     grouped = _normalize_grouped_positions(coil_element_positions)
     grouped_weights = _normalize_grouped_weights(grouped, coil_element_weights)
     if not grouped:

@@ -42,34 +42,13 @@ def find_plasma_boundary_gpu_with_status(
     local_bbox_pad_r: float | None = None,
     local_bbox_pad_z: float | None = None,
     limiter_shape=None,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
     gpu_device: str = "cuda:0",
 ) -> tuple[np.ndarray, float, BoundaryStatus]:
-    del n_levels, prev_level, prev_poly, local_n_levels, local_span_frac, target_mean_radius, target_switch_ratio, target_switch_abs_delta, local_bbox_pad_r, local_bbox_pad_z
-    if limiter_shape is None:
-        raise BoundaryNotFoundError("GPU boundary requires limiter geometry")
-    torch = _torch(gpu_device)
-    psi_t = torch.as_tensor(psi, dtype=torch.float64, device=torch.device(gpu_device))
-    if psi_t.ndim == 2:
-        psi_t = psi_t.unsqueeze(0)
-    angles = torch.linspace(-torch.pi, torch.pi, 128, device=psi_t.device, dtype=torch.float64)[:-1]
-    result = fixed_angle_boundary_gpu(
-        psi=psi_t,
-        grid=grid,
-        center=center,
-        angles_rad=angles,
-        limiter_shape=np.asarray(limiter_shape, dtype=float),
-        boundary_mode=boundary_mode,
-        gpu_device=gpu_device,
-    )
-    if not bool(result.found[0].detach().cpu().item()):
-        raise BoundaryNotFoundError("No GPU plasma boundary found")
-    poly = result.points[0].detach().cpu().numpy().astype(float)
-    if not np.allclose(poly[0], poly[-1]):
-        poly = np.vstack([poly, poly[0]])
-    level = float(result.level[0].detach().cpu().item())
-    status: BoundaryStatus = "limited_success" if int(result.status_code[0].detach().cpu().item()) == 1 else "separatrix_success"
-    return poly, level, status
+    del psi, grid, center, n_levels, prev_level, prev_poly, local_n_levels, local_span_frac
+    del target_mean_radius, target_switch_ratio, target_switch_abs_delta
+    del local_bbox_pad_r, local_bbox_pad_z, limiter_shape, boundary_mode, gpu_device
+    raise BoundaryNotFoundError("legacy_contour boundary extraction is routed through the CPU dispatcher")
 
 
 def fixed_angle_boundary_gpu(
@@ -79,48 +58,22 @@ def fixed_angle_boundary_gpu(
     center: tuple[float, float],
     angles_rad,
     limiter_shape: np.ndarray,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
     gpu_device: str = "cuda:0",
     ray_samples: int = 256,
 ) -> FixedAngleBoundaryGpuResult:
-    """Return fixed-angle physical boundary samples on CUDA.
-
-    Limited mode uses the flux level sampled on the limiter in outward physical
-    order. The boundary point for each configured angle is the first ray
-    crossing of that limiter-contact level from the magnetic axis outward.
-    """
-    torch = _torch(gpu_device)
-    dev = torch.device(gpu_device)
-    psi_t = torch.as_tensor(psi, dtype=torch.float64, device=dev)
-    if psi_t.ndim == 2:
-        psi_t = psi_t.unsqueeze(0)
-    B = int(psi_t.shape[0])
-    angles = torch.as_tensor(angles_rad, dtype=torch.float64, device=dev).reshape(-1)
-    limiter = torch.as_tensor(np.asarray(limiter_shape, dtype=float).reshape(-1, 2), dtype=torch.float64, device=dev)
-    axis_points, axis_levels, axis_kind = _axis_search(psi_t, grid, center, limiter)
-    if str(boundary_mode) == "limited":
-        limiter_psi = _sample_limiter_psi(psi_t, grid, limiter)
-        finite_limiter = torch.isfinite(limiter_psi)
-        high = torch.max(torch.where(finite_limiter, limiter_psi, torch.full_like(limiter_psi, -torch.inf)), dim=1).values
-        low = torch.min(torch.where(finite_limiter, limiter_psi, torch.full_like(limiter_psi, torch.inf)), dim=1).values
-        level = torch.where(axis_kind > 0, high, low)
-        status_code = torch.ones((B,), dtype=torch.int64, device=dev)
-    elif str(boundary_mode) == "diverted":
-        level, has_x = _xpoint_level(psi_t, grid, axis_points)
-        status_code = torch.full((B,), 2, dtype=torch.int64, device=dev)
-        level = torch.where(has_x, level, torch.full_like(level, float("nan")))
-    else:
-        raise ValueError(f"boundary_mode must be 'limited' or 'diverted', got {boundary_mode!r}")
-    points, radii, found_rays = _ray_crossings(psi_t, grid, axis_points, level, axis_kind, angles, limiter, ray_samples=ray_samples)
-    found = found_rays & torch.isfinite(level) & torch.isfinite(axis_levels)
-    return FixedAngleBoundaryGpuResult(found=found, status_code=status_code, level=level, points=points, radii=radii, axis_points=axis_points)
+    """Disabled for old-parity runs; legacy contour extraction is CPU-routed."""
+    del psi, grid, center, angles_rad, limiter_shape, boundary_mode, gpu_device, ray_samples
+    raise BoundaryNotFoundError("legacy_contour fixed-angle boundary extraction is CPU-routed")
 
 
 def _axis_search(psi, grid: Grid2D, center: tuple[float, float], limiter):
     torch = __import__("torch")
     B, nz, nr = psi.shape
-    r = torch.linspace(float(grid.r.start), float(grid.r.start) + float(grid.r.step) * (int(grid.r.size) - 1), int(grid.r.size), dtype=psi.dtype, device=psi.device)
-    z = torch.linspace(float(grid.z.start), float(grid.z.start) + float(grid.z.step) * (int(grid.z.size) - 1), int(grid.z.size), dtype=psi.dtype, device=psi.device)
+    r0 = float(grid.r.coords()[0])
+    z0 = float(grid.z.coords()[0])
+    r = torch.linspace(r0, r0 + float(grid.r.step) * (int(grid.r.size) - 1), int(grid.r.size), dtype=psi.dtype, device=psi.device)
+    z = torch.linspace(z0, z0 + float(grid.z.step) * (int(grid.z.size) - 1), int(grid.z.size), dtype=psi.dtype, device=psi.device)
     Z, R = torch.meshgrid(z, r, indexing="ij")
     c = torch.tensor(center, dtype=psi.dtype, device=psi.device)
     dist = (R - c[0]) ** 2 + (Z - c[1]) ** 2

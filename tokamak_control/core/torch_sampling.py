@@ -10,8 +10,10 @@ def bilinear_sample_torch(field: torch.Tensor, grid: Grid2D, points: torch.Tenso
     if field.ndim != 3:
         raise ValueError(f"field must have shape (B, Z, R), got {tuple(field.shape)}")
     pts = points.to(device=field.device, dtype=field.dtype).reshape(-1, 2)
-    u = (pts[:, 0] - float(grid.r.start)) / float(grid.r.step)
-    v = (pts[:, 1] - float(grid.z.start)) / float(grid.z.step)
+    r0 = float(grid.r.coords()[0])
+    z0 = float(grid.z.coords()[0])
+    u = (pts[:, 0] - r0) / float(grid.r.step)
+    v = (pts[:, 1] - z0) / float(grid.z.step)
     i0 = torch.floor(u).long()
     j0 = torch.floor(v).long()
     i1 = i0 + 1
@@ -39,8 +41,10 @@ def bilinear_sample_torch_points(field: torch.Tensor, grid: Grid2D, points: torc
     B, M, _ = pts.shape
     if B != field.shape[0]:
         raise ValueError("points batch size must match field batch size")
-    u = (pts[..., 0] - float(grid.r.start)) / float(grid.r.step)
-    v = (pts[..., 1] - float(grid.z.start)) / float(grid.z.step)
+    r0 = float(grid.r.coords()[0])
+    z0 = float(grid.z.coords()[0])
+    u = (pts[..., 0] - r0) / float(grid.r.step)
+    v = (pts[..., 1] - z0) / float(grid.z.step)
     i0 = torch.floor(u).long()
     j0 = torch.floor(v).long()
     i1 = i0 + 1

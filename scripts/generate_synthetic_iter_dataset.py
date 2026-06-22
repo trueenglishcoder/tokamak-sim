@@ -2,9 +2,9 @@
 """
 Generate synthetic ITER rising-segment Ip and coil-current shot tables for sigma/L recovery checks.
 
-The script uses the real project plant model and an LQR-current controller. It creates
+The script uses the real project plant model and the old-parity Zaitsev LQR controller. It creates
 T15-like rising-only current-reference profiles, lets the controller generate coil
-current derivative commands, records the plant's applied coil currents and resulting
+absolute next-current commands, records the plant's applied coil currents and resulting
 Ip, and writes CSVs in the same headerless semicolon-separated format consumed by
 `scripts/fit_sigma_L_grid.py`:
 
@@ -46,7 +46,7 @@ def _ensure_repo_root_on_path() -> None:
 _ensure_repo_root_on_path()
 
 from tokamak_control.control.base import ControlAction
-from tokamak_control.control.lqr_current import LQRCurrentController
+from tokamak_control.control.lqr_t15_zaitsev import LQRT15ZaitsevController
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.core.plasma_state import PlasmaState
 from tokamak_control.io.config_io import load_config
@@ -191,7 +191,7 @@ def _simulate_one_shot(
     pfc0, sol0 = _initial_currents_from_model(model)
     _initialize_model_at_ip(model, ip0=float(profile.ip_start), pfc0=pfc0, sol0=sol0)
 
-    controller = LQRCurrentController(**controller_params)
+    controller = LQRT15ZaitsevController(**controller_params)
     controller.reset()
 
     dt = float(model.t_step)
@@ -218,11 +218,23 @@ def _simulate_one_shot(
             raise RuntimeError("Model state was lost during simulation")
 
         ip_ref = _ip_reference(profile, float(state.t))
-        action = controller.compute_control(model=model, Ip_ref=ip_ref)
+        action = controller.compute_control(
+            model=model,
+            psi=model.state.psi,
+            boundary_poly=None,
+            center=(float(model.R0), float(model.Z0)),
+            measure_angles=np.zeros((0,), dtype=float),
+            ref_radii=np.zeros((0,), dtype=float),
+            Ip_ref=ip_ref,
+            scenario=None,
+        )
         if not isinstance(action, ControlAction):
             raise TypeError(f"Controller returned {type(action)!r}, expected ControlAction")
 
-        state = model.step(action.pfc_derivs, action.sol_derivs)
+        state = model.step_currents(
+            pfc_currents_next=action.pfc_currents_next,
+            sol_currents_next=action.sol_currents_next,
+        )
 
         t[k + 1] = float(state.t)
         ip[k + 1] = float(state.Ip)
@@ -258,7 +270,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
             "Generate synthetic ITER rising-segment Ip/coil-current CSV shots by "
-            "tracking T15-like rising Ip references with the project LQR-current controller."
+            "tracking T15-like rising Ip references with the old-parity Zaitsev LQR controller."
         )
     )
     ap.add_argument("--config", required=True, help="ITER TOML config used as the true synthetic plant")
@@ -295,11 +307,11 @@ def main() -> int:
 
     rng = np.random.default_rng(int(args.seed))
     controller_params: dict[str, object] = {
-        "q_ip": float(args.q_ip),
-        "r_pfc": float(args.r_pfc),
-        "r_sol": float(args.r_sol),
-        "ridge": float(args.ridge),
-        "u_clip": None if args.u_clip is None else float(args.u_clip),
+        "boundary_weight": 0.0,
+        "ip_weight": float(args.q_ip),
+        "derivative_weight": max(float(args.r_pfc), float(args.r_sol), 0.0),
+        "delta_derivative_weight": max(float(args.ridge), 1.0e-30),
+        "derivative_scale_aps": 1.0e6 if args.u_clip is None else float(args.u_clip),
     }
 
     summaries: list[ShotSummary] = []
@@ -361,7 +373,7 @@ def main() -> int:
         "n_sol": int(len(np.asarray(meta_model.state.sol_currents))),
         "coil_csv_order": "time, SOL currents, PFC currents",
         "profile_shape": "rising_only",
-        "controller": "LQRCurrentController",
+        "controller": "LQRT15ZaitsevController",
         "controller_params": controller_params,
         "seed": int(args.seed),
         "profiles": [asdict(p) for p in profiles],

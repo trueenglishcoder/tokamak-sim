@@ -7,7 +7,7 @@ import numpy as np
 
 from tokamak_control.compute import ComputeBackend
 from tokamak_control.geometry.boundary import BoundaryMode, BoundaryNotFoundError, find_plasma_boundary_with_status
-from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
+from tokamak_control.geometry.legacy_metrics import legacy_radii_at_angles
 from tokamak_control.realism.types import ActuatorRealismResult, RealismSettings, SensorRealismResult
 
 
@@ -108,7 +108,17 @@ class RealismRuntime:
         center: tuple[float, float] | None = None,
         angles_rad: np.ndarray | None = None,
         limiter_shape: np.ndarray | None = None,
-        boundary_mode: BoundaryMode = "limited",
+        boundary_mode: BoundaryMode = "legacy_contour",
+        boundary_base_mode: BoundaryMode = "legacy_contour_limited",
+        legacy_precision_index2: float = 1.0e-3,
+        track_level: bool = False,
+        level_smoothing_alpha: float = 1.0,
+        level_search_span_fraction: float = 0.02,
+        continuity_weight_radii: float = 1.0,
+        continuity_weight_mean_radius: float = 0.3,
+        continuity_weight_center: float = 0.2,
+        continuity_weight_area: float = 0.2,
+        continuity_weight_level: float = 0.1,
         compute_backend: ComputeBackend | str = "cpu",
         gpu_device: str = "cuda:0",
     ) -> SensorRealismResult:
@@ -137,6 +147,16 @@ class RealismRuntime:
                     n_levels=40,
                     limiter_shape=limiter_shape,
                     boundary_mode=boundary_mode,
+                    boundary_base_mode=boundary_base_mode,
+                    legacy_precision_index2=legacy_precision_index2,
+                    track_level=track_level,
+                    level_smoothing_alpha=level_smoothing_alpha,
+                    level_search_span_fraction=level_search_span_fraction,
+                    continuity_weight_radii=continuity_weight_radii,
+                    continuity_weight_mean_radius=continuity_weight_mean_radius,
+                    continuity_weight_center=continuity_weight_center,
+                    continuity_weight_area=continuity_weight_area,
+                    continuity_weight_level=continuity_weight_level,
                     compute_backend=compute_backend,
                     gpu_device=gpu_device,
                 )
@@ -157,7 +177,7 @@ class RealismRuntime:
         radii_meas = None
         if radii_true is not None:
             if boundary_meas is not None and center is not None and angles_rad is not None:
-                radii_meas = radii_from_polyline_ray_intersections(boundary_meas, center, np.asarray(angles_rad, dtype=float))
+                radii_meas = legacy_radii_at_angles(boundary_meas, center, np.asarray(angles_rad, dtype=float))
             else:
                 radii_meas = radii_true.copy()
             radii_meas = self._measure_radii(radii_meas)

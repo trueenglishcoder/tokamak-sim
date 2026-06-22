@@ -6,14 +6,14 @@ from typing import Mapping
 
 import numpy as np
 
-from tokamak_control.bridge.types import DerivativeAction, InitialStateOverride, MachineSpec, ReferenceFrame, ResetResult, StepResult, StepSnapshot
+from tokamak_control.bridge.types import CurrentAction, InitialStateOverride, MachineSpec, ReferenceFrame, ResetResult, StepResult, StepSnapshot
 from tokamak_control.compute import ComputeBackend, ComputeSettings, compute_runtime_metadata
 from tokamak_control.core.coils import CoilGroup
 from tokamak_control.config.scenarios import Scenario, ScenarioName, make_scenario
 from tokamak_control.core.gpu_plasma_model import GpuPlasmaModel
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.geometry.boundary import BoundaryMode, BoundaryNotFoundError, find_plasma_boundary_with_status
-from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
+from tokamak_control.geometry.legacy_metrics import legacy_radii_at_angles
 from tokamak_control.io.config_io import LoadedConfig, load_config
 from tokamak_control.metrics import current_limit_margin, derivative_limit_margin
 from tokamak_control.realism import RealismRuntime, RealismSettings
@@ -144,10 +144,20 @@ class SimulationSession:
                 n_levels=80 if cfg.limiter_shape is not None else 10,
                 limiter_shape=cfg.limiter_shape,
                 boundary_mode=cfg.boundary_mode,
+                boundary_base_mode=cfg.boundary_base_mode,
+                legacy_precision_index2=cfg.boundary_legacy_precision_index2,
+                track_level=cfg.boundary_track_level,
+                level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
+                level_search_span_fraction=cfg.boundary_level_search_span_fraction,
+                continuity_weight_radii=cfg.boundary_continuity_weight_radii,
+                continuity_weight_mean_radius=cfg.boundary_continuity_weight_mean_radius,
+                continuity_weight_center=cfg.boundary_continuity_weight_center,
+                continuity_weight_area=cfg.boundary_continuity_weight_area,
+                continuity_weight_level=cfg.boundary_continuity_weight_level,
                 compute_backend=cfg.compute.backend,
                 gpu_device=cfg.compute.gpu_device,
             )
-            base_radii = radii_from_polyline_ray_intersections(boundary_poly, center, angles_rad)
+            base_radii = legacy_radii_at_angles(boundary_poly, center, angles_rad)
         except BoundaryNotFoundError as exc:
             boundary_found = False
             boundary_reason = str(exc)
@@ -181,14 +191,15 @@ class SimulationSession:
         self._boundary_poly = None if boundary_poly is None else np.asarray(boundary_poly, dtype=float)
         self._boundary_level = None if boundary_level is None else float(boundary_level)
         self._boundary_status = str(boundary_status)
-        self._last_commanded = np.zeros((machine.n_active_total,), dtype=float)
-        self._last_applied = np.zeros((machine.n_active_total,), dtype=float)
+        self._last_commanded = _active_currents(model).copy()
+        self._last_applied = self._last_commanded.copy()
         self._terminated = False
         self._termination_reason = None
 
         snapshot = self._snapshot(
-            commanded_active_derivatives=self._last_commanded,
-            previous_applied_active_derivatives=self._last_applied,
+            commanded_active_currents=self._last_commanded,
+            commanded_active_derivatives=np.zeros((machine.n_active_total,), dtype=float),
+            previous_applied_active_derivatives=np.zeros((machine.n_active_total,), dtype=float),
             boundary_found=boundary_found,
             boundary_reason=boundary_reason,
         )
@@ -206,27 +217,28 @@ class SimulationSession:
             },
         )
 
-    def step_derivatives(self, action: DerivativeAction) -> StepResult:
-        """Применить физические производные токов активных актуаторов на один шаг."""
+    def step_currents(self, action: CurrentAction) -> StepResult:
+        """Apply absolute next currents for active actuators for one step."""
         if self._terminated:
             raise RuntimeError(f"SimulationSession is terminated: {self._termination_reason}")
         cfg, model, machine, scenario, angles_rad, realism = self._require_ready()
-        active_derivs = np.asarray(action.active_current_derivatives, dtype=float).reshape(-1)
-        if active_derivs.shape != (machine.n_active_total,):
+        active_currents_next = np.asarray(action.active_currents_next, dtype=float).reshape(-1)
+        if active_currents_next.shape != (machine.n_active_total,):
             raise ValueError(
-                f"active_current_derivatives shape {active_derivs.shape} != ({machine.n_active_total},)"
+                f"active_currents_next shape {active_currents_next.shape} != ({machine.n_active_total},)"
             )
-        if not np.all(np.isfinite(active_derivs)):
-            raise ValueError("active_current_derivatives must contain only finite values")
+        if not np.all(np.isfinite(active_currents_next)):
+            raise ValueError("active_currents_next must contain only finite values")
 
+        prev_currents = _active_currents(model).copy()
         prev_applied = _active_derivatives(model).copy()
-        pfc_derivs = active_derivs[: machine.n_active_pfc]
-        sol_derivs = active_derivs[machine.n_active_pfc :]
+        pfc_next = active_currents_next[: machine.n_active_pfc]
+        sol_next = active_currents_next[machine.n_active_pfc :]
         if realism is not None:
-            actuation = realism.apply_actuation(pfc_derivs, sol_derivs)
-            pfc_derivs = actuation.pfc_applied
-            sol_derivs = actuation.sol_applied
-        state = model.step(pfc_current_derivs=pfc_derivs, sol_current_derivs=sol_derivs)
+            actuation = realism.apply_actuation(pfc_next, sol_next)
+            pfc_next = actuation.pfc_applied
+            sol_next = actuation.sol_applied
+        state = model.step_currents(pfc_currents_next=pfc_next, sol_currents_next=sol_next)
         psi_true = _model_compute_psi_for_boundary(model)
         if not isinstance(model, GpuPlasmaModel):
             model.state.psi = psi_true
@@ -246,6 +258,16 @@ class SimulationSession:
                 target_mean_radius=float(np.nanmean(ref_for_boundary.radii_ref)),
                 limiter_shape=cfg.limiter_shape,
                 boundary_mode=cfg.boundary_mode,
+                boundary_base_mode=cfg.boundary_base_mode,
+                legacy_precision_index2=cfg.boundary_legacy_precision_index2,
+                track_level=cfg.boundary_track_level,
+                level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
+                level_search_span_fraction=cfg.boundary_level_search_span_fraction,
+                continuity_weight_radii=cfg.boundary_continuity_weight_radii,
+                continuity_weight_mean_radius=cfg.boundary_continuity_weight_mean_radius,
+                continuity_weight_center=cfg.boundary_continuity_weight_center,
+                continuity_weight_area=cfg.boundary_continuity_weight_area,
+                continuity_weight_level=cfg.boundary_continuity_weight_level,
                 compute_backend=cfg.compute.backend,
                 gpu_device=cfg.compute.gpu_device,
             )
@@ -260,11 +282,13 @@ class SimulationSession:
             self._boundary_status = None
 
         applied = _active_derivatives(model).copy()
-        self._last_commanded = active_derivs.copy()
-        self._last_applied = applied.copy()
+        self._last_commanded = active_currents_next.copy()
+        self._last_applied = _active_currents(model).copy()
         truncated = bool((not self._terminated) and int(state.step) >= self.steps)
+        commanded_derivs = (active_currents_next - prev_currents) / max(float(model.t_step), 1.0e-12)
         snapshot = self._snapshot(
-            commanded_active_derivatives=active_derivs,
+            commanded_active_currents=active_currents_next,
+            commanded_active_derivatives=commanded_derivs,
             previous_applied_active_derivatives=prev_applied,
             boundary_found=boundary_found,
             boundary_reason=boundary_reason,
@@ -298,6 +322,7 @@ class SimulationSession:
     def _snapshot(
         self,
         *,
+        commanded_active_currents: np.ndarray,
         commanded_active_derivatives: np.ndarray,
         previous_applied_active_derivatives: np.ndarray,
         boundary_found: bool,
@@ -312,7 +337,7 @@ class SimulationSession:
         boundary_poly = None if self._boundary_poly is None else np.asarray(self._boundary_poly, dtype=float).copy()
         radii = None
         if boundary_poly is not None:
-            radii = radii_from_polyline_ray_intersections(boundary_poly, (model.R0, model.Z0), angles_rad)
+            radii = legacy_radii_at_angles(boundary_poly, (model.R0, model.Z0), angles_rad)
         if realism is None:
             measured_ip = float(state.Ip)
             measured_currents = currents.copy()
@@ -330,6 +355,16 @@ class SimulationSession:
                 angles_rad=angles_rad,
                 limiter_shape=cfg.limiter_shape,
                 boundary_mode=cfg.boundary_mode,
+                boundary_base_mode=cfg.boundary_base_mode,
+                legacy_precision_index2=cfg.boundary_legacy_precision_index2,
+                track_level=cfg.boundary_track_level,
+                level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
+                level_search_span_fraction=cfg.boundary_level_search_span_fraction,
+                continuity_weight_radii=cfg.boundary_continuity_weight_radii,
+                continuity_weight_mean_radius=cfg.boundary_continuity_weight_mean_radius,
+                continuity_weight_center=cfg.boundary_continuity_weight_center,
+                continuity_weight_area=cfg.boundary_continuity_weight_area,
+                continuity_weight_level=cfg.boundary_continuity_weight_level,
                 compute_backend=cfg.compute.backend,
                 gpu_device=cfg.compute.gpu_device,
             )
@@ -347,6 +382,8 @@ class SimulationSession:
             measured_ip=float(measured_ip),
             true_active_currents=currents,
             measured_active_currents=np.asarray(measured_currents, dtype=float).copy(),
+            commanded_active_currents=np.asarray(commanded_active_currents, dtype=float).copy(),
+            applied_active_currents=currents.copy(),
             commanded_active_derivatives=np.asarray(commanded_active_derivatives, dtype=float).copy(),
             applied_active_derivatives=applied,
             previous_applied_active_derivatives=np.asarray(previous_applied_active_derivatives, dtype=float).copy(),

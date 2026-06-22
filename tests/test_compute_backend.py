@@ -71,8 +71,14 @@ def test_gpu_plasma_model_matches_cpu_for_fixed_actions() -> None:
     for _ in range(5):
         pfc = rng.normal(0.0, 2.0e5, size=cfg.pfc.n_coils)
         sol = rng.normal(0.0, 2.0e5, size=cfg.sol.n_coils)
-        s_cpu = cpu.step(pfc_current_derivs=pfc, sol_current_derivs=sol)
-        s_gpu = gpu.step(pfc_current_derivs=pfc, sol_current_derivs=sol)
+        s_cpu = cpu.step_currents(
+            pfc_currents_next=cpu.state.pfc_currents + cpu.t_step * pfc,
+            sol_currents_next=cpu.state.sol_currents + cpu.t_step * sol,
+        )
+        s_gpu = gpu.step_currents(
+            pfc_currents_next=gpu.state.pfc_currents + gpu.t_step * pfc,
+            sol_currents_next=gpu.state.sol_currents + gpu.t_step * sol,
+        )
         assert np.allclose(s_gpu.pfc_currents, s_cpu.pfc_currents, rtol=1e-10, atol=1e-6)
         assert np.allclose(s_gpu.sol_currents, s_cpu.sol_currents, rtol=1e-10, atol=1e-6)
         assert np.isclose(s_gpu.Ip, s_cpu.Ip, rtol=1e-10, atol=1e-6)

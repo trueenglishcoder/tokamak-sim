@@ -32,10 +32,12 @@ class CoilActuator:
     elements : list[Coil]
         Physical elements driven by one shared current.
     element_weights : np.ndarray | None
-        Optional per-element contribution weights. When omitted, each element
-        contributes with weight 1.0. This lets one actuator represent a split
-        coil whose total runtime current is distributed across many point
-        elements by explicit fractions.
+        Optional per-element contribution weights. The runtime current vector
+        still has one value per actuator, not one value per physical element.
+        For volumetric split coils, such as the T15 SOL coils, these weights
+        are fractions that sum to 1 so the actuator's total current is
+        distributed across the point elements. When omitted, each element
+        contributes with weight 1.0.
     """
 
     elements: list[Coil]
@@ -77,7 +79,7 @@ class CoilActuator:
 
     @property
     def weights(self) -> np.ndarray:
-        """Вернуть веса вкладов физических элементов в runtime actuator."""
+        """Return physical-element weights for this one runtime actuator."""
         if self.element_weights is None:
             return np.ones((len(self.elements),), dtype=float)
         return np.asarray(self.element_weights, dtype=float).copy()
@@ -143,7 +145,7 @@ class CoilGroup:
 
     @property
     def element_weights(self) -> list[np.ndarray]:
-        """Вернуть веса физических элементов по актуаторам."""
+        """Return one element-weight vector per runtime actuator."""
         return [act.weights for act in self.coils]
 
     @property

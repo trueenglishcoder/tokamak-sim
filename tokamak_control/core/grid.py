@@ -21,10 +21,9 @@ class Grid1D:
 
     Notes
     -----
-    The runtime uses ``center`` as the primary geometric anchor and derives grid
-    coordinates from the nearest grid index to that center. This makes the grid
-    semantics depend on ``center`` rather than treating ``start`` as the sole
-    source of truth.
+    Coordinates follow the original Little SCoPE grid convention: the configured
+    center is placed halfway between two neighboring samples by shifting the
+    effective first coordinate by the fractional part of the center offset.
     """
 
     start: float
@@ -49,29 +48,32 @@ class Grid1D:
 
     @property
     def center_index(self) -> int:
-        """Return the nearest integer grid index associated with ``center``."""
-        idx = int(round((float(self.center) - float(self.start)) / float(self.step)))
+        """Return the lower bracketing index for the configured center."""
+        q = (float(self.center) - float(self.start)) / float(self.step)
+        idx = int(np.floor(q))
         return int(min(max(idx, 0), self.size - 1))
 
     @property
     def aligned_start(self) -> float:
-        """Return the effective first coordinate implied by ``center`` and ``center_index``."""
-        return float(self.center) - float(self.center_index) * float(self.step)
+        """Return the old-model shifted first coordinate."""
+        q = (float(self.center) - float(self.start)) / float(self.step)
+        frac = q - float(np.floor(q))
+        return float(self.start) + (frac - 0.5) * float(self.step)
 
     def coord(self, i: int) -> float:
         """Return the coordinate value at 0-based index ``i``."""
         if i < 0 or i >= self.size:
             raise IndexError("Grid1D index out of bounds")
-        return float(self.center) + (int(i) - self.center_index) * float(self.step)
+        return self.aligned_start + int(i) * float(self.step)
 
     def coords(self) -> np.ndarray:
         """Return coordinates for all indices."""
         idx = np.arange(self.size, dtype=float)
-        return float(self.center) + (idx - float(self.center_index)) * float(self.step)
+        return self.aligned_start + idx * float(self.step)
 
     def nearest_index(self, x: float) -> int:
         """Return the nearest valid index to coordinate ``x``."""
-        idx = int(round((float(x) - float(self.center)) / float(self.step) + float(self.center_index)))
+        idx = int(round((float(x) - self.aligned_start) / float(self.step)))
         return int(min(max(idx, 0), self.size - 1))
 
 

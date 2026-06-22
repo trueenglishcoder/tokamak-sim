@@ -110,6 +110,20 @@ def _polyline_from_padded_row(row: np.ndarray) -> np.ndarray:
     return poly
 
 
+def _last_valid_polyline(rows: np.ndarray) -> tuple[np.ndarray, int]:
+    """Вернуть последний реально найденный контур из NaN-заполненного массива."""
+    arr = np.asarray(rows, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"Boundary polyline array must have shape (T, N, 2), got {arr.shape}")
+    last_error: Exception | None = None
+    for idx in range(arr.shape[0] - 1, -1, -1):
+        try:
+            return _polyline_from_padded_row(arr[idx]), idx
+        except (RuntimeError, ValueError) as exc:
+            last_error = exc
+    raise RuntimeError("Stored boundary artifact has no valid polyline") from last_error
+
+
 def main(argv: list[str] | None = None) -> int:
     """Разобрать CLI, выполнить расчет и записать артефакты визуализации."""
     ap = argparse.ArgumentParser(
@@ -153,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             "joint_disturbance",
             "shot_follow",
             "ip_table",
+            "t15_replay_reference",
             "ip_follow",
             "t15_synthetic_follow",
             "t15_training_circle_static",
@@ -302,7 +317,13 @@ def main(argv: list[str] | None = None) -> int:
         print(str(result.manifest_path))
         print(f"No physical plasma boundary was found: {result.stop_reason or 'run artifact has no valid boundary polyline'}")
         return 0
-    boundary_final = _polyline_from_padded_row(boundary_polys[-1])
+    try:
+        boundary_final, boundary_final_index = _last_valid_polyline(boundary_polys)
+    except RuntimeError:
+        print(str(result.run_dir))
+        print(str(result.manifest_path))
+        print(f"No physical plasma boundary was found: {result.stop_reason or 'run artifact has no valid boundary polyline'}")
+        return 0
 
     psi_boundary_path = out_dir / f"psi_boundary{run_id}.png"
     time_series_path = out_dir / f"time_series{run_id}.png"
@@ -313,7 +334,11 @@ def main(argv: list[str] | None = None) -> int:
         center=center,
         poly=boundary_final,
         n_contours=60,
-        title="ψ contours, heatmap, and boundary (final step)",
+        title=(
+            "ψ contours, heatmap, and boundary (final step)"
+            if boundary_final_index == boundary_polys.shape[0] - 1
+            else f"ψ contours, heatmap, and boundary (last found step {boundary_final_index + 1})"
+        ),
         coil_positions=coil_positions,
         limiter_shape=limiter_shape,
     )

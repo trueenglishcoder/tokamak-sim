@@ -10,17 +10,14 @@ class PhysicsSettings:
     Central physical and numerical settings for the simulation.
 
     ``sigma`` and ``inductance_L`` define the passive plasma-current time
-    constant used by the plant:
+    constant:
 
         tau = sigma * inductance_L
 
-    At each numerical step the plant decays the previous runtime ``Ip`` value by
-    ``exp(-dt / tau)`` and then adds the coil-driven increment derived from
-    actual actuator current increments over the step. The sign convention of
-    that coupling is controlled by ``ip_coupling_sign``. The sign convention of
-    the plasma-current contribution to rendered ``psi`` is controlled separately
-    by ``plasma_psi_sign``. These are effective lumped parameters of the
-    translated Little Scope model, not full profile-resolved tokamak quantities.
+    The plant advances Ip as a causal state using this passive decay and the
+    LittleSCOPE coil-drive term as a dIp/dt contribution. Current/derivative
+    limits and actuator time constants are retained as controller/diagnostic
+    metadata; the core plant does not enforce them.
     """
 
     mu0: float = 4e-7 * math.pi
@@ -87,7 +84,10 @@ class PhysicsSettings:
             if float(lim) <= 0.0:
                 raise ValueError(f"{name} must be > 0 if set, got {lim!r}")
 
-        for name, coeffs in (("ip_coupling_pfc", self.ip_coupling_pfc), ("ip_coupling_sol", self.ip_coupling_sol)):
+        for name, coeffs in (
+            ("ip_coupling_pfc", self.ip_coupling_pfc),
+            ("ip_coupling_sol", self.ip_coupling_sol),
+        ):
             if coeffs is None:
                 continue
             if len(coeffs) == 0:

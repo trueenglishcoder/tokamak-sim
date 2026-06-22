@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from tokamak_control.compute import ComputeBackend, normalize_compute_backend
+from tokamak_control.compute import ComputeBackend
 from tokamak_control.core.grid import Grid2D
 from tokamak_control.geometry.boundary_common import (
     BoundaryMode,
@@ -17,7 +17,6 @@ from tokamak_control.geometry.boundary_cpu import (
     find_plasma_boundary_cpu_with_status,
     log_boundary_profiling_summary as log_boundary_cpu_profiling_summary,
 )
-from tokamak_control.geometry.boundary_gpu import find_plasma_boundary_gpu_with_status
 
 
 def configure_boundary_profiling(*, enabled: bool, summary_every: int = 0, reset: bool = True) -> None:
@@ -30,6 +29,14 @@ def boundary_profiling_snapshot() -> dict[str, object]:
 
 def log_boundary_profiling_summary() -> None:
     log_boundary_cpu_profiling_summary()
+
+
+def _as_cpu_numpy(value: object) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    return np.asarray(value)
 
 
 def find_plasma_boundary_with_status(
@@ -47,32 +54,23 @@ def find_plasma_boundary_with_status(
     local_bbox_pad_r: float | None = None,
     local_bbox_pad_z: float | None = None,
     limiter_shape: np.ndarray | None = None,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
+    boundary_base_mode: BoundaryMode = "legacy_contour_limited",
+    legacy_precision_index2: float = 1.0e-3,
+    track_level: bool = False,
+    level_smoothing_alpha: float = 1.0,
+    level_search_span_fraction: float = 0.02,
+    continuity_weight_radii: float = 1.0,
+    continuity_weight_mean_radius: float = 0.3,
+    continuity_weight_center: float = 0.2,
+    continuity_weight_area: float = 0.2,
+    continuity_weight_level: float = 0.1,
     compute_backend: ComputeBackend | str = "cpu",
     gpu_device: str = "cuda:0",
 ) -> tuple[np.ndarray, float, BoundaryStatus]:
-    backend = normalize_compute_backend(compute_backend)
-    if backend == "gpu":
-        return find_plasma_boundary_gpu_with_status(
-            psi,
-            grid,
-            center,
-            n_levels=n_levels,
-            prev_level=prev_level,
-            prev_poly=prev_poly,
-            local_n_levels=local_n_levels,
-            local_span_frac=local_span_frac,
-            target_mean_radius=target_mean_radius,
-            target_switch_ratio=target_switch_ratio,
-            target_switch_abs_delta=target_switch_abs_delta,
-            local_bbox_pad_r=local_bbox_pad_r,
-            local_bbox_pad_z=local_bbox_pad_z,
-            limiter_shape=limiter_shape,
-            boundary_mode=boundary_mode,
-            gpu_device=gpu_device,
-        )
+    del compute_backend, gpu_device
     return find_plasma_boundary_cpu_with_status(
-        psi,
+        _as_cpu_numpy(psi),
         grid,
         center,
         n_levels=n_levels,
@@ -87,6 +85,16 @@ def find_plasma_boundary_with_status(
         local_bbox_pad_z=local_bbox_pad_z,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
+        boundary_base_mode=boundary_base_mode,
+        legacy_precision_index2=legacy_precision_index2,
+        track_level=track_level,
+        level_smoothing_alpha=level_smoothing_alpha,
+        level_search_span_fraction=level_search_span_fraction,
+        continuity_weight_radii=continuity_weight_radii,
+        continuity_weight_mean_radius=continuity_weight_mean_radius,
+        continuity_weight_center=continuity_weight_center,
+        continuity_weight_area=continuity_weight_area,
+        continuity_weight_level=continuity_weight_level,
     )
 
 
@@ -100,7 +108,6 @@ __all__ = [
     "configure_boundary_cpu_profiling",
     "configure_boundary_profiling",
     "find_plasma_boundary_cpu_with_status",
-    "find_plasma_boundary_gpu_with_status",
     "find_plasma_boundary_with_status",
     "log_boundary_cpu_profiling_summary",
     "log_boundary_profiling_summary",

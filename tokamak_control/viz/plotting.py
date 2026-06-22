@@ -103,9 +103,9 @@ def _boundary_mode_from_meta(meta: dict) -> BoundaryMode:
     """Прочитать режим физического определения границы из metadata запуска."""
     boundary_meta = meta.get("boundary")
     if not isinstance(boundary_meta, dict):
-        return "limited"
-    mode = str(boundary_meta.get("mode", "limited")).strip().lower()
-    if mode not in {"limited", "diverted"}:
+        return "legacy_contour"
+    mode = str(boundary_meta.get("mode", "legacy_contour")).strip().lower()
+    if mode not in {"legacy_contour", "legacy_contour_limited"}:
         raise ValueError(f"Invalid boundary mode in run metadata: {mode!r}")
     return cast(BoundaryMode, mode)
 
@@ -214,7 +214,7 @@ def _find_boundary_tracked(
     prev_poly: Optional[np.ndarray] = None,
     target_mean_radius: Optional[float] = None,
     limiter_shape: Optional[np.ndarray] = None,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
 ) -> tuple[np.ndarray | None, float | None, bool]:
     poly, level, status = find_plasma_boundary_with_status(
         psi=np.asarray(psi, dtype=float),
@@ -247,7 +247,7 @@ def _fig_boundary_from_poly(
     title: Optional[str] = None,
     coil_positions: Optional[np.ndarray | dict[str, np.ndarray]] = None,
     limiter_shape: Optional[np.ndarray] = None,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
 ) -> plt.Figure:
     if psi.shape != grid.shape:
         raise ValueError(f"psi shape {psi.shape} != grid shape {grid.shape}")
@@ -524,7 +524,7 @@ def fig_boundary(
     title: Optional[str] = None,
     coil_positions: Optional[np.ndarray | dict[str, np.ndarray]] = None,
     limiter_shape: Optional[np.ndarray] = None,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
     prev_level: Optional[float] = None,
     prev_poly: Optional[np.ndarray] = None,
 ) -> plt.Figure:
@@ -566,7 +566,7 @@ def fig_boundary_vs_reference(
     n_levels_search: int = 40,
     title: Optional[str] = None,
     limiter_shape: Optional[np.ndarray] = None,
-    boundary_mode: BoundaryMode = "limited",
+    boundary_mode: BoundaryMode = "legacy_contour",
 ) -> plt.Figure:
     """Построить границу плазмы и опорную полярную кривую."""
     poly, _, is_real = _find_boundary_tracked(

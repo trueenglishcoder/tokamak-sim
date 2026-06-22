@@ -9,7 +9,7 @@ from tokamak_control.config.settings import PhysicsSettings
 from tokamak_control.core.coils import CoilGroup
 from tokamak_control.core.green import build_green_for_coils, build_green_for_eind, build_green_for_plasma_center
 from tokamak_control.core.grid import Grid2D
-from tokamak_control.geometry.boundary_gpu import FixedAngleBoundaryGpuResult, fixed_angle_boundary_gpu
+from tokamak_control.geometry.boundary_gpu import FixedAngleBoundaryGpuResult
 
 
 @dataclass(slots=True)
@@ -43,6 +43,15 @@ class BatchedGpuTokamakSimulator:
         batch_size: int,
         angles_rad: np.ndarray,
         limiter_shape: np.ndarray,
+        boundary_mode: str = "legacy_contour",
+        boundary_base_mode: str = "legacy_contour_limited",
+        boundary_level_smoothing_alpha: float = 0.6,
+        boundary_level_search_span_fraction: float = 0.02,
+        boundary_continuity_weight_radii: float = 1.0,
+        boundary_continuity_weight_mean_radius: float = 0.3,
+        boundary_continuity_weight_center: float = 0.2,
+        boundary_continuity_weight_area: float = 0.2,
+        boundary_continuity_weight_level: float = 0.1,
         gpu_device: str = "cuda:0",
     ) -> None:
         if int(batch_size) <= 0:
@@ -59,6 +68,19 @@ class BatchedGpuTokamakSimulator:
         self.batch_size = int(batch_size)
         self.angles_rad = np.asarray(angles_rad, dtype=float).reshape(-1)
         self.limiter_shape = np.asarray(limiter_shape, dtype=float).reshape(-1, 2)
+        self.boundary_mode = str(boundary_mode)
+        if self.boundary_mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour"}:
+            raise ValueError("BatchedGpuTokamakSimulator only supports legacy contour boundary modes")
+        self.boundary_base_mode = str(boundary_base_mode)
+        self.boundary_level_smoothing_alpha = float(boundary_level_smoothing_alpha)
+        self.boundary_level_search_span_fraction = float(boundary_level_search_span_fraction)
+        self.boundary_continuity_weight_radii = float(boundary_continuity_weight_radii)
+        self.boundary_continuity_weight_mean_radius = float(boundary_continuity_weight_mean_radius)
+        self.boundary_continuity_weight_center = float(boundary_continuity_weight_center)
+        self.boundary_continuity_weight_area = float(boundary_continuity_weight_area)
+        self.boundary_continuity_weight_level = float(boundary_continuity_weight_level)
+        self._boundary_prev_polys: list[np.ndarray | None] = [None for _ in range(self.batch_size)]
+        self._boundary_prev_levels = np.full((self.batch_size,), np.nan, dtype=float)
         self.center = (float(settings.R0), float(settings.Z0))
         R, Z = grid.mesh()
         self.G_pfc = torch.as_tensor(build_green_for_coils(R, Z, pfc.element_positions, pfc.element_weights) if pfc.n_coils else np.zeros((0, *grid.shape)), dtype=self.dtype, device=self.device)
@@ -86,13 +108,16 @@ class BatchedGpuTokamakSimulator:
         pfc_t = torch.as_tensor(np.asarray(self.pfc.initial_currents, dtype=float), dtype=self.dtype, device=self.device).reshape(1, self.pfc.n_coils).repeat(B, 1) if pfc_currents is None else torch.as_tensor(pfc_currents, dtype=self.dtype, device=self.device).reshape(B, self.pfc.n_coils)
         sol_t = torch.as_tensor(np.asarray(self.sol.initial_currents, dtype=float), dtype=self.dtype, device=self.device).reshape(1, self.sol.n_coils).repeat(B, 1) if sol_currents is None else torch.as_tensor(sol_currents, dtype=self.dtype, device=self.device).reshape(B, self.sol.n_coils)
         self.Ip = ip_t.clone()
-        self.pfc_currents = self._clip_currents(pfc_t, self.settings.pfc_current_limit)
-        self.sol_currents = self._clip_currents(sol_t, self.settings.sol_current_limit)
+        self.Ip0 = ip_t.clone()
+        self.pfc_currents = pfc_t.clone()
+        self.sol_currents = sol_t.clone()
         self.pfc_derivs = torch.zeros_like(self.pfc_currents)
         self.sol_derivs = torch.zeros_like(self.sol_currents)
         self.step_index = torch.zeros((B,), dtype=torch.int64, device=self.device)
         self.time_s = torch.zeros((B,), dtype=self.dtype, device=self.device)
         self.psi = self.compose_psi(self.Ip, self.pfc_currents, self.sol_currents)
+        self._boundary_prev_polys = [None for _ in range(B)]
+        self._boundary_prev_levels = np.full((B,), np.nan, dtype=float)
         return self._result()
 
     def reset_indices(self, indices: list[int], *, ip, pfc_currents, sol_currents) -> BatchedGpuSimulatorResult:
@@ -101,35 +126,39 @@ class BatchedGpuTokamakSimulator:
         torch = self.torch
         idx = torch.as_tensor(indices, dtype=torch.long, device=self.device)
         self.Ip[idx] = torch.as_tensor(ip, dtype=self.dtype, device=self.device).reshape(-1)
-        self.pfc_currents[idx] = self._clip_currents(torch.as_tensor(pfc_currents, dtype=self.dtype, device=self.device).reshape(len(indices), self.pfc.n_coils), self.settings.pfc_current_limit)
-        self.sol_currents[idx] = self._clip_currents(torch.as_tensor(sol_currents, dtype=self.dtype, device=self.device).reshape(len(indices), self.sol.n_coils), self.settings.sol_current_limit)
+        self.Ip0[idx] = self.Ip[idx]
+        self.pfc_currents[idx] = torch.as_tensor(pfc_currents, dtype=self.dtype, device=self.device).reshape(len(indices), self.pfc.n_coils)
+        self.sol_currents[idx] = torch.as_tensor(sol_currents, dtype=self.dtype, device=self.device).reshape(len(indices), self.sol.n_coils)
         self.pfc_derivs[idx] = 0.0
         self.sol_derivs[idx] = 0.0
         self.step_index[idx] = 0
         self.time_s[idx] = 0.0
         self.psi[idx] = self.compose_psi(self.Ip[idx], self.pfc_currents[idx], self.sol_currents[idx])
+        for lane in indices:
+            self._boundary_prev_polys[int(lane)] = None
+            self._boundary_prev_levels[int(lane)] = np.nan
         return self._result()
 
-    def step(self, active_current_derivs) -> BatchedGpuSimulatorResult:
+    def step_currents(self, active_currents_next) -> BatchedGpuSimulatorResult:
+        """Advance one old-parity batched step from absolute next active currents."""
         torch = self.torch
         B = self.batch_size
-        actions = torch.as_tensor(active_current_derivs, dtype=self.dtype, device=self.device).reshape(B, self.pfc.n_coils + self.sol.n_coils)
-        cmd_pfc = self._clip_derivs(actions[:, : self.pfc.n_coils], self.settings.pfc_deriv_limit)
-        cmd_sol = self._clip_derivs(actions[:, self.pfc.n_coils :], self.settings.sol_deriv_limit)
-        alpha = self._actuator_alpha()
-        applied_pfc = self._clip_derivs(alpha * self.pfc_derivs + (1.0 - alpha) * cmd_pfc, self.settings.pfc_deriv_limit)
-        applied_sol = self._clip_derivs(alpha * self.sol_derivs + (1.0 - alpha) * cmd_sol, self.settings.sol_deriv_limit)
-        next_pfc = self._clip_currents(self.pfc_currents + float(self.settings.t_step) * applied_pfc, self.settings.pfc_current_limit)
-        next_sol = self._clip_currents(self.sol_currents + float(self.settings.t_step) * applied_sol, self.settings.sol_current_limit)
-        delta_pfc = next_pfc - self.pfc_currents
-        delta_sol = next_sol - self.sol_currents
-        control = torch.zeros((B,), dtype=self.dtype, device=self.device)
+        actions = torch.as_tensor(active_currents_next, dtype=self.dtype, device=self.device).reshape(B, self.pfc.n_coils + self.sol.n_coils)
+        next_pfc = actions[:, : self.pfc.n_coils]
+        next_sol = actions[:, self.pfc.n_coils :]
+        applied_pfc = (next_pfc - self.pfc_currents) / float(self.settings.t_step)
+        applied_sol = (next_sol - self.sol_currents) / float(self.settings.t_step)
+        drive = torch.zeros((B,), dtype=self.dtype, device=self.device)
         if self.g_pfc.numel():
-            control = control + torch.einsum("bi,i->b", delta_pfc, self.g_pfc)
+            drive = drive + torch.einsum("bi,i->b", applied_pfc, self.g_pfc)
         if self.g_sol.numel():
-            control = control + torch.einsum("bi,i->b", delta_sol, self.g_sol)
-        decay = float(np.exp(-float(self.settings.t_step) / max(float(self.settings.sigma * self.settings.inductance_L), 1e-30)))
-        ip_next = self.Ip * decay + float(getattr(self.settings, "ip_coupling_sign", -1.0)) * (float(self.settings.mu0) * float(self.settings.sigma) / float(self.settings.R0)) * control
+            drive = drive + torch.einsum("bi,i->b", applied_sol, self.g_sol)
+        tau = max(float(self.settings.sigma * self.settings.inductance_L), 1.0e-30)
+        scale = float(getattr(self.settings, "ip_coupling_sign", -1.0)) * (
+            float(self.settings.mu0) * float(self.settings.sigma) / float(self.settings.R0)
+        )
+        d_ip_dt = -self.Ip / tau + scale * drive
+        ip_next = self.Ip + float(self.settings.t_step) * d_ip_dt
         self.Ip = ip_next
         self.pfc_currents = next_pfc
         self.sol_currents = next_sol
@@ -140,6 +169,10 @@ class BatchedGpuTokamakSimulator:
         self.psi = self.compose_psi(self.Ip, self.pfc_currents, self.sol_currents)
         return self._result()
 
+    def step(self, *args, **kwargs) -> BatchedGpuSimulatorResult:
+        """Reject the removed derivative-command API."""
+        raise RuntimeError("BatchedGpuTokamakSimulator.step() was removed; use step_currents(J_next)")
+
     def compose_psi(self, ip, pfc, sol):
         psi = float(getattr(self.settings, "plasma_psi_sign", 1.0)) * ip[:, None, None] * self.G_plasma[None, :, :]
         if self.G_pfc.shape[0]:
@@ -149,14 +182,63 @@ class BatchedGpuTokamakSimulator:
         return float(self.settings.mu0) * psi
 
     def _result(self) -> BatchedGpuSimulatorResult:
-        boundary = fixed_angle_boundary_gpu(
-            psi=self.psi,
-            grid=self.grid,
-            center=self.center,
-            angles_rad=self.angles_t,
-            limiter_shape=self.limiter_shape,
-            boundary_mode="limited",
-            gpu_device=str(self.device),
+        from tokamak_control.geometry.boundary import BoundaryNotFoundError, find_plasma_boundary_with_status
+        from tokamak_control.geometry.legacy_metrics import legacy_radii_at_angles
+
+        torch = self.torch
+        psi_cpu = self.psi.detach().cpu().numpy().astype(float)
+        angles = np.asarray(self.angles_rad, dtype=float).reshape(-1)
+        dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        B = int(psi_cpu.shape[0])
+        A = int(angles.shape[0])
+        found_np = np.zeros((B,), dtype=bool)
+        status_np = np.zeros((B,), dtype=np.int64)
+        level_np = np.full((B,), np.nan, dtype=float)
+        radii_np = np.full((B, A), np.nan, dtype=float)
+        points_np = np.full((B, A, 2), np.nan, dtype=float)
+        center_np = np.asarray(self.center, dtype=float).reshape(2)
+        axis_np = np.repeat(center_np.reshape(1, 2), B, axis=0)
+        for b in range(B):
+            try:
+                use_limiter = self.boundary_mode in {"legacy_contour_limited", "tracked_flux_contour"}
+                poly, level, _status = find_plasma_boundary_with_status(
+                    psi_cpu[b],
+                    self.grid,
+                    self.center,
+                    prev_level=None if not np.isfinite(self._boundary_prev_levels[b]) else float(self._boundary_prev_levels[b]),
+                    prev_poly=self._boundary_prev_polys[b],
+                    limiter_shape=(self.limiter_shape if use_limiter else None),
+                    boundary_mode=self.boundary_mode,
+                    boundary_base_mode=self.boundary_base_mode,
+                    track_level=False,
+                    level_smoothing_alpha=self.boundary_level_smoothing_alpha,
+                    level_search_span_fraction=self.boundary_level_search_span_fraction,
+                    continuity_weight_radii=self.boundary_continuity_weight_radii,
+                    continuity_weight_mean_radius=self.boundary_continuity_weight_mean_radius,
+                    continuity_weight_center=self.boundary_continuity_weight_center,
+                    continuity_weight_area=self.boundary_continuity_weight_area,
+                    continuity_weight_level=self.boundary_continuity_weight_level,
+                    compute_backend="cpu",
+                )
+                radii = legacy_radii_at_angles(poly, self.center, angles)
+                found_np[b] = True
+                status_np[b] = 3
+                level_np[b] = float(level)
+                radii_np[b] = radii
+                points_np[b] = center_np.reshape(1, 2) + radii.reshape(-1, 1) * dirs
+                self._boundary_prev_polys[b] = np.asarray(poly, dtype=float)
+                self._boundary_prev_levels[b] = float(level)
+            except (BoundaryNotFoundError, ValueError, FloatingPointError):
+                self._boundary_prev_polys[b] = None
+                self._boundary_prev_levels[b] = np.nan
+                continue
+        boundary = FixedAngleBoundaryGpuResult(
+            found=torch.as_tensor(found_np, dtype=torch.bool, device=self.device),
+            status_code=torch.as_tensor(status_np, dtype=torch.int64, device=self.device),
+            level=torch.as_tensor(level_np, dtype=self.dtype, device=self.device),
+            points=torch.as_tensor(points_np, dtype=self.dtype, device=self.device),
+            radii=torch.as_tensor(radii_np, dtype=self.dtype, device=self.device),
+            axis_points=torch.as_tensor(axis_np, dtype=self.dtype, device=self.device),
         )
         state = BatchedGpuPlantState(
             t=self.time_s,

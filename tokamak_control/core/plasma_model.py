@@ -42,9 +42,7 @@ def plasma_model_profiling_snapshot() -> dict[str, object]:
     return _PROFILER.summary_dict(
         total_key="step_total",
         keys=(
-            "step_clip_cmd",
-            "step_actuator_lag",
-            "step_integrate_currents",
+            "step_derive_current_change",
             "step_ip_update",
             "step_compose_psi",
             "step_commit_state",
@@ -60,9 +58,7 @@ def log_plasma_model_profiling_summary() -> None:
     _PROFILER.log_summary(
         total_key="step_total",
         keys=(
-            "step_clip_cmd",
-            "step_actuator_lag",
-            "step_integrate_currents",
+            "step_derive_current_change",
             "step_ip_update",
             "step_compose_psi",
             "step_commit_state",
@@ -97,15 +93,12 @@ class PlasmaModel:
     """
     Deterministic, single-process plasma model.
 
-    The plasma current is an evolving runtime state. Each call to ``step`` first
-    decays the previous state value over one numerical time step, then adds the
-    coil-driven increment produced by the actual actuator current increments
-    after lag, derivative clipping, and current saturation.
-
-    The passive time constant is ``sigma * inductance_L``. The sign convention
-    for the coil-driven increment is controlled by ``ip_coupling_sign``; the
-    sign of the plasma-current term in ``psi`` is controlled by
-    ``plasma_psi_sign``.
+    Each call to ``step_currents`` treats the input as absolute next coil
+    currents, derives ``Jdot`` over the time step, and advances ``Ip`` as a
+    causal state. The LittleSCOPE coil-drive expression is interpreted as a
+    dIp/dt term and integrated over ``t_step`` instead of overwriting Ip.
+    Current/derivative limits and actuator lag are metadata for controllers and
+    diagnostics, not plant-side clamps.
     """
 
     grid: Grid2D
@@ -197,8 +190,8 @@ class PlasmaModel:
                     )
                 self.g2 = g_sol.copy()
 
-        pfc0 = _clip_currents(self.pfc.initial_currents, self.pfc_current_limit)
-        sol0 = _clip_currents(self.sol.initial_currents, self.sol_current_limit)
+        pfc0 = np.asarray(self.pfc.initial_currents, dtype=float).copy()
+        sol0 = np.asarray(self.sol.initial_currents, dtype=float).copy()
         psi0 = self._compose_psi(self.Ip0, pfc0, sol0)
 
         self.state = PlasmaState(
@@ -215,34 +208,43 @@ class PlasmaModel:
         self._initial_state = self.state.copied()
 
     def time_constant(self) -> float:
+        """Return the passive Ip loss time constant."""
         return float(self.sigma * self.inductance_L)
 
     def decay_factor(self, dt: float | None = None) -> float:
-        tau = max(self.time_constant(), 1e-30)
+        """Return the one-step explicit-Euler passive Ip multiplier."""
         step = float(self.t_step if dt is None else dt)
-        return float(np.exp(-step / tau))
+        return float(1.0 - step / max(self.time_constant(), 1.0e-30))
 
     def ip_decay_baseline_at(self, t: float, *, Ip0: float | None = None) -> float:
-        """Return passive decay from an arbitrary origin for diagnostics."""
-        tau = max(self.time_constant(), 1e-30)
+        """Return the continuous passive-loss baseline for diagnostics."""
         ip0 = float(self.Ip0 if Ip0 is None else Ip0)
-        return ip0 * float(np.exp(-float(t) / tau))
+        return float(ip0 * np.exp(-float(t) / max(self.time_constant(), 1.0e-30)))
 
     def predict_Ip_decay_baseline_next(self) -> float:
-        """Return next-step Ip with passive decay only, from the current state."""
+        """Return next-step passive-only Ip from the current state."""
         s = self._require_state()
-        return float(s.Ip) * self.decay_factor(float(self.t_step))
+        return float(s.Ip) * self.decay_factor()
 
     def get_ip_B_row(self) -> np.ndarray:
         """Return one-step Ip sensitivity to derivative commands [PFC..., SOL...]."""
         gp = self.g if self.g is not None else np.zeros((0,), dtype=float)
         gs = self.g2 if self.g2 is not None else np.zeros((0,), dtype=float)
-        return (
-            float(self.t_step)
-            * float(self.ip_coupling_sign)
-            * (self.mu0 * self.sigma / self.R0)
-            * np.concatenate([gp, gs])
-        )
+        scale = float(self.ip_coupling_sign) * (float(self.mu0) * float(self.sigma) / float(self.R0))
+        return float(self.t_step) * scale * np.concatenate([gp, gs])
+
+    def _advance_ip(self, ip_now: float, pfc_jdot: np.ndarray, sol_jdot: np.ndarray) -> float:
+        """Advance plasma current by integrating passive decay plus coil drive."""
+        gp = self.g if self.g is not None else np.zeros((0,), dtype=float)
+        gs = self.g2 if self.g2 is not None else np.zeros((0,), dtype=float)
+        drive = 0.0
+        if gp.size:
+            drive += float(np.dot(gp, np.asarray(pfc_jdot, dtype=float)))
+        if gs.size:
+            drive += float(np.dot(gs, np.asarray(sol_jdot, dtype=float)))
+        scale = float(self.ip_coupling_sign) * (float(self.mu0) * float(self.sigma) / float(self.R0))
+        d_ip_dt = -float(ip_now) / max(self.time_constant(), 1.0e-30) + scale * drive
+        return float(float(ip_now) + float(self.t_step) * d_ip_dt)
 
     def snapshot_state(self) -> PlasmaState:
         return self._require_state().copied()
@@ -271,57 +273,29 @@ class PlasmaModel:
             return 0.0
         return float(np.exp(-float(self.t_step) / tau))
 
-    def step(
+    def step_currents(
         self,
-        pfc_current_derivs: np.ndarray | None = None,
-        sol_current_derivs: np.ndarray | None = None,
+        pfc_currents_next: np.ndarray | None = None,
+        sol_currents_next: np.ndarray | None = None,
     ) -> PlasmaState:
+        """Advance one old-parity step from absolute next coil currents."""
         with _time_block("step_total"):
             s = self._require_state()
             dt = float(self.t_step)
             if dt <= 0.0:
                 raise ValueError(f"t_step must be > 0, got {dt!r}")
 
-            with _time_block("step_clip_cmd"):
-                cmd_pfc = np.zeros((self.pfc.n_coils,), dtype=float) if pfc_current_derivs is None else np.asarray(pfc_current_derivs, dtype=float).reshape(self.pfc.n_coils)
-                cmd_sol = np.zeros((self.sol.n_coils,), dtype=float) if sol_current_derivs is None else np.asarray(sol_current_derivs, dtype=float).reshape(self.sol.n_coils)
-
-                cmd_pfc = _clip_derivs(cmd_pfc, self.pfc_deriv_limit)
-                cmd_sol = _clip_derivs(cmd_sol, self.sol_deriv_limit)
-
-            with _time_block("step_actuator_lag"):
-                alpha = self._actuator_alpha()
-                applied_pfc = alpha * np.asarray(s.pfc_current_derivs, dtype=float) + (1.0 - alpha) * cmd_pfc
-                applied_sol = alpha * np.asarray(s.sol_current_derivs, dtype=float) + (1.0 - alpha) * cmd_sol
-
-                applied_pfc = _clip_derivs(applied_pfc, self.pfc_deriv_limit)
-                applied_sol = _clip_derivs(applied_sol, self.sol_deriv_limit)
-
-            with _time_block("step_integrate_currents"):
+            with _time_block("step_derive_current_change"):
                 prev_pfc = np.asarray(s.pfc_currents, dtype=float)
                 prev_sol = np.asarray(s.sol_currents, dtype=float)
-
-                next_pfc = _clip_currents(prev_pfc + dt * applied_pfc, self.pfc_current_limit)
-                next_sol = _clip_currents(prev_sol + dt * applied_sol, self.sol_current_limit)
-
-                delta_pfc = next_pfc - prev_pfc
-                delta_sol = next_sol - prev_sol
+                next_pfc = prev_pfc.copy() if pfc_currents_next is None else np.asarray(pfc_currents_next, dtype=float).reshape(self.pfc.n_coils)
+                next_sol = prev_sol.copy() if sol_currents_next is None else np.asarray(sol_currents_next, dtype=float).reshape(self.sol.n_coils)
+                applied_pfc = (next_pfc - prev_pfc) / dt
+                applied_sol = (next_sol - prev_sol) / dt
 
             with _time_block("step_ip_update"):
                 t_next = float(s.t) + dt
-                ip_base = float(s.Ip) * self.decay_factor(dt)
-                gp = self.g if self.g is not None else np.zeros((0,), dtype=float)
-                gs = self.g2 if self.g2 is not None else np.zeros((0,), dtype=float)
-                control_term = 0.0
-                if gp.size:
-                    control_term += float(np.dot(gp, delta_pfc))
-                if gs.size:
-                    control_term += float(np.dot(gs, delta_sol))
-                ip_next = float(
-                    ip_base
-                    + (float(self.ip_coupling_sign) * (self.mu0 * self.sigma / self.R0))
-                    * control_term
-                )
+                ip_next = self._advance_ip(float(s.Ip), applied_pfc, applied_sol)
 
             with _time_block("step_compose_psi"):
                 psi_next = self._compose_psi(ip_next, next_pfc, next_sol)
@@ -340,6 +314,10 @@ class PlasmaModel:
                 )
             _PROFILER.step()
             return self.state
+
+    def step(self, *args: object, **kwargs: object) -> PlasmaState:
+        """Reject the removed derivative-command API."""
+        raise RuntimeError("PlasmaModel.step() was removed; use step_currents(J_next) with absolute next currents")
 
     def _compose_psi(self, Ip: float, pfc_currents: np.ndarray, sol_currents: np.ndarray) -> np.ndarray:
         with _time_block("compose_psi"):
@@ -400,8 +378,8 @@ class PlasmaModel:
         return self._bilinear_sample_slice(self._G_plasma, points)
 
     def _bilinear_sample_slice(self, field2d: np.ndarray, points: np.ndarray) -> np.ndarray:
-        R0 = self.grid.r.start
-        Z0 = self.grid.z.start
+        R0 = float(self.grid.r.coords()[0])
+        Z0 = float(self.grid.z.coords()[0])
         dR = self.grid.r.step
         dZ = self.grid.z.step
         NR = self.grid.r.size

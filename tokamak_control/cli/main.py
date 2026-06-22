@@ -51,7 +51,7 @@ def _add_simulate(p) -> None:
     )
     ap.add_argument(
         "--controller",
-        default="lqr_boundary",
+        default="lqr_t15_zaitsev",
         choices=controller_names(),
         help="Controller name.",
     )

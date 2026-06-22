@@ -4,6 +4,10 @@ Pure-Python tokamak plasma simulation and control toolkit. The main workflow is 
 
 This repository is being prepared as source code. Local machine configs, private/large data tables, generated runs, and exploratory notes are intentionally kept out of Git.
 
+See [CURRENT_PIPELINE.md](CURRENT_PIPELINE.md) for the active plant contract.
+The public simulator/control input is absolute next-step coil current; `Jdot`
+is derived internally from adjacent current states.
+
 ## Quick Start
 
 Install the project in a virtual environment:
@@ -31,9 +35,11 @@ python scripts/run_simulation_artifacts.py \
   --config configs/T15MD_new_data.toml \
   --initial-currents configs/initial_currents/T15MD_new_data_3864.toml \
   --steps 20 \
-  --controller lqr_boundary \
+  --controller t15md_replay \
+  --controller-arg replay_path=data/t15_data_new/coils/t15md_3864_coils.csv \
   --angles 32 \
-  --scenario nominal \
+  --scenario ip_table \
+  --scenario-arg ip_csv=data/t15_data_new/ip/t15md_3864_ip.csv \
   --out runs/quick_t15 \
   --no-progress
 ```
@@ -155,7 +161,13 @@ Use `--plot`, not `-plot`; the fitter defines `--plot` as a long argparse flag.
 
 ## Programmatic Use
 
-External tools can step the simulator directly through `tokamak_control.bridge.SimulationSession` without going through the plotting/artifact CLI. The bridge exposes loaded machine metadata, scenario references, active-coil current vectors, derivative commands, applied derivatives, sampled boundary radii, and clean boundary-failure termination status. It accepts physical active-coil current derivatives in A/s and keeps training/optimization-specific logic outside this repository.
+External tools can step the simulator directly through
+`tokamak_control.bridge.SimulationSession` without going through the
+plotting/artifact CLI. The bridge exposes loaded machine metadata, scenario
+references, active-coil current vectors, derived `Jdot`, sampled boundary radii,
+and clean boundary-failure termination status. It accepts absolute next-step
+active-coil currents and keeps training/optimization-specific logic outside this
+repository.
 
 Pure tracking and actuator diagnostics live in `tokamak_control.metrics`. These functions compute errors and margins only; they do not apply reward weights or controller logic.
 

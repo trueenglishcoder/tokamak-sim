@@ -14,6 +14,7 @@ import pytest
 from tokamak_control.core.grid import Grid1D, Grid2D
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.config.scenarios import make_scenario
+from tokamak_control.control.registry import normalize_controller_launch
 from tokamak_control.control.t15md_replay import T15MDReplayController
 from tokamak_control.geometry.boundary import find_plasma_boundary_with_status
 from tokamak_control.io.config_io import dump_config, load_config
@@ -353,9 +354,9 @@ def test_ip_follow_t15_linear_boundary_mode_changes_reference_shape() -> None:
     assert float(np.max(np.abs(radii_late - radii_start))) > 1e-6
 
 
-def test_split_t15_sol_points_are_loaded_as_three_homogeneous_actuators() -> None:
-    """Проверить, что split SOL T15 грузится как 3 однородных актуатора, а не сотни независимых."""
-    _require_local_paths(SMOKE_CONFIG, SMOKE_INITIAL_CURRENTS, "data/t15_data_new_split/coils/t15md_3864_coils.csv")
+def test_t15md_replay_commands_exact_next_currents() -> None:
+    """T15 replay must command exact table currents at t + dt, SOL first then PFC."""
+    _require_local_paths(SMOKE_CONFIG, SMOKE_INITIAL_CURRENTS, "data/t15_data_new/coils/t15md_3864_coils.csv")
     cfg = load_config(
         REPO_ROOT / "configs/T15MD_new_data.toml",
         initial_currents_path=REPO_ROOT / "configs/initial_currents/T15MD_new_data_3864.toml",
@@ -366,8 +367,41 @@ def test_split_t15_sol_points_are_loaded_as_three_homogeneous_actuators() -> Non
     assert [float(weights.sum()) for weights in cfg.sol.element_weights] == [1.0, 1.0, 1.0]
 
     model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
-    controller = T15MDReplayController(replay_path=REPO_ROOT / "data/t15_data_new_split/coils/t15md_3864_coils.csv")
+    replay_path = REPO_ROOT / "data/t15_data_new/coils/t15md_3864_coils.csv"
+    controller = T15MDReplayController(replay_path=replay_path)
     action = controller.compute_control(model=model)
+    table = np.loadtxt(replay_path, delimiter=";")
 
-    assert action.sol_derivs.shape == (3,)
-    assert action.pfc_derivs.shape == (6,)
+    assert action.sol_currents_next.shape == (3,)
+    assert action.pfc_currents_next.shape == (6,)
+    assert np.allclose(action.sol_currents_next, table[1, 1:4])
+    assert np.allclose(action.pfc_currents_next, table[1, 4:10])
+
+
+def test_t15md_replay_rejects_non_exact_u_clip_launch_arg() -> None:
+    """T15 replay should not accept clipping because that is no longer exact replay."""
+    _require_local_paths("data/t15_data_new/coils/t15md_3864_coils.csv")
+    with pytest.raises(ValueError, match="does not accept"):
+        normalize_controller_launch(
+            "t15md_replay",
+            {
+                "replay_path": REPO_ROOT / "data/t15_data_new/coils/t15md_3864_coils.csv",
+                "u_clip": 1.0,
+            },
+        )
+
+
+def test_t15md_replay_rejects_wrong_table_width(tmp_path: Path) -> None:
+    """Replay table width must match the loaded 3 SOL + 6 PFC plant."""
+    _require_local_paths(SMOKE_CONFIG, SMOKE_INITIAL_CURRENTS)
+    cfg = load_config(
+        REPO_ROOT / "configs/T15MD_new_data.toml",
+        initial_currents_path=REPO_ROOT / "configs/initial_currents/T15MD_new_data_3864.toml",
+    )
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    replay_path = tmp_path / "bad_width.csv"
+    replay_path.write_text("0.0;1;2\n0.001;3;4\n", encoding="utf-8")
+    controller = T15MDReplayController(replay_path=replay_path)
+
+    with pytest.raises(ValueError, match="actuator count"):
+        controller.compute_control(model=model)

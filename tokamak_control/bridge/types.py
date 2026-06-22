@@ -66,10 +66,10 @@ class InitialStateOverride:
 
 
 @dataclass(frozen=True, slots=True)
-class DerivativeAction:
-    """Физическая команда производных токов по активным актуаторам, А/с."""
+class CurrentAction:
+    """Absolute next-current command for active actuators, A."""
 
-    active_current_derivatives: np.ndarray
+    active_currents_next: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +93,8 @@ class StepSnapshot:
     measured_ip: float
     true_active_currents: np.ndarray
     measured_active_currents: np.ndarray
+    commanded_active_currents: np.ndarray
+    applied_active_currents: np.ndarray
     commanded_active_derivatives: np.ndarray
     applied_active_derivatives: np.ndarray
     previous_applied_active_derivatives: np.ndarray

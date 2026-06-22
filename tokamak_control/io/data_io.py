@@ -103,6 +103,10 @@ class RunWriter:
     _track_sol_cmd: bool = field(default=False, init=False)
     _track_pfc_eff: bool = field(default=False, init=False)
     _track_sol_eff: bool = field(default=False, init=False)
+    _track_pfc_current_cmd: bool = field(default=False, init=False)
+    _track_sol_current_cmd: bool = field(default=False, init=False)
+    _track_pfc_current_eff: bool = field(default=False, init=False)
+    _track_sol_current_eff: bool = field(default=False, init=False)
     _track_radii: bool = field(default=False, init=False)
     _track_boundary_poly_true: bool = field(default=False, init=False)
     _track_boundary_poly_meas: bool = field(default=False, init=False)
@@ -116,6 +120,10 @@ class RunWriter:
     _sol_dJ_cmd: list[np.ndarray] = field(default_factory=list, init=False)
     _pfc_dJ_eff: list[np.ndarray] = field(default_factory=list, init=False)
     _sol_dJ_eff: list[np.ndarray] = field(default_factory=list, init=False)
+    _pfc_J_cmd: list[np.ndarray] = field(default_factory=list, init=False)
+    _sol_J_cmd: list[np.ndarray] = field(default_factory=list, init=False)
+    _pfc_J_eff: list[np.ndarray] = field(default_factory=list, init=False)
+    _sol_J_eff: list[np.ndarray] = field(default_factory=list, init=False)
 
     _radii_true: list[np.ndarray] = field(default_factory=list, init=False)
     _radii_meas: list[np.ndarray] = field(default_factory=list, init=False)
@@ -212,6 +220,10 @@ class RunWriter:
         sol_cmd = extra.get("sol_derivs_cmd", None)
         pfc_eff = extra.get("pfc_derivs_eff", None)
         sol_eff = extra.get("sol_derivs_eff", None)
+        pfc_current_cmd = extra.get("pfc_currents_cmd", None)
+        sol_current_cmd = extra.get("sol_currents_cmd", None)
+        pfc_current_eff = extra.get("pfc_currents_eff", None)
+        sol_current_eff = extra.get("sol_currents_eff", None)
         radii_true = extra.get("radii_true", None)
         radii_meas = extra.get("radii_meas", None)
         boundary_poly_true = extra.get("boundary_poly_true", None)
@@ -270,6 +282,54 @@ class RunWriter:
                 if v.shape != (self._n_sol,):
                     raise ValueError(f"sol_derivs_eff shape {v.shape} != ({self._n_sol},)")
                 self._sol_dJ_eff.append(v)
+
+        if pfc_current_cmd is not None and not self._track_pfc_current_cmd:
+            self._track_pfc_current_cmd = True
+            self._ensure_len(self._pfc_J_cmd, step_index, _nan_vec(self._n_pfc))
+        if self._track_pfc_current_cmd:
+            if pfc_current_cmd is None:
+                self._pfc_J_cmd.append(_nan_vec(self._n_pfc))
+            else:
+                v = np.asarray(pfc_current_cmd, dtype=float).copy()
+                if v.shape != (self._n_pfc,):
+                    raise ValueError(f"pfc_currents_cmd shape {v.shape} != ({self._n_pfc},)")
+                self._pfc_J_cmd.append(v)
+
+        if sol_current_cmd is not None and not self._track_sol_current_cmd:
+            self._track_sol_current_cmd = True
+            self._ensure_len(self._sol_J_cmd, step_index, _nan_vec(self._n_sol))
+        if self._track_sol_current_cmd:
+            if sol_current_cmd is None:
+                self._sol_J_cmd.append(_nan_vec(self._n_sol))
+            else:
+                v = np.asarray(sol_current_cmd, dtype=float).copy()
+                if v.shape != (self._n_sol,):
+                    raise ValueError(f"sol_currents_cmd shape {v.shape} != ({self._n_sol},)")
+                self._sol_J_cmd.append(v)
+
+        if pfc_current_eff is not None and not self._track_pfc_current_eff:
+            self._track_pfc_current_eff = True
+            self._ensure_len(self._pfc_J_eff, step_index, _nan_vec(self._n_pfc))
+        if self._track_pfc_current_eff:
+            if pfc_current_eff is None:
+                self._pfc_J_eff.append(_nan_vec(self._n_pfc))
+            else:
+                v = np.asarray(pfc_current_eff, dtype=float).copy()
+                if v.shape != (self._n_pfc,):
+                    raise ValueError(f"pfc_currents_eff shape {v.shape} != ({self._n_pfc},)")
+                self._pfc_J_eff.append(v)
+
+        if sol_current_eff is not None and not self._track_sol_current_eff:
+            self._track_sol_current_eff = True
+            self._ensure_len(self._sol_J_eff, step_index, _nan_vec(self._n_sol))
+        if self._track_sol_current_eff:
+            if sol_current_eff is None:
+                self._sol_J_eff.append(_nan_vec(self._n_sol))
+            else:
+                v = np.asarray(sol_current_eff, dtype=float).copy()
+                if v.shape != (self._n_sol,):
+                    raise ValueError(f"sol_currents_eff shape {v.shape} != ({self._n_sol},)")
+                self._sol_J_eff.append(v)
 
         if (radii_true is not None or radii_meas is not None or radii_ref is not None) and not self._track_radii:
             self._track_radii = True
@@ -439,6 +499,8 @@ class RunWriter:
             ("t", t),
             ("Ip", np.asarray(payload["Ip"], dtype=float)),
         ]
+        if "dIp_dt" in payload:
+            columns.append(("dIp_dt", np.asarray(payload["dIp_dt"], dtype=float)))
 
         def add_vector_matrix(prefix: str, arr: np.ndarray) -> None:
             arr = np.asarray(arr, dtype=float)
@@ -471,6 +533,14 @@ class RunWriter:
             add_vector_matrix("pfc_deriv_eff", np.asarray(payload["pfc_derivs_eff"], dtype=float))
         if "sol_derivs_eff" in payload:
             add_vector_matrix("sol_deriv_eff", np.asarray(payload["sol_derivs_eff"], dtype=float))
+        if "pfc_currents_cmd" in payload:
+            add_vector_matrix("pfc_current_cmd", np.asarray(payload["pfc_currents_cmd"], dtype=float))
+        if "sol_currents_cmd" in payload:
+            add_vector_matrix("sol_current_cmd", np.asarray(payload["sol_currents_cmd"], dtype=float))
+        if "pfc_currents_eff" in payload:
+            add_vector_matrix("pfc_current_eff", np.asarray(payload["pfc_currents_eff"], dtype=float))
+        if "sol_currents_eff" in payload:
+            add_vector_matrix("sol_current_eff", np.asarray(payload["sol_currents_eff"], dtype=float))
         if "radii_true" in payload:
             add_vector_matrix("radii_true", np.asarray(payload["radii_true"], dtype=float))
         if "radii_meas" in payload:
@@ -523,6 +593,14 @@ class RunWriter:
 
         t = np.asarray(self._t, dtype=float)
         Ip = np.asarray(self._Ip, dtype=float)
+        dIp_dt = np.full_like(Ip, np.nan, dtype=float)
+        if Ip.size >= 2:
+            dt = np.diff(t)
+            valid = np.isfinite(dt) & (np.abs(dt) > 0.0)
+            deriv = np.full((Ip.size - 1,), np.nan, dtype=float)
+            deriv[valid] = np.diff(Ip)[valid] / dt[valid]
+            dIp_dt[1:] = deriv
+            dIp_dt[0] = deriv[0]
 
         pfc_J = _stack_list_of_vectors(self._pfc_J)
         pfc_dJ = _stack_list_of_vectors(self._pfc_dJ_applied)
@@ -541,6 +619,7 @@ class RunWriter:
             "step": np.asarray(self._step, dtype=int),
             "t": t,
             "Ip": Ip,
+            "dIp_dt": dIp_dt,
             "pfc_currents": pfc_J,
             "pfc_derivs": pfc_dJ,
             "sol_currents": sol_J,
@@ -561,6 +640,14 @@ class RunWriter:
             payload["pfc_derivs_eff"] = _stack_list_of_vectors(self._pfc_dJ_eff)
         if self._track_sol_eff:
             payload["sol_derivs_eff"] = _stack_list_of_vectors(self._sol_dJ_eff)
+        if self._track_pfc_current_cmd:
+            payload["pfc_currents_cmd"] = _stack_list_of_vectors(self._pfc_J_cmd)
+        if self._track_sol_current_cmd:
+            payload["sol_currents_cmd"] = _stack_list_of_vectors(self._sol_J_cmd)
+        if self._track_pfc_current_eff:
+            payload["pfc_currents_eff"] = _stack_list_of_vectors(self._pfc_J_eff)
+        if self._track_sol_current_eff:
+            payload["sol_currents_eff"] = _stack_list_of_vectors(self._sol_J_eff)
         if self._track_radii:
             payload["radii_true"] = _stack_list_of_vectors(self._radii_true)
             payload["radii_meas"] = _stack_list_of_vectors(self._radii_meas)
@@ -628,6 +715,7 @@ def load_run(npz_path: str | Path) -> dict[str, object]:
             "step": np.asarray(d["step"], dtype=int) if "step" in files else np.arange(np.asarray(d["t"], dtype=float).shape[0], dtype=int),
             "t": np.asarray(d["t"], dtype=float),
             "Ip": np.asarray(d["Ip"], dtype=float),
+            "dIp_dt": np.asarray(d["dIp_dt"], dtype=float) if "dIp_dt" in files else np.full_like(np.asarray(d["Ip"], dtype=float), np.nan),
             "pfc_currents": np.asarray(d["pfc_currents"], dtype=float),
             "pfc_derivs": np.asarray(d["pfc_derivs"], dtype=float),
             "sol_currents": np.asarray(d["sol_currents"], dtype=float),
@@ -645,6 +733,10 @@ def load_run(npz_path: str | Path) -> dict[str, object]:
             "sol_derivs_cmd",
             "pfc_derivs_eff",
             "sol_derivs_eff",
+            "pfc_currents_cmd",
+            "sol_currents_cmd",
+            "pfc_currents_eff",
+            "sol_currents_eff",
             "radii_true",
             "radii_meas",
             "boundary_poly_true",

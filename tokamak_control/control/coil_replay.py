@@ -16,8 +16,8 @@ class CoilReplayController(Controller):
     seconds and whose remaining columns are target runtime actuator currents.
     The target-current columns are mapped to the model's PFC and SOL banks by
     ``bank_order``. At runtime the controller interpolates target currents at
-    the current simulation time and emits derivative commands that move the
-    plant currents toward those targets in one simulation step.
+    the current simulation time and emits absolute next-current commands for
+    the plant.
 
     Time alignment
     --------------
@@ -37,8 +37,8 @@ class CoilReplayController(Controller):
     - ``pfc,sol`` maps the first ``n_pfc`` columns to PFC and the next
       ``n_sol`` columns to SOL.
 
-    Banks omitted from ``bank_order`` are left unchanged by emitting zero
-    derivative commands for that bank.
+    Banks omitted from ``bank_order`` are left unchanged by commanding the
+    current bank value again for the next step.
     """
 
     def __init__(
@@ -163,8 +163,8 @@ class CoilReplayController(Controller):
 
         if n_total == 0:
             return ControlAction(
-                pfc_derivs=np.zeros((0,), dtype=float),
-                sol_derivs=np.zeros((0,), dtype=float),
+                pfc_currents_next=np.zeros((0,), dtype=float),
+                sol_currents_next=np.zeros((0,), dtype=float),
             )
 
         dt = float(model.t_step)
@@ -194,17 +194,17 @@ class CoilReplayController(Controller):
                 f"Runtime SOL current vector has size {curr_sol.size}, expected {n_sol}"
             )
 
-        pfc_derivs = (target_pfc - curr_pfc) / dt
-        sol_derivs = (target_sol - curr_sol) / dt
+        pfc_delta = target_pfc - curr_pfc
+        sol_delta = target_sol - curr_sol
 
-        if not np.all(np.isfinite(pfc_derivs)) or not np.all(np.isfinite(sol_derivs)):
-            raise ValueError("Replay controller produced non-finite derivative commands")
+        if not np.all(np.isfinite(pfc_delta)) or not np.all(np.isfinite(sol_delta)):
+            raise ValueError("Replay controller produced non-finite current commands")
 
         if self.u_clip is not None:
-            pfc_derivs = np.clip(pfc_derivs, -self.u_clip, self.u_clip)
-            sol_derivs = np.clip(sol_derivs, -self.u_clip, self.u_clip)
+            pfc_delta = np.clip(pfc_delta, -float(self.u_clip) * dt, float(self.u_clip) * dt)
+            sol_delta = np.clip(sol_delta, -float(self.u_clip) * dt, float(self.u_clip) * dt)
 
         return ControlAction(
-            pfc_derivs=np.asarray(pfc_derivs, dtype=float),
-            sol_derivs=np.asarray(sol_derivs, dtype=float),
+            pfc_currents_next=np.asarray(curr_pfc + pfc_delta, dtype=float),
+            sol_currents_next=np.asarray(curr_sol + sol_delta, dtype=float),
         )

@@ -17,7 +17,6 @@ import numpy as np
 from tokamak_control.compute import ComputeBackend, ComputeSettings, compute_runtime_metadata, normalize_compute_backend
 from tokamak_control.config.scenarios import Scenario, ScenarioName, make_scenario
 from tokamak_control.control.base import ControlAction, Controller
-from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
 from tokamak_control.control.registry import (
     build_controller_runtime_call,
     make_controller,
@@ -45,6 +44,7 @@ from tokamak_control.geometry.boundary import (
     log_boundary_profiling_summary,
     boundary_profiling_snapshot,
 )
+from tokamak_control.geometry.legacy_metrics import legacy_measurement_angles_from_actuators, legacy_radii_at_angles
 from tokamak_control.io.config_io import LoadedConfig, load_config
 from tokamak_control.io.data_io import RunWriter
 from tokamak_control.io.logger import configure_logging, get_logger
@@ -67,6 +67,7 @@ LaunchScenarioName = Literal[
     "joint_disturbance",
     "shot_follow",
     "ip_table",
+    "t15_replay_reference",
     "ip_follow",
     "t15_synthetic_follow",
     "ip_crash",
@@ -120,7 +121,7 @@ class _StepRefs:
 
 @dataclass(frozen=True, slots=True)
 class _StepCommands:
-    """Команды регулятора до и после слоя реализма."""
+    """Абсолютные команды следующего тока до и после слоя реализма."""
 
     pfc_cmd: np.ndarray
     sol_cmd: np.ndarray
@@ -139,6 +140,7 @@ class _StepRecord:
     ip_ref_log: float
     sensors: SensorRealismResult
     disturbances_applied: list[str]
+    controller_diagnostics: dict[str, object]
 
 
 
@@ -303,6 +305,15 @@ def _build_run_metadata(
             "R0": float(cfg.physics.R0),
             "Z0": float(cfg.physics.Z0),
         },
+        "physics": {
+            "Ip0": float(cfg.physics.Ip0),
+            "t_step": float(cfg.physics.t_step),
+            "sigma": float(cfg.physics.sigma),
+            "inductance_L": float(cfg.physics.inductance_L),
+            "ip_coupling_pfc": None if cfg.physics.ip_coupling_pfc is None else list(cfg.physics.ip_coupling_pfc),
+            "ip_coupling_sol": None if cfg.physics.ip_coupling_sol is None else list(cfg.physics.ip_coupling_sol),
+            "plasma_psi_sign": float(cfg.physics.plasma_psi_sign),
+        },
         "coil_positions": {
             "pfc": np.asarray(cfg.pfc.positions, dtype=float).tolist(),
             "sol": np.asarray(cfg.sol.positions, dtype=float).tolist(),
@@ -313,6 +324,16 @@ def _build_run_metadata(
         },
         "boundary": {
             "mode": cfg.boundary_mode,
+            "base_mode": cfg.boundary_base_mode,
+            "legacy_precision_index2": cfg.boundary_legacy_precision_index2,
+            "track_level": cfg.boundary_track_level,
+            "level_smoothing_alpha": cfg.boundary_level_smoothing_alpha,
+            "level_search_span_fraction": cfg.boundary_level_search_span_fraction,
+            "continuity_weight_radii": cfg.boundary_continuity_weight_radii,
+            "continuity_weight_mean_radius": cfg.boundary_continuity_weight_mean_radius,
+            "continuity_weight_center": cfg.boundary_continuity_weight_center,
+            "continuity_weight_area": cfg.boundary_continuity_weight_area,
+            "continuity_weight_level": cfg.boundary_continuity_weight_level,
         },
         "compute": compute_runtime_metadata(cfg.compute, validate=False),
         "limiter": {
@@ -376,13 +397,22 @@ def _model_compute_psi_for_boundary(model: PlasmaModel | GpuPlasmaModel):
     return model.compute_psi()
 
 
+def _legacy_radii(boundary_poly: np.ndarray | None, center: tuple[float, float], angles: np.ndarray) -> np.ndarray:
+    """Измерить радиусы контура правилом угловой интерполяции tokamak-sim-0."""
+    if boundary_poly is None:
+        return np.full((angles.shape[0],), np.nan, dtype=float)
+    return legacy_radii_at_angles(boundary_poly, center, angles)
+
+
 def _prepare(
     cfg: LoadedConfig,
     *,
     M_angles: int,
     scenario_name: ScenarioName,
     scenario_params: Mapping[str, object] | None,
+    controller_name: str = "",
 ) -> tuple[PlasmaModel | GpuPlasmaModel, np.ndarray, Scenario, np.ndarray]:
+    """Подготовить модель, опорные углы и сценарий для выбранного контроллера."""
     model: PlasmaModel | GpuPlasmaModel
     if cfg.compute.backend == "gpu":
         model = GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, gpu_device=cfg.compute.gpu_device)
@@ -407,10 +437,26 @@ def _prepare(
             n_levels=80 if cfg.limiter_shape is not None else 10,
             limiter_shape=cfg.limiter_shape,
             boundary_mode=cfg.boundary_mode,
+            boundary_base_mode=cfg.boundary_base_mode,
+            legacy_precision_index2=cfg.boundary_legacy_precision_index2,
+            track_level=cfg.boundary_track_level,
+            level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
+            level_search_span_fraction=cfg.boundary_level_search_span_fraction,
+            continuity_weight_radii=cfg.boundary_continuity_weight_radii,
+            continuity_weight_mean_radius=cfg.boundary_continuity_weight_mean_radius,
+            continuity_weight_center=cfg.boundary_continuity_weight_center,
+            continuity_weight_area=cfg.boundary_continuity_weight_area,
+            continuity_weight_level=cfg.boundary_continuity_weight_level,
             compute_backend=cfg.compute.backend,
             gpu_device=cfg.compute.gpu_device,
         )
-        base_radii = radii_from_polyline_ray_intersections(boundary0, center, angles)
+        if (
+            str(controller_name).lower() == "lqr_t15_zaitsev"
+            and int(getattr(model.pfc, "n_coils", 0)) > 0
+        ):
+            angles, base_radii = legacy_measurement_angles_from_actuators(boundary0, center, model.pfc.positions)
+        else:
+            base_radii = _legacy_radii(boundary0, center, angles)
     except BoundaryNotFoundError:
         base_radii = np.full((angles.shape[0],), np.nan, dtype=float)
 
@@ -422,6 +468,64 @@ def _prepare(
         center=center,
     )
     return model, angles, scenario, base_radii
+
+
+def _controller_diagnostics(controller: Controller) -> dict[str, object]:
+    """Собрать необязательные диагностические поля аналитического контроллера."""
+    fields = (
+        "last_derivative_clipping_fraction",
+        "last_gain_fallback_used",
+        "last_gain_failure",
+        "last_gain_recomputed",
+        "last_gain_recompute_reason",
+        "last_gain_age_steps",
+        "gain_fallback_count",
+        "gain_recompute_count",
+        "last_boundary_sensitivity_max",
+        "last_ip_sensitivity_max",
+        "last_response_condition",
+        "last_h_size",
+        "last_n_boundary",
+    )
+    out: dict[str, object] = {}
+    for name in fields:
+        if hasattr(controller, name):
+            value = getattr(controller, name)
+            if isinstance(value, np.generic):
+                value = value.item()
+            out[f"controller_{name}"] = value
+    for source_name, prefix in (("last_q_diag_summary", "controller_q"), ("last_r_diag_summary", "controller_r")):
+        if hasattr(controller, source_name):
+            summary = getattr(controller, source_name)
+            if isinstance(summary, Mapping):
+                for key, value in summary.items():
+                    if isinstance(value, np.generic):
+                        value = value.item()
+                    out[f"{prefix}_{key}"] = value
+    for source_name, prefix in (
+        ("last_delta_jdot_raw", "controller_delta_jdot_raw"),
+        ("last_delta_jdot_applied", "controller_delta_jdot_applied"),
+        ("last_jdot_command", "controller_jdot_command"),
+    ):
+        if hasattr(controller, source_name):
+            arr = getattr(controller, source_name)
+            if arr is None:
+                continue
+            vec = np.asarray(arr, dtype=float).reshape(-1)
+            if vec.size:
+                out[f"{prefix}_max_abs"] = float(np.max(np.abs(vec)))
+                out[f"{prefix}_rms"] = float(np.sqrt(np.mean(vec * vec)))
+    if hasattr(controller, "last_gain"):
+        gain = getattr(controller, "last_gain")
+        if gain is not None:
+            K = np.asarray(gain, dtype=float)
+            out["controller_gain_max_abs"] = float(np.max(np.abs(K))) if K.size else 0.0
+            out["controller_gain_fro_norm"] = float(np.linalg.norm(K)) if K.size else 0.0
+    if hasattr(controller, "last_state"):
+        state = getattr(controller, "last_state")
+        if state is not None:
+            out["controller_state_max_abs"] = float(np.max(np.abs(np.asarray(state, dtype=float)))) if np.asarray(state).size else 0.0
+    return out
 
 
 def _make_progress(*, enabled: bool, total: int, desc: str):
@@ -566,6 +670,16 @@ def _initial_boundary_tracker(
     target_mean_radius: float | None,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
+    boundary_base_mode: BoundaryMode,
+    legacy_precision_index2: float,
+    track_level: bool,
+    level_smoothing_alpha: float,
+    level_search_span_fraction: float,
+    continuity_weight_radii: float,
+    continuity_weight_mean_radius: float,
+    continuity_weight_center: float,
+    continuity_weight_area: float,
+    continuity_weight_level: float,
     compute_backend: str,
     gpu_device: str,
     logger: logging.Logger,
@@ -583,6 +697,16 @@ def _initial_boundary_tracker(
                 target_mean_radius=target_mean_radius,
                 limiter_shape=limiter_shape,
                 boundary_mode=boundary_mode,
+                boundary_base_mode=boundary_base_mode,
+                legacy_precision_index2=legacy_precision_index2,
+                track_level=track_level,
+                level_smoothing_alpha=level_smoothing_alpha,
+                level_search_span_fraction=level_search_span_fraction,
+                continuity_weight_radii=continuity_weight_radii,
+                continuity_weight_mean_radius=continuity_weight_mean_radius,
+                continuity_weight_center=continuity_weight_center,
+                continuity_weight_area=continuity_weight_area,
+                continuity_weight_level=continuity_weight_level,
                 compute_backend=compute_backend,
                 gpu_device=gpu_device,
             )
@@ -624,6 +748,16 @@ def _sensor_measurements(
     angles: np.ndarray,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
+    boundary_base_mode: BoundaryMode,
+    legacy_precision_index2: float,
+    track_level: bool,
+    level_smoothing_alpha: float,
+    level_search_span_fraction: float,
+    continuity_weight_radii: float,
+    continuity_weight_mean_radius: float,
+    continuity_weight_center: float,
+    continuity_weight_area: float,
+    continuity_weight_level: float,
     compute_backend: str,
     gpu_device: str,
     run_profiler: Profiler,
@@ -661,6 +795,16 @@ def _sensor_measurements(
             angles_rad=angles,
             limiter_shape=limiter_shape,
             boundary_mode=boundary_mode,
+            boundary_base_mode=boundary_base_mode,
+            legacy_precision_index2=legacy_precision_index2,
+            track_level=track_level,
+            level_smoothing_alpha=level_smoothing_alpha,
+            level_search_span_fraction=level_search_span_fraction,
+            continuity_weight_radii=continuity_weight_radii,
+            continuity_weight_mean_radius=continuity_weight_mean_radius,
+            continuity_weight_center=continuity_weight_center,
+            continuity_weight_area=continuity_weight_area,
+            continuity_weight_level=continuity_weight_level,
             compute_backend=compute_backend,
             gpu_device=gpu_device,
         )
@@ -679,9 +823,12 @@ def _compute_controller_commands(
     scenario: Scenario,
     max_episode_steps: int,
     sensors: SensorRealismResult,
+    limiter_shape: np.ndarray | None,
+    boundary_mode: BoundaryMode,
+    legacy_precision_index2: float,
     run_profiler: Profiler,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Вызвать регулятор и вернуть команды производных токов."""
+    """Вызвать регулятор и вернуть абсолютные команды следующего тока."""
     runtime_context = {
         "model": model,
         "psi": psi_meas,
@@ -695,13 +842,16 @@ def _compute_controller_commands(
         "measured_ip": float(sensors.measured_ip),
         "measured_active_currents": np.asarray(sensors.measured_active_currents, dtype=float),
         "measured_radii": None if sensors.measured_radii is None else np.asarray(sensors.measured_radii, dtype=float),
+        "limiter_shape": limiter_shape,
+        "boundary_mode": boundary_mode,
+        "legacy_precision_index2": float(legacy_precision_index2),
     }
     with run_profiler.time_block("step_controller"):
         ctrl_kwargs = build_controller_runtime_call(controller_name, runtime_context)
         action = controller.compute_control(**ctrl_kwargs)
     if not isinstance(action, ControlAction):
         raise TypeError("Controller must return ControlAction")
-    return np.asarray(action.pfc_derivs, dtype=float), np.asarray(action.sol_derivs, dtype=float)
+    return np.asarray(action.pfc_currents_next, dtype=float), np.asarray(action.sol_currents_next, dtype=float)
 
 
 def _effective_commands(
@@ -711,7 +861,7 @@ def _effective_commands(
     sol_cmd: np.ndarray,
     run_profiler: Profiler,
 ) -> _StepCommands:
-    """Применить реализм исполнительных устройств к командам регулятора."""
+    """Применить слой реализма к абсолютным командам следующего тока."""
     if realism is None:
         return _StepCommands(pfc_cmd=pfc_cmd, sol_cmd=sol_cmd, pfc_eff=pfc_cmd, sol_eff=sol_cmd)
     with run_profiler.time_block("step_actuation_realism"):
@@ -731,9 +881,9 @@ def _advance_model_state(
 ) -> tuple[PlasmaState, list[str], np.ndarray]:
     """Продвинуть модель на шаг и вернуть обновленное состояние и psi."""
     with run_profiler.time_block("step_model"):
-        state = model.step(
-            pfc_current_derivs=commands.pfc_eff,
-            sol_current_derivs=commands.sol_eff,
+        state = model.step_currents(
+            pfc_currents_next=commands.pfc_eff,
+            sol_currents_next=commands.sol_eff,
         )
     with run_profiler.time_block("step_disturbances"):
         state, disturbances_applied = apply_prepared_disturbances(
@@ -760,6 +910,16 @@ def _update_boundary_tracker(
     refs: _StepRefs,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
+    boundary_base_mode: BoundaryMode,
+    legacy_precision_index2: float,
+    track_level: bool,
+    level_smoothing_alpha: float,
+    level_search_span_fraction: float,
+    continuity_weight_radii: float,
+    continuity_weight_mean_radius: float,
+    continuity_weight_center: float,
+    continuity_weight_area: float,
+    continuity_weight_level: float,
     compute_backend: str,
     gpu_device: str,
     logger: logging.Logger,
@@ -782,6 +942,16 @@ def _update_boundary_tracker(
                 target_mean_radius=refs.target_mean_radius,
                 limiter_shape=limiter_shape,
                 boundary_mode=boundary_mode,
+                boundary_base_mode=boundary_base_mode,
+                legacy_precision_index2=legacy_precision_index2,
+                track_level=track_level,
+                level_smoothing_alpha=level_smoothing_alpha,
+                level_search_span_fraction=level_search_span_fraction,
+                continuity_weight_radii=continuity_weight_radii,
+                continuity_weight_mean_radius=continuity_weight_mean_radius,
+                continuity_weight_center=continuity_weight_center,
+                continuity_weight_area=continuity_weight_area,
+                continuity_weight_level=continuity_weight_level,
                 compute_backend=compute_backend,
                 gpu_device=gpu_device,
             )
@@ -809,15 +979,12 @@ def _build_step_record(
     tracker: _BoundaryTracker,
     sensors: SensorRealismResult,
     disturbances_applied: list[str],
+    controller_diagnostics: dict[str, object],
     run_profiler: Profiler,
 ) -> _StepRecord:
     """Собрать данные шага перед записью в RunWriter."""
     with run_profiler.time_block("step_radii_true"):
-        radii_true = (
-            radii_from_polyline_ray_intersections(tracker.poly, center, angles)
-            if tracker.poly is not None
-            else np.full((angles.shape[0],), np.nan, dtype=float)
-        )
+        radii_true = _legacy_radii(tracker.poly, center, angles)
     if sensors.true_radii is None or not np.allclose(np.asarray(sensors.true_radii, dtype=float), radii_true, equal_nan=True):
         sensors = SensorRealismResult(
             true_ip=sensors.true_ip,
@@ -843,6 +1010,7 @@ def _build_step_record(
         ip_ref_log=ip_ref_log,
         sensors=sensors,
         disturbances_applied=disturbances_applied,
+        controller_diagnostics=dict(controller_diagnostics),
     )
 
 
@@ -871,10 +1039,10 @@ def _write_step_record(
             sol_currents=np.asarray(state.sol_currents, dtype=float),
             sol_derivs=np.asarray(state.sol_current_derivs, dtype=float),
             psi=(_as_numpy_psi(psi_true) if snapshot_every > 0 and ((step_index + 1) % snapshot_every == 0) else None),
-            pfc_derivs_cmd=commands.pfc_cmd,
-            sol_derivs_cmd=commands.sol_cmd,
-            pfc_derivs_eff=commands.pfc_eff,
-            sol_derivs_eff=commands.sol_eff,
+            pfc_currents_cmd=commands.pfc_cmd,
+            sol_currents_cmd=commands.sol_cmd,
+            pfc_currents_eff=commands.pfc_eff,
+            sol_currents_eff=commands.sol_eff,
             psi_latest=_as_numpy_psi(psi_true),
             step=int(state.step),
             Ip_ref=record.ip_ref_log,
@@ -887,21 +1055,23 @@ def _write_step_record(
             boundary_poly_true=tracker.poly,
             boundary_poly_meas=sensors.measured_boundary_poly,
         )
+        event_payload = {
+            "type": "step",
+            "k": int(state.step),
+            "t": float(state.t),
+            "Ip": float(state.Ip),
+            "Ip_ref": float(record.ip_ref_log),
+            "target_mean_radius": record.refs.target_mean_radius,
+            "boundary_status": tracker.status,
+            "boundary_found": bool(tracker.found),
+            "boundary_fail_reason": tracker.fail_reason,
+            "norm_u_pfc": float(np.linalg.norm(commands.pfc_cmd)),
+            "norm_u_sol": float(np.linalg.norm(commands.sol_cmd)),
+            "disturbances_applied": record.disturbances_applied,
+        }
+        event_payload.update(record.controller_diagnostics)
         writer.log_event(
-            {
-                "type": "step",
-                "k": int(state.step),
-                "t": float(state.t),
-                "Ip": float(state.Ip),
-                "Ip_ref": float(record.ip_ref_log),
-                "target_mean_radius": record.refs.target_mean_radius,
-                "boundary_status": tracker.status,
-                "boundary_found": bool(tracker.found),
-                "boundary_fail_reason": tracker.fail_reason,
-                "norm_u_pfc": float(np.linalg.norm(commands.pfc_cmd)),
-                "norm_u_sol": float(np.linalg.norm(commands.sol_cmd)),
-                "disturbances_applied": record.disturbances_applied,
-            }
+            event_payload
         )
 
 
@@ -920,6 +1090,16 @@ def _run_single_step(
     center: tuple[float, float],
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
+    boundary_base_mode: BoundaryMode,
+    legacy_precision_index2: float,
+    track_level: bool,
+    level_smoothing_alpha: float,
+    level_search_span_fraction: float,
+    continuity_weight_radii: float,
+    continuity_weight_mean_radius: float,
+    continuity_weight_center: float,
+    continuity_weight_area: float,
+    continuity_weight_level: float,
     compute_backend: str,
     gpu_device: str,
     angles: np.ndarray,
@@ -933,11 +1113,7 @@ def _run_single_step(
     """Выполнить один полный шаг замкнутой симуляции."""
     with run_profiler.time_block("step_scenario"):
         refs = _scenario_refs(scenario, angles, float(model.state.t))
-    radii_pre = (
-        radii_from_polyline_ray_intersections(tracker.poly, center, angles)
-        if tracker.poly is not None
-        else np.full((angles.shape[0],), np.nan, dtype=float)
-    )
+    radii_pre = _legacy_radii(tracker.poly, center, angles)
     sensors_pre = _sensor_measurements(
         realism=realism,
         model=model,
@@ -948,6 +1124,16 @@ def _run_single_step(
         angles=angles,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
+        boundary_base_mode=boundary_base_mode,
+        legacy_precision_index2=legacy_precision_index2,
+        track_level=track_level,
+        level_smoothing_alpha=level_smoothing_alpha,
+        level_search_span_fraction=level_search_span_fraction,
+        continuity_weight_radii=continuity_weight_radii,
+        continuity_weight_mean_radius=continuity_weight_mean_radius,
+        continuity_weight_center=continuity_weight_center,
+        continuity_weight_area=continuity_weight_area,
+        continuity_weight_level=continuity_weight_level,
         compute_backend=compute_backend,
         gpu_device=gpu_device,
         run_profiler=run_profiler,
@@ -966,6 +1152,9 @@ def _run_single_step(
         scenario=scenario,
         max_episode_steps=steps,
         sensors=sensors_pre,
+        limiter_shape=limiter_shape,
+        boundary_mode=boundary_mode,
+        legacy_precision_index2=legacy_precision_index2,
         run_profiler=run_profiler,
     )
     commands = _effective_commands(
@@ -991,6 +1180,16 @@ def _run_single_step(
         refs=refs,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
+        boundary_base_mode=boundary_base_mode,
+        legacy_precision_index2=legacy_precision_index2,
+        track_level=track_level,
+        level_smoothing_alpha=level_smoothing_alpha,
+        level_search_span_fraction=level_search_span_fraction,
+        continuity_weight_radii=continuity_weight_radii,
+        continuity_weight_mean_radius=continuity_weight_mean_radius,
+        continuity_weight_center=continuity_weight_center,
+        continuity_weight_area=continuity_weight_area,
+        continuity_weight_level=continuity_weight_level,
         compute_backend=compute_backend,
         gpu_device=gpu_device,
         logger=logger,
@@ -998,11 +1197,7 @@ def _run_single_step(
         step_index=step_index,
         run_profiler=run_profiler,
     )
-    radii_post = (
-        radii_from_polyline_ray_intersections(tracker.poly, center, angles)
-        if tracker.poly is not None
-        else np.full((angles.shape[0],), np.nan, dtype=float)
-    )
+    radii_post = _legacy_radii(tracker.poly, center, angles)
     sensors_post = _sensor_measurements(
         realism=realism,
         model=model,
@@ -1013,6 +1208,16 @@ def _run_single_step(
         angles=angles,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
+        boundary_base_mode=boundary_base_mode,
+        legacy_precision_index2=legacy_precision_index2,
+        track_level=track_level,
+        level_smoothing_alpha=level_smoothing_alpha,
+        level_search_span_fraction=level_search_span_fraction,
+        continuity_weight_radii=continuity_weight_radii,
+        continuity_weight_mean_radius=continuity_weight_mean_radius,
+        continuity_weight_center=continuity_weight_center,
+        continuity_weight_area=continuity_weight_area,
+        continuity_weight_level=continuity_weight_level,
         compute_backend=compute_backend,
         gpu_device=gpu_device,
         run_profiler=run_profiler,
@@ -1028,6 +1233,7 @@ def _run_single_step(
         tracker=tracker,
         sensors=sensors_post,
         disturbances_applied=disturbances_applied,
+        controller_diagnostics=_controller_diagnostics(controller),
         run_profiler=run_profiler,
     )
     _write_step_record(
@@ -1074,7 +1280,7 @@ def _log_verbose_step(
     report_every = max(1, min(100, int(steps) // 20 or 1))
     if (step_index + 1) % report_every != 0 and (step_index + 1) != int(steps):
         return
-    logger.info("Step %d/%d t=%.6f Ip=%.6g ||u_pfc||=%.3e ||u_sol||=%.3e", step_index + 1, int(steps), float(record.state.t), float(record.state.Ip), float(np.linalg.norm(record.commands.pfc_cmd)), float(np.linalg.norm(record.commands.sol_cmd)))
+    logger.info("Step %d/%d t=%.6f Ip=%.6g ||Jnext_pfc||=%.3e ||Jnext_sol||=%.3e", step_index + 1, int(steps), float(record.state.t), float(record.state.Ip), float(np.linalg.norm(record.commands.pfc_cmd)), float(np.linalg.norm(record.commands.sol_cmd)))
 
 
 def _write_profile_summary(
@@ -1103,7 +1309,7 @@ def run(
     initial_currents_path: str | Path | None = None,
     steps: int,
     output_dir: str | Path | None,
-    controller_name: str = "lqr_boundary",
+    controller_name: str = "lqr_t15_zaitsev",
     controller_params: Mapping[str, object] | None = None,
     M_angles: int = 16,
     scenario_name: ScenarioName = "nominal",
@@ -1189,6 +1395,7 @@ def run(
             M_angles=M_angles,
             scenario_name=scenario_name,
             scenario_params=scenario_params,
+            controller_name=canonical_controller_name,
         )
 
     with run_profiler.time_block("prepare_disturbances"):
@@ -1225,6 +1432,16 @@ def run(
         target_mean_radius=initial_refs.target_mean_radius,
         limiter_shape=cfg_runtime.limiter_shape,
         boundary_mode=cfg_runtime.boundary_mode,
+        boundary_base_mode=cfg_runtime.boundary_base_mode,
+        legacy_precision_index2=cfg_runtime.boundary_legacy_precision_index2,
+        track_level=cfg_runtime.boundary_track_level,
+        level_smoothing_alpha=cfg_runtime.boundary_level_smoothing_alpha,
+        level_search_span_fraction=cfg_runtime.boundary_level_search_span_fraction,
+        continuity_weight_radii=cfg_runtime.boundary_continuity_weight_radii,
+        continuity_weight_mean_radius=cfg_runtime.boundary_continuity_weight_mean_radius,
+        continuity_weight_center=cfg_runtime.boundary_continuity_weight_center,
+        continuity_weight_area=cfg_runtime.boundary_continuity_weight_area,
+        continuity_weight_level=cfg_runtime.boundary_continuity_weight_level,
         compute_backend=cfg_runtime.compute.backend,
         gpu_device=cfg_runtime.compute.gpu_device,
         logger=logger,
@@ -1260,6 +1477,16 @@ def run(
                         center=center,
                         limiter_shape=cfg_runtime.limiter_shape,
                         boundary_mode=cfg_runtime.boundary_mode,
+                        boundary_base_mode=cfg_runtime.boundary_base_mode,
+                        legacy_precision_index2=cfg_runtime.boundary_legacy_precision_index2,
+                        track_level=cfg_runtime.boundary_track_level,
+                        level_smoothing_alpha=cfg_runtime.boundary_level_smoothing_alpha,
+                        level_search_span_fraction=cfg_runtime.boundary_level_search_span_fraction,
+                        continuity_weight_radii=cfg_runtime.boundary_continuity_weight_radii,
+                        continuity_weight_mean_radius=cfg_runtime.boundary_continuity_weight_mean_radius,
+                        continuity_weight_center=cfg_runtime.boundary_continuity_weight_center,
+                        continuity_weight_area=cfg_runtime.boundary_continuity_weight_area,
+                        continuity_weight_level=cfg_runtime.boundary_continuity_weight_level,
                         compute_backend=cfg_runtime.compute.backend,
                         gpu_device=cfg_runtime.compute.gpu_device,
                         angles=angles,

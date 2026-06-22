@@ -37,6 +37,7 @@ ScenarioName = Literal[
     "joint_disturbance",
     "shot_follow",
     "ip_table",
+    "t15_replay_reference",
     "ip_follow",
     "t15_synthetic_follow",
     "t15_training_circle_static",
@@ -426,6 +427,39 @@ def _interp_clamped(query_t: float, t: np.ndarray, y: np.ndarray) -> float:
     return float(np.interp(tq, t, y))
 
 
+def _interp_matrix_clamped(query_t: float, t: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Interpolate a matrix-valued time series row by row, clamped at edges."""
+    t_arr = np.asarray(t, dtype=float).reshape(-1)
+    y_arr = np.asarray(y, dtype=float)
+    if y_arr.ndim != 2 or y_arr.shape[0] != t_arr.size:
+        raise ValueError(f"Expected y with shape (len(t), N), got t={t_arr.shape} y={y_arr.shape}")
+    tq = float(np.clip(query_t, float(t_arr[0]), float(t_arr[-1])))
+    return np.asarray([np.interp(tq, t_arr, y_arr[:, j]) for j in range(y_arr.shape[1])], dtype=float)
+
+
+def _periodic_angle_resample(source_angles: np.ndarray, source_values: np.ndarray, target_angles: np.ndarray) -> np.ndarray:
+    """Periodically resample one angular profile onto target angles."""
+    src_angles = np.asarray(source_angles, dtype=float).reshape(-1)
+    values = np.asarray(source_values, dtype=float).reshape(-1)
+    targets = np.asarray(target_angles, dtype=float).reshape(-1)
+    if src_angles.shape != values.shape:
+        raise ValueError(f"source_angles/value shape mismatch: {src_angles.shape} vs {values.shape}")
+    if src_angles.size < 2:
+        raise ValueError("At least two source angles are required")
+    order = np.argsort(src_angles)
+    src = src_angles[order]
+    vals = values[order]
+    src_norm = ((src + np.pi) % (2.0 * np.pi)) - np.pi
+    order = np.argsort(src_norm)
+    src_norm = src_norm[order]
+    vals = vals[order]
+    src_ext = np.concatenate([src_norm, src_norm[:1] + 2.0 * np.pi])
+    vals_ext = np.concatenate([vals, vals[:1]])
+    tq = ((targets + np.pi) % (2.0 * np.pi)) - np.pi
+    tq = np.where(tq < src_norm[0], tq + 2.0 * np.pi, tq)
+    return np.interp(tq, src_ext, vals_ext)
+
+
 def _interp_polyline_clamped(
     query_t: float,
     t_samples: np.ndarray,
@@ -549,6 +583,70 @@ def make_ip_table(
         return _interp_clamped(float(t), t_ip, ip_vals)
 
     return Scenario("ip_table", _r, _ip)
+
+
+def make_t15_replay_reference(
+    base_radii: np.ndarray,
+    Ip0: float,
+    *,
+    reference_npz: str | Path,
+    boundary_channel: str = "radii_true",
+    time_offset: float | None = None,
+) -> Scenario:
+    """Follow Ip and boundary-radii references exported from a T15 replay dataset."""
+    del base_radii, Ip0
+
+    path = Path(reference_npz).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Scenario 't15_replay_reference' could not find {path}")
+
+    with np.load(path, allow_pickle=False) as data:
+        files = set(data.files)
+        required = {"t", "angles_rad", boundary_channel}
+        missing = sorted(required - files)
+        if missing:
+            raise ValueError(f"Scenario 't15_replay_reference' reference is missing: {', '.join(missing)}")
+        source_t = np.asarray(data["t"], dtype=float).reshape(-1)
+        source_angles = np.asarray(data["angles_rad"], dtype=float).reshape(-1)
+        source_radii = np.asarray(data[boundary_channel], dtype=float)
+        if "Ip_ref" in files:
+            ip_vals = np.asarray(data["Ip_ref"], dtype=float).reshape(-1)
+        elif "Ip" in files:
+            ip_vals = np.asarray(data["Ip"], dtype=float).reshape(-1)
+        else:
+            raise ValueError("Scenario 't15_replay_reference' requires Ip_ref or Ip in reference_npz")
+
+    if source_t.ndim != 1 or source_t.size < 2:
+        raise ValueError("Scenario 't15_replay_reference' requires at least two time samples")
+    if np.any(np.diff(source_t) < 0.0):
+        raise ValueError("Scenario 't15_replay_reference' requires nondecreasing reference times")
+    if source_radii.ndim != 2 or source_radii.shape != (source_t.size, source_angles.size):
+        raise ValueError(
+            "Scenario 't15_replay_reference' requires boundary radii with "
+            f"shape ({source_t.size}, {source_angles.size}), got {source_radii.shape}"
+        )
+    if ip_vals.shape != source_t.shape:
+        raise ValueError(f"Scenario 't15_replay_reference' Ip shape {ip_vals.shape} != t shape {source_t.shape}")
+
+    if time_offset is None:
+        origin = 0.0
+    else:
+        origin = float(time_offset)
+        if not np.isfinite(origin):
+            raise ValueError("Scenario parameter 'time_offset' must be finite when provided")
+    t_ref = source_t - origin
+
+    def _r(angles: np.ndarray, t: float) -> np.ndarray:
+        values = _interp_matrix_clamped(float(t), t_ref, source_radii)
+        target_angles = np.asarray(angles, dtype=float).reshape(-1)
+        if target_angles.shape == source_angles.shape and np.allclose(target_angles, source_angles, atol=1e-12, rtol=0.0):
+            return values
+        return _periodic_angle_resample(source_angles, values, target_angles)
+
+    def _ip(t: float) -> float:
+        return _interp_clamped(float(t), t_ref, ip_vals)
+
+    return Scenario("t15_replay_reference", _r, _ip)
 
 
 
@@ -1172,6 +1270,27 @@ def make_scenario(
             base_radii,
             Ip0,
             ip_csv=ip_csv,
+            time_offset=time_offset,
+        )
+
+    if name == "t15_replay_reference":
+        _require_params(
+            name,
+            params,
+            required=("reference_npz",),
+            optional=("boundary_channel", "time_offset"),
+        )
+        reference_npz = str(params["reference_npz"])
+        boundary_channel = "radii_true" if "boundary_channel" not in params else str(params["boundary_channel"])
+        time_offset = (
+            None if "time_offset" not in params
+            else _coerce_float_param(params, "time_offset")
+        )
+        return make_t15_replay_reference(
+            base_radii,
+            Ip0,
+            reference_npz=reference_npz,
+            boundary_channel=boundary_channel,
             time_offset=time_offset,
         )
 

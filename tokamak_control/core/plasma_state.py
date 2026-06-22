@@ -16,10 +16,11 @@ class PlasmaState:
     simulation. ``CoilGroup`` objects define static coil-bank specification plus
     initial-current values only.
 
-    The coil derivative fields represent the *applied* derivatives used to
-    integrate coil currents over the last step. If actuator lag is enabled in
-    ``PlasmaModel``, these may differ from the commanded derivatives provided to
-    ``PlasmaModel.step()``.
+    The coil derivative fields are diagnostics derived from the last
+    absolute-current command:
+    ``(current_next - current_previous) / t_step``.  The active plant API is
+    ``PlasmaModel.step_currents(...)``; derivative commands are not a public
+    plant input.
 
     Attributes
     ----------
@@ -30,7 +31,8 @@ class PlasmaState:
     Ip : float
         Plasma current (A).
     Ip0 : float
-        Initial plasma current at t=0 (A); used by the simple relaxation model.
+        Initial plasma current at t=0 (A); retained for diagnostics and reset
+        bookkeeping.
     psi : np.ndarray
         Poloidal flux array with shape (nz, nr).
     pfc_currents : np.ndarray
