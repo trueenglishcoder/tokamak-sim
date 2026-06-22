@@ -102,6 +102,8 @@ _LEARNED_MAGNETIC_CONTROLLER_PARAMS: tuple[ControllerLaunchParam, ...] = (
     ControllerLaunchParam("export_dir", Path, True, None, _validate_existing_path("export_dir")),
     ControllerLaunchParam("target_preview_stride", int | None, False, None, _validate_positive_int("target_preview_stride")),
     ControllerLaunchParam("action_clip", float, False, 1.0, _validate_finite_positive("action_clip")),
+    ControllerLaunchParam("episode_norm_steps", int | None, False, None, _validate_positive_int("episode_norm_steps")),
+    ControllerLaunchParam("rolling_episode_norm", bool, False, False),
 )
 
 

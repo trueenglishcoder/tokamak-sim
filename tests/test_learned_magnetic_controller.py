@@ -181,6 +181,34 @@ def test_learned_controller_zero_action_holds_currents(tmp_path: Path) -> None:
     assert np.allclose(action.sol_currents_next, model.state.sol_currents)
 
 
+def test_learned_controller_can_use_rolling_training_horizon_norm(tmp_path: Path) -> None:
+    """Full-shot deployment can keep the 0.1 s training step normalization."""
+    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    model.state.step = 157
+    export = tmp_path / "export"
+    _write_v4_export(export, model=model, n_angles=4, mean_bias=0.0)
+    controller = make_controller(
+        "learned_magnetic_controller",
+        config={"export_dir": export, "episode_norm_steps": 100, "rolling_episode_norm": True},
+    )
+    ctx = _runtime_context(model, cfg, n_angles=4)
+    obs = controller._observation(
+        model=ctx["model"],
+        psi=ctx["psi"],
+        boundary_poly=ctx["boundary_poly"],
+        center=ctx["center"],
+        measure_angles=ctx["measure_angles"],
+        ref_radii=ctx["ref_radii"],
+        ip_ref=float(ctx["Ip_ref"]),
+        scenario=ctx["scenario"],
+        max_episode_steps=1439,
+    )
+    slices, _obs_dim = _feature_slices(action_dim=model.pfc.n_coils + model.sol.n_coils, n_angles=4, preview_steps=0)
+    start, stop = slices["step_norm"]
+    assert np.allclose(obs[start:stop], np.asarray([57.0 / 100.0], dtype=np.float32))
+
+
 def test_learned_controller_rejects_old_action_contract(tmp_path: Path) -> None:
     """Old learned exports must not silently run under the v4 plant contract."""
     cfg = load_config(CONFIG, initial_currents_path=INITIAL)

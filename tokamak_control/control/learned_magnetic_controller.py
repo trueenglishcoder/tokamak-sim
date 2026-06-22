@@ -74,6 +74,8 @@ class LearnedMagneticController(Controller):
         export_dir: str | Path,
         target_preview_stride: int | None = None,
         action_clip: float = 1.0,
+        episode_norm_steps: int | None = None,
+        rolling_episode_norm: bool = False,
     ) -> None:
         self.export_dir = Path(export_dir).expanduser()
         if not self.export_dir.is_dir():
@@ -107,6 +109,10 @@ class LearnedMagneticController(Controller):
             raise ValueError("target_preview_steps must be >= 0")
         if self.target_preview_stride <= 0:
             raise ValueError("target_preview_stride must be > 0")
+        self.episode_norm_steps = None if episode_norm_steps is None else int(episode_norm_steps)
+        if self.episode_norm_steps is not None and self.episode_norm_steps <= 0:
+            raise ValueError("episode_norm_steps must be > 0 when provided")
+        self.rolling_episode_norm = bool(rolling_episode_norm)
 
         self.layer_norm_eps = float(self.metadata.get("layer_norm_eps", 1.0e-5))
         self.ip_scale = _positive_scale(self.normalization.get("ip_scale", 1.0), "ip_scale")
@@ -245,7 +251,7 @@ class LearnedMagneticController(Controller):
         derivative_scale = np.where(self.derivative_scale > 0.0, self.derivative_scale, 1.0)
         measured_ip = float(model.state.Ip)
         features = {
-            "step_norm": np.array([float(model.state.step) / max(float(max_episode_steps), 1.0)], dtype=float),
+            "step_norm": np.array([self._step_norm(model=model, max_episode_steps=max_episode_steps)], dtype=float),
             "ip": np.array([measured_ip / self.ip_scale], dtype=float),
             "ip_ref": np.array([float(ip_ref) / self.ip_scale], dtype=float),
             "ip_error": np.array([(measured_ip - float(ip_ref)) / self.ip_scale], dtype=float),
@@ -272,10 +278,23 @@ class LearnedMagneticController(Controller):
             return np.zeros((0,), dtype=float)
         offsets = np.arange(1, self.target_preview_steps + 1, dtype=float) * float(self.target_preview_stride)
         times = float(model.state.t) + offsets * float(model.t_step)
-        time_norm = offsets / max(float(max_episode_steps), 1.0)
+        horizon = self._normalization_horizon(max_episode_steps=max_episode_steps)
+        time_norm = offsets / horizon
         ip_preview = np.asarray([float(scenario.Ip_ref(float(t))) for t in times], dtype=float) / self.ip_scale
         radii_preview = np.stack([np.asarray(scenario.ref_radii(angles, float(t)), dtype=float).reshape(-1) for t in times], axis=0) / self.radius_scale
         return np.concatenate([time_norm, ip_preview, radii_preview.reshape(-1)], dtype=float)
+
+    def _normalization_horizon(self, *, max_episode_steps: int) -> float:
+        if self.episode_norm_steps is not None:
+            return float(self.episode_norm_steps)
+        return max(float(max_episode_steps), 1.0)
+
+    def _step_norm(self, *, model, max_episode_steps: int) -> float:
+        horizon = self._normalization_horizon(max_episode_steps=max_episode_steps)
+        step = float(model.state.step)
+        if self.rolling_episode_norm and self.episode_norm_steps is not None:
+            step = float(int(model.state.step) % int(self.episode_norm_steps))
+        return step / horizon
 
     def _deterministic_action(self, observation: np.ndarray) -> np.ndarray:
         x = _linear(observation.astype(np.float32, copy=False), self.weights["input.weight"], self.weights["input.bias"])
