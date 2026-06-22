@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 import sys
 
@@ -199,6 +200,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Render video.mp4 from saved frames using ffmpeg. Implies --frames.",
     )
     ap.add_argument(
+        "--remove-frames-after-video",
+        action="store_true",
+        help="Delete rendered frame PNGs after the mp4 is created. Useful on quota-limited servers.",
+    )
+    ap.add_argument(
         "--fps",
         type=int,
         default=10,
@@ -271,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     frame_stride = max(int(args.frame_stride), 1)
     frame_dpi = max(int(args.frame_dpi), 40)
     save_frames = bool(args.frames or args.video)
-    snapshot_every = 1 if save_frames else args.steps
+    snapshot_every = frame_stride if save_frames else args.steps
 
     result = run_simulation(
         config=Path(args.config),
@@ -365,6 +371,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.video:
             video_path = out_dir / f"video{run_id}.mp4"
             frames_to_video(frames_dir=frames_dir, video_path=video_path, fps=args.fps)
+            if args.remove_frames_after_video:
+                shutil.rmtree(frames_dir)
+                frames_dir = None
 
     print(str(out_dir))
     print(str(result.manifest_path))
