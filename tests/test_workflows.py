@@ -252,13 +252,14 @@ def test_grid_config_uses_range_and_derives_original_step(tmp_path: Path) -> Non
 
 
 def test_split_t15md_boundary_uses_limiter_contact_by_default() -> None:
-    """Проверить, что T15MD по умолчанию ищет limited-границу на лимитере."""
+    """Проверить, что T15MD по умолчанию использует лимитерный legacy/tracked контур."""
     _require_local_paths(SMOKE_CONFIG, SMOKE_INITIAL_CURRENTS)
     cfg = load_config(
         REPO_ROOT / "configs/T15MD_new_data.toml",
         initial_currents_path=REPO_ROOT / "configs/initial_currents/T15MD_new_data_3864.toml",
     )
-    assert cfg.boundary_mode == "limited"
+    assert cfg.boundary_mode == "tracked_flux_contour"
+    assert cfg.boundary_base_mode == "legacy_contour_limited"
     assert cfg.limiter_name == "T15MD"
     assert cfg.limiter_shape is not None
 
@@ -277,7 +278,7 @@ def test_split_t15md_boundary_uses_limiter_contact_by_default() -> None:
         boundary_mode=cfg.boundary_mode,
     )
 
-    assert status == "limited_success"
+    assert status in {"tracked_flux_contour_success", "tracked_flux_contour_reset"}
     assert poly.shape[0] >= 3
 
 

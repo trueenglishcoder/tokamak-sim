@@ -12,15 +12,17 @@ import subprocess
 import sys
 from collections import Counter
 from typing import Iterable
+import tomllib
 
 import numpy as np
+import tomli_w
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tokamak_control.io.config_io import dump_config, load_config
+from tokamak_control.io.config_io import load_config
 from tokamak_control.io.data_io import load_run
 
 
@@ -63,28 +65,29 @@ def _read_events(path: Path | None) -> tuple[list[dict[str, str]], Counter[str]]
 
 
 def _write_strict_limited_config(*, base_config: Path, out_path: Path, legacy_precision_index2: float) -> Path:
-    cfg = load_config(base_config)
-    dump_config(
-        out_path,
-        cfg.grid,
-        cfg.pfc,
-        cfg.sol,
-        cfg.physics,
-        compute=cfg.compute,
-        realism=cfg.realism,
-        limiter_name=cfg.limiter_name,
-        boundary_mode="legacy_contour_limited",
-        boundary_base_mode="legacy_contour_limited",
-        boundary_legacy_precision_index2=float(legacy_precision_index2),
-        boundary_track_level=False,
-        boundary_level_smoothing_alpha=1.0,
-        boundary_level_search_span_fraction=0.02,
-        boundary_continuity_weight_radii=1.0,
-        boundary_continuity_weight_mean_radius=0.3,
-        boundary_continuity_weight_center=0.2,
-        boundary_continuity_weight_area=0.2,
-        boundary_continuity_weight_level=0.1,
+    with base_config.open("rb") as handle:
+        data = tomllib.load(handle)
+    boundary = data.setdefault("boundary", {})
+    if not isinstance(boundary, dict):
+        raise ValueError(f"{base_config} boundary section must be a TOML table")
+    boundary.update(
+        {
+            "mode": "legacy_contour_limited",
+            "base_mode": "legacy_contour_limited",
+            "legacy_precision_index2": float(legacy_precision_index2),
+            "track_level": False,
+            "level_smoothing_alpha": 1.0,
+            "level_search_span_fraction": 0.02,
+            "continuity_weight_radii": 1.0,
+            "continuity_weight_mean_radius": 0.3,
+            "continuity_weight_center": 0.2,
+            "continuity_weight_area": 0.2,
+            "continuity_weight_level": 0.1,
+        }
     )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("wb") as handle:
+        tomli_w.dump(data, handle)
     loaded = load_config(out_path)
     if loaded.boundary_mode != "legacy_contour_limited":
         raise RuntimeError(f"Strict replay config did not persist legacy_contour_limited: {loaded.boundary_mode!r}")
@@ -93,10 +96,24 @@ def _write_strict_limited_config(*, base_config: Path, out_path: Path, legacy_pr
     return out_path
 
 
-def _validate_shot_files(shot: str) -> tuple[Path, Path, Path]:
-    coils = REPO_ROOT / "data" / "t15_data_new" / "coils" / f"t15md_{shot}_coils.csv"
-    ip = REPO_ROOT / "data" / "t15_data_new" / "ip" / f"t15md_{shot}_ip.csv"
-    init = REPO_ROOT / "configs" / "initial_currents" / f"T15MD_new_data_{shot}.toml"
+def _discover_data_shots(data_root: Path) -> list[str]:
+    """Найти разряды по наличию пар ip/coils CSV."""
+    ip_dir = data_root / "ip"
+    coils_dir = data_root / "coils"
+    if not ip_dir.is_dir() or not coils_dir.is_dir():
+        raise FileNotFoundError(f"data root must contain ip/ and coils/: {data_root}")
+    ip_shots = {path.name.removeprefix("t15md_").removesuffix("_ip.csv") for path in ip_dir.glob("t15md_*_ip.csv")}
+    coil_shots = {path.name.removeprefix("t15md_").removesuffix("_coils.csv") for path in coils_dir.glob("t15md_*_coils.csv")}
+    shots = sorted(ip_shots & coil_shots, key=lambda value: int(value))
+    if not shots:
+        raise FileNotFoundError(f"no paired replay shots found in {data_root}")
+    return shots
+
+
+def _validate_shot_files(shot: str, *, data_root: Path, initial_prefix: str) -> tuple[Path, Path, Path]:
+    coils = data_root / "coils" / f"t15md_{shot}_coils.csv"
+    ip = data_root / "ip" / f"t15md_{shot}_ip.csv"
+    init = REPO_ROOT / "configs" / "initial_currents" / f"{initial_prefix}_{shot}.toml"
     missing = [str(p) for p in (coils, ip, init) if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Shot {shot} is missing required files: {', '.join(missing)}")
@@ -111,6 +128,8 @@ def _run_one_shot(
     *,
     shot: str,
     config: Path,
+    data_root: Path,
+    initial_prefix: str,
     dataset_root: Path,
     angles: int,
     frame_stride: int,
@@ -118,7 +137,7 @@ def _run_one_shot(
     fps: int,
     dry_run: bool,
 ) -> Path | None:
-    coils, ip, init = _validate_shot_files(shot)
+    coils, ip, init = _validate_shot_files(shot, data_root=data_root, initial_prefix=initial_prefix)
     steps = _count_rows(ip)
     shot_parent = dataset_root / f"t15md_limited_replay_{shot}"
     before = {p.resolve() for p in shot_parent.iterdir() if p.is_dir()} if shot_parent.exists() else set()
@@ -324,8 +343,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run exact T15MD limited current replays and export LQR boundary reference files."
     )
-    parser.add_argument("--shots", nargs="+", default=list(DEFAULT_SHOTS), help="Shot ids to run.")
+    parser.add_argument("--shots", nargs="+", default=list(DEFAULT_SHOTS), help="Shot ids to run, or 'auto' for every paired shot.")
     parser.add_argument("--config", default="configs/T15MD_new_data.toml", help="Base config to copy from.")
+    parser.add_argument("--data-root", default="data/t15_data_new", help="Replay data root with ip/ and coils/ subdirectories.")
+    parser.add_argument("--initial-prefix", default="T15MD_new_data", help="Prefix for configs/initial_currents/<prefix>_<shot>.toml")
+    parser.add_argument("--strict-config-name", default=None, help="Filename for the generated strict replay config.")
     parser.add_argument("--out", default="runs/t15md_limited_replay_dataset", help="Dataset output root.")
     parser.add_argument("--angles", type=int, default=32, help="Boundary radii sample count to store.")
     parser.add_argument("--legacy-precision-index2", type=float, default=1.0e-3)
@@ -335,22 +357,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print commands and validate inputs without running.")
     args = parser.parse_args(argv)
 
+    data_root = (REPO_ROOT / args.data_root).resolve() if not Path(args.data_root).is_absolute() else Path(args.data_root)
+    shots = _discover_data_shots(data_root) if len(args.shots) == 1 and str(args.shots[0]).lower() == "auto" else [str(shot) for shot in args.shots]
     dataset_root = (REPO_ROOT / args.out).resolve() if not Path(args.out).is_absolute() else Path(args.out)
     dataset_root.mkdir(parents=True, exist_ok=True)
+    strict_config_name = args.strict_config_name or f"{Path(args.config).stem}_legacy_contour_limited_replay.toml"
+    base_config = (REPO_ROOT / args.config).resolve() if not Path(args.config).is_absolute() else Path(args.config)
     config = _write_strict_limited_config(
-        base_config=(REPO_ROOT / args.config),
-        out_path=dataset_root / "T15MD_new_data_legacy_contour_limited_replay.toml",
+        base_config=base_config,
+        out_path=dataset_root / strict_config_name,
         legacy_precision_index2=float(args.legacy_precision_index2),
     )
 
-    for shot in args.shots:
-        _validate_shot_files(str(shot))
+    for shot in shots:
+        _validate_shot_files(str(shot), data_root=data_root, initial_prefix=str(args.initial_prefix))
 
     rows: list[dict[str, object]] = []
-    for shot in args.shots:
+    for shot in shots:
         run_dir = _run_one_shot(
             shot=str(shot),
             config=config,
+            data_root=data_root,
+            initial_prefix=str(args.initial_prefix),
             dataset_root=dataset_root,
             angles=int(args.angles),
             frame_stride=int(args.frame_stride),
