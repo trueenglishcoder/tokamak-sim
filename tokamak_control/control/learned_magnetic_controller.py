@@ -51,11 +51,29 @@ CONTROLLER_STATE_V4_FEATURE_ORDER = [
     "previous_action",
     "target_preview",
 ]
+CONTROLLER_STATE_V5_FEATURE_ORDER = [
+    "step_norm",
+    "ip",
+    "ip_ref",
+    "ip_error",
+    "active_currents",
+    "active_current_derivs",
+    "measured_boundary_radii",
+    "ref_radii",
+    "boundary_radii_error",
+    "boundary_found",
+    "ip_ref_rate",
+    "boundary_ref_rate",
+    "ip_measured_rate",
+    "previous_action",
+    "target_preview",
+]
 COMPACT_JOINT_STATE_V2_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
 OBSERVATION_KIND = "controller_state_v4"
 EXPECTED_FEATURE_ORDER = CONTROLLER_STATE_V4_FEATURE_ORDER
 SUPPORTED_FEATURE_ORDERS = {
     "controller_state_v4": CONTROLLER_STATE_V4_FEATURE_ORDER,
+    "controller_state_v5": CONTROLLER_STATE_V5_FEATURE_ORDER,
 }
 
 
@@ -82,6 +100,7 @@ class LearnedMagneticController(Controller):
             raise FileNotFoundError(f"learned controller export directory does not exist: {self.export_dir}")
         self.schema = _read_json(_first_existing(self.export_dir, ("controller_schema.json", "schema.json")))
         self._validate_observation_schema()
+        self.observation_kind = str(self.schema.get("observation_kind"))
         self.action_contract = str(self.schema.get("action_contract", ""))
         if self.action_contract != "absolute_jdot_command_v1":
             raise ValueError(
@@ -118,14 +137,18 @@ class LearnedMagneticController(Controller):
         self.ip_scale = _positive_scale(self.normalization.get("ip_scale", 1.0), "ip_scale")
         self.radius_scale = _positive_scale(self.normalization.get("radius_scale", 1.0), "radius_scale")
         self.psi_scale = _positive_scale(self.normalization.get("psi_scale", 1.0), "psi_scale")
+        self.ip_rate_scale = self._schema_or_normalization_scale("ip_rate_scale_aps", default=1.0)
+        self.boundary_rate_scale = self._schema_or_normalization_scale("boundary_rate_scale_mps", default=1.0)
         self.current_scale = _scale_array(self.normalization["current_scale"], self.n_active_total, "current_scale")
         self.derivative_scale = _scale_array(self.normalization["derivative_scale"], self.action_dim, "derivative_scale")
         self.action_clip = _positive_scale(action_clip, "action_clip")
         self._validate_weights()
         self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
+        self._previous_ip: float | None = None
 
     def reset(self) -> None:
         self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
+        self._previous_ip = None
         return None
 
     def compute_control(
@@ -160,6 +183,7 @@ class LearnedMagneticController(Controller):
             scenario=scenario,
             max_episode_steps=int(max_episode_steps),
         )
+        observed_ip = float(model.state.Ip)
         requested_action_norm = self._deterministic_action(obs.reshape(1, -1))[0]
         requested_action_norm = np.clip(requested_action_norm, -self.action_clip, self.action_clip).astype(np.float32, copy=False)
         physical = np.asarray(requested_action_norm, dtype=float) * self.derivative_scale
@@ -167,6 +191,7 @@ class LearnedMagneticController(Controller):
         derivative_scale = np.where(np.abs(self.derivative_scale) > 1.0e-12, self.derivative_scale, 1.0)
         applied_action_norm = np.clip(physical / derivative_scale, -1.0, 1.0)
         self._previous_action_norm = applied_action_norm.astype(np.float32, copy=True)
+        self._previous_ip = observed_ip
         currents_now = np.concatenate([
             np.asarray(model.state.pfc_currents, dtype=float).reshape(-1),
             np.asarray(model.state.sol_currents, dtype=float).reshape(-1),
@@ -250,6 +275,14 @@ class LearnedMagneticController(Controller):
         current_scale = np.where(self.current_scale > 0.0, self.current_scale, 1.0)
         derivative_scale = np.where(self.derivative_scale > 0.0, self.derivative_scale, 1.0)
         measured_ip = float(model.state.Ip)
+        ip_ref_rate, boundary_ref_rate, ip_measured_rate = self._rate_features(
+            model=model,
+            scenario=scenario,
+            angles=angles,
+            ip_ref=float(ip_ref),
+            ref_radii=ref,
+            measured_ip=measured_ip,
+        )
         features = {
             "step_norm": np.array([self._step_norm(model=model, max_episode_steps=max_episode_steps)], dtype=float),
             "ip": np.array([measured_ip / self.ip_scale], dtype=float),
@@ -262,6 +295,9 @@ class LearnedMagneticController(Controller):
             "ref_radii": ref / self.radius_scale,
             "boundary_radii_error": (ref - measured_radii) / self.radius_scale,
             "boundary_found": np.array([boundary_found], dtype=float),
+            "ip_ref_rate": np.array([ip_ref_rate], dtype=float),
+            "boundary_ref_rate": boundary_ref_rate,
+            "ip_measured_rate": np.array([ip_measured_rate], dtype=float),
             "previous_action": self._previous_action_norm.astype(float, copy=False),
             "target_preview": self._reference_preview(model=model, scenario=scenario, angles=angles, max_episode_steps=max_episode_steps),
         }
@@ -272,6 +308,33 @@ class LearnedMagneticController(Controller):
         if not np.all(np.isfinite(obs)):
             raise ValueError("controller observation contains non-finite values")
         return obs
+
+    def _rate_features(
+        self,
+        *,
+        model,
+        scenario,
+        angles: np.ndarray,
+        ip_ref: float,
+        ref_radii: np.ndarray,
+        measured_ip: float,
+    ) -> tuple[float, np.ndarray, float]:
+        """Return controller_state_v5 rate features in the same normalized units as training."""
+        if self.observation_kind != "controller_state_v5":
+            return 0.0, np.zeros((self.n_angles,), dtype=float), 0.0
+        dt = max(float(getattr(model, "t_step")), 1.0e-12)
+        t_next = float(model.state.t) + dt
+        ip_ref_next = float(scenario.Ip_ref(t_next))
+        ref_next = np.asarray(scenario.ref_radii(angles, t_next), dtype=float).reshape(-1)
+        if ref_next.shape != (self.n_angles,):
+            raise ValueError(f"controller expected {self.n_angles} next target radii, got {ref_next.shape[0]}")
+        ip_ref_rate = ((ip_ref_next - float(ip_ref)) / dt) / self.ip_rate_scale
+        boundary_ref_rate = ((ref_next - np.asarray(ref_radii, dtype=float).reshape(-1)) / dt) / self.boundary_rate_scale
+        if self._previous_ip is None:
+            ip_measured_rate = 0.0
+        else:
+            ip_measured_rate = ((float(measured_ip) - float(self._previous_ip)) / dt) / self.ip_rate_scale
+        return float(ip_ref_rate), np.asarray(boundary_ref_rate, dtype=float), float(ip_measured_rate)
 
     def _reference_preview(self, *, model, scenario, angles: np.ndarray, max_episode_steps: int) -> np.ndarray:
         if self.target_preview_steps == 0:
@@ -311,7 +374,7 @@ class LearnedMagneticController(Controller):
         kind = self.schema.get("observation_kind")
         if kind not in SUPPORTED_FEATURE_ORDERS:
             if "diagnostics" in self.schema:
-                raise ValueError("learned_magnetic_controller export uses an old virtual-diagnostic observation schema; retrain under controller_state_v4")
+                raise ValueError("learned_magnetic_controller export uses an old virtual-diagnostic observation schema; retrain under a supported controller_state schema")
             raise ValueError(f"learned_magnetic_controller requires one of {sorted(SUPPORTED_FEATURE_ORDERS)}, got {kind!r}")
         order = list(self.schema.get("feature_order", []))
         if order != SUPPORTED_FEATURE_ORDERS[str(kind)]:
@@ -326,6 +389,15 @@ class LearnedMagneticController(Controller):
             raise ValueError("controller input weight shape does not match obs_dim")
         if self.weights["mean_head.weight"].shape[0] != self.action_dim:
             raise ValueError("controller mean head shape does not match action_dim")
+
+    def _schema_or_normalization_scale(self, name: str, *, default: float) -> float:
+        if name in self.schema:
+            return _positive_scale(self.schema[name], name)
+        if name in self.normalization:
+            return _positive_scale(self.normalization[name], name)
+        if self.observation_kind == "controller_state_v5":
+            raise ValueError(f"{name} is required for controller_state_v5 learned-controller exports")
+        return _positive_scale(default, name)
 
 
 def _first_existing(root: Path, names: tuple[str, ...]) -> Path:
