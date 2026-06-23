@@ -182,6 +182,7 @@ def _run_one_shot(
     frame_stride: int,
     frame_dpi: int,
     fps: int,
+    video: bool,
     compute_backend: str,
     gpu_device: str,
     dry_run: bool,
@@ -214,16 +215,21 @@ def _run_one_shot(
         str(shot_parent),
         "--compute-backend",
         str(compute_backend),
-        "--video",
-        "--frame-stride",
-        str(frame_stride),
-        "--frame-dpi",
-        str(frame_dpi),
-        "--fps",
-        str(fps),
         "--verbose",
         "--no-progress",
     ]
+    if bool(video):
+        cmd.extend(
+            [
+                "--video",
+                "--frame-stride",
+                str(frame_stride),
+                "--frame-dpi",
+                str(frame_dpi),
+                "--fps",
+                str(fps),
+            ]
+        )
     if str(compute_backend) == "gpu":
         cmd.extend(["--gpu-device", str(gpu_device)])
 
@@ -447,6 +453,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--frame-dpi", type=int, default=100)
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help=(
+            "Do not render frames/video while generating the replay dataset. Use this on servers "
+            "whose container does not provide ffmpeg; boundary reference NPZ/JSON export still runs."
+        ),
+    )
+    parser.add_argument(
         "--compute-backend",
         choices=("cpu", "gpu"),
         default="cpu",
@@ -507,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
             frame_stride=int(args.frame_stride),
             frame_dpi=int(args.frame_dpi),
             fps=int(args.fps),
+            video=not bool(args.no_video),
             compute_backend=str(args.compute_backend),
             gpu_device=str(args.gpu_device),
             dry_run=bool(args.dry_run),
