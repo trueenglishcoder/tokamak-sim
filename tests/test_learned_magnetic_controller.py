@@ -291,10 +291,15 @@ def _runtime_context(model: PlasmaModel, cfg, *, n_angles: int) -> dict[str, obj
     )
     ref_radii = legacy_radii_at_angles(poly, (model.R0, model.Z0), angles)
     scenario = make_scenario("nominal", ref_radii, model.Ip0, params={}, center=(model.R0, model.Z0))
+    active_currents = np.concatenate([model.state.pfc_currents, model.state.sol_currents]).astype(float)
     return {
         "model": model,
         "psi": model.compute_psi(),
         "boundary_poly": poly,
+        "measured_ip": float(model.state.Ip),
+        "measured_active_currents": active_currents,
+        "measured_radii": ref_radii.copy(),
+        "boundary_found": True,
         "center": (model.R0, model.Z0),
         "measure_angles": angles,
         "ref_radii": ref_radii,
@@ -306,14 +311,46 @@ def _runtime_context(model: PlasmaModel, cfg, *, n_angles: int) -> dict[str, obj
 
 
 def test_learned_controller_runtime_inputs_are_current_contract() -> None:
-    """Registry should expose only inputs needed by the active v3 controller."""
+    """Registry should pass measured sensor channels to learned policies."""
     runtime_inputs = controller_runtime_inputs("learned_magnetic_controller")
     assert "model" in runtime_inputs
     assert "psi" in runtime_inputs
     assert "boundary_poly" in runtime_inputs
     assert "max_episode_steps" in runtime_inputs
-    assert "measured_ip" not in runtime_inputs
-    assert "measured_radii" not in runtime_inputs
+    assert "measured_ip" in runtime_inputs
+    assert "measured_active_currents" in runtime_inputs
+    assert "measured_radii" in runtime_inputs
+    assert "boundary_found" in runtime_inputs
+
+
+def test_learned_controller_uses_passed_measured_radii(tmp_path: Path) -> None:
+    """Measured radii should be consumed directly instead of recomputing from the CPU polygon."""
+    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    export = tmp_path / "export"
+    _write_v4_export(export, model=model, n_angles=8, mean_bias=0.0)
+    controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
+    ctx = _runtime_context(model, cfg, n_angles=8)
+    measured = np.linspace(0.25, 0.55, 8, dtype=float)
+
+    obs = controller._observation(
+        model=ctx["model"],
+        psi=ctx["psi"],
+        boundary_poly=ctx["boundary_poly"],
+        measured_ip=ctx["measured_ip"],
+        measured_active_currents=ctx["measured_active_currents"],
+        measured_radii=measured,
+        boundary_found=True,
+        center=ctx["center"],
+        measure_angles=ctx["measure_angles"],
+        ref_radii=ctx["ref_radii"],
+        ip_ref=float(ctx["Ip_ref"]),
+        scenario=ctx["scenario"],
+        max_episode_steps=10,
+    )
+    slices = {name: tuple(bounds) for name, bounds in controller.schema["feature_slices"].items()}
+    start, stop = slices["measured_boundary_radii"]
+    assert np.allclose(obs[start:stop], measured.astype(np.float32))
 
 
 def test_learned_controller_v4_outputs_absolute_next_currents(tmp_path: Path) -> None:

@@ -189,6 +189,10 @@ class LearnedMagneticController(Controller):
         Ip_ref: float,
         scenario,
         max_episode_steps: int,
+        measured_ip: float | None = None,
+        measured_active_currents: np.ndarray | None = None,
+        measured_radii: np.ndarray | None = None,
+        boundary_found: bool | None = None,
     ) -> ControlAction:
         n_pfc = int(model.pfc.n_coils)
         n_sol = int(model.sol.n_coils)
@@ -202,6 +206,10 @@ class LearnedMagneticController(Controller):
             model=model,
             psi=np.asarray(psi, dtype=float),
             boundary_poly=boundary_poly,
+            measured_ip=measured_ip,
+            measured_active_currents=measured_active_currents,
+            measured_radii=measured_radii,
+            boundary_found=boundary_found,
             center=center,
             measure_angles=measure_angles,
             ref_radii=ref_radii,
@@ -209,7 +217,7 @@ class LearnedMagneticController(Controller):
             scenario=scenario,
             max_episode_steps=int(max_episode_steps),
         )
-        observed_ip = float(model.state.Ip)
+        observed_ip = float(model.state.Ip) if measured_ip is None else float(measured_ip)
         requested_action_norm = self._deterministic_action(obs.reshape(1, -1))[0]
         requested_action_norm = np.clip(requested_action_norm, -self.action_clip, self.action_clip).astype(np.float32, copy=False)
         physical = np.asarray(requested_action_norm, dtype=float) * self.derivative_scale
@@ -268,6 +276,10 @@ class LearnedMagneticController(Controller):
         ip_ref: float,
         scenario,
         max_episode_steps: int,
+        measured_ip: float | None = None,
+        measured_active_currents: np.ndarray | None = None,
+        measured_radii: np.ndarray | None = None,
+        boundary_found: bool | None = None,
     ) -> np.ndarray:
         angles = np.asarray(measure_angles, dtype=float).reshape(-1)
         ref = np.asarray(ref_radii, dtype=float).reshape(-1)
@@ -283,45 +295,56 @@ class LearnedMagneticController(Controller):
             np.asarray(model.state.pfc_currents, dtype=float).reshape(-1),
             np.asarray(model.state.sol_currents, dtype=float).reshape(-1),
         ])
+        observed_currents = currents if measured_active_currents is None else np.asarray(measured_active_currents, dtype=float).reshape(-1)
         derivs = np.concatenate([
             np.asarray(model.state.pfc_current_derivs, dtype=float).reshape(-1),
             np.asarray(model.state.sol_current_derivs, dtype=float).reshape(-1),
         ])
         if currents.shape != (self.n_active_total,):
             raise ValueError(f"controller expected {self.n_active_total} active currents, got {currents.shape[0]}")
+        if observed_currents.shape != (self.n_active_total,):
+            raise ValueError(f"controller expected {self.n_active_total} measured active currents, got {observed_currents.shape[0]}")
         if derivs.shape != (self.action_dim,):
             raise ValueError(f"controller expected {self.action_dim} active current derivatives, got {derivs.shape[0]}")
-        if boundary_poly is None:
-            measured_radii = np.zeros((self.n_angles,), dtype=float)
-            boundary_found = 0.0
+        if measured_radii is not None:
+            measured_radii_arr = np.asarray(measured_radii, dtype=float).reshape(-1)
+            if measured_radii_arr.shape != (self.n_angles,):
+                raise ValueError(f"controller expected {self.n_angles} measured radii, got {measured_radii_arr.shape[0]}")
+            measured_radii_arr = np.nan_to_num(measured_radii_arr, nan=0.0, posinf=0.0, neginf=0.0)
+            found_value = 1.0 if bool(boundary_found) else 0.0
+            if boundary_found is None:
+                found_value = 1.0 if np.any(np.isfinite(np.asarray(measured_radii, dtype=float))) else 0.0
+        elif boundary_poly is None:
+            measured_radii_arr = np.zeros((self.n_angles,), dtype=float)
+            found_value = 0.0
         else:
-            measured_radii = legacy_radii_at_angles(np.asarray(boundary_poly, dtype=float), center, angles)
-            measured_radii = np.nan_to_num(measured_radii, nan=0.0, posinf=0.0, neginf=0.0)
-            boundary_found = 1.0
-        self._sync_integral_errors(model=model, measured_ip=float(model.state.Ip), ip_ref=float(ip_ref), measured_radii=measured_radii, ref_radii=ref)
+            measured_radii_arr = legacy_radii_at_angles(np.asarray(boundary_poly, dtype=float), center, angles)
+            measured_radii_arr = np.nan_to_num(measured_radii_arr, nan=0.0, posinf=0.0, neginf=0.0)
+            found_value = 1.0
+        observed_ip = float(model.state.Ip) if measured_ip is None else float(measured_ip)
+        self._sync_integral_errors(model=model, measured_ip=observed_ip, ip_ref=float(ip_ref), measured_radii=measured_radii_arr, ref_radii=ref)
         current_scale = np.where(self.current_scale > 0.0, self.current_scale, 1.0)
         derivative_scale = np.where(self.derivative_scale > 0.0, self.derivative_scale, 1.0)
-        measured_ip = float(model.state.Ip)
         ip_ref_rate, boundary_ref_rate, ip_measured_rate = self._rate_features(
             model=model,
             scenario=scenario,
             angles=angles,
             ip_ref=float(ip_ref),
             ref_radii=ref,
-            measured_ip=measured_ip,
+            measured_ip=observed_ip,
         )
         features = {
             "step_norm": np.array([self._step_norm(model=model, max_episode_steps=max_episode_steps)], dtype=float),
-            "ip": np.array([measured_ip / self.ip_scale], dtype=float),
+            "ip": np.array([observed_ip / self.ip_scale], dtype=float),
             "ip_ref": np.array([float(ip_ref) / self.ip_scale], dtype=float),
-            "ip_error": np.array([(measured_ip - float(ip_ref)) / self.ip_scale], dtype=float),
-            "active_currents": currents / current_scale,
+            "ip_error": np.array([(observed_ip - float(ip_ref)) / self.ip_scale], dtype=float),
+            "active_currents": observed_currents / current_scale,
             "active_current_derivs": derivs / derivative_scale,
             "psi_flat": psi_arr.reshape(-1) / self.psi_scale,
-            "measured_boundary_radii": measured_radii / self.radius_scale,
+            "measured_boundary_radii": measured_radii_arr / self.radius_scale,
             "ref_radii": ref / self.radius_scale,
-            "boundary_radii_error": (ref - measured_radii) / self.radius_scale,
-            "boundary_found": np.array([boundary_found], dtype=float),
+            "boundary_radii_error": (ref - measured_radii_arr) / self.radius_scale,
+            "boundary_found": np.array([found_value], dtype=float),
             "ip_ref_rate": np.array([ip_ref_rate], dtype=float),
             "boundary_ref_rate": boundary_ref_rate,
             "ip_measured_rate": np.array([ip_measured_rate], dtype=float),

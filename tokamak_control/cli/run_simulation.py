@@ -842,6 +842,7 @@ def _compute_controller_commands(
         "measured_ip": float(sensors.measured_ip),
         "measured_active_currents": np.asarray(sensors.measured_active_currents, dtype=float),
         "measured_radii": None if sensors.measured_radii is None else np.asarray(sensors.measured_radii, dtype=float),
+        "boundary_found": bool(sensors.measured_boundary_poly is not None and sensors.measured_radii is not None),
         "limiter_shape": limiter_shape,
         "boundary_mode": boundary_mode,
         "legacy_precision_index2": float(legacy_precision_index2),
