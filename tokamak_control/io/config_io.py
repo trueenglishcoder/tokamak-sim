@@ -32,6 +32,13 @@ class LoadedConfig:
     boundary_base_mode: BoundaryMode = "legacy_contour_limited"
     boundary_legacy_precision_index2: float = 1.0e-3
     boundary_track_level: bool = False
+    boundary_smooth_selected_level: bool = False
+    boundary_soft_level_selection: bool = False
+    boundary_soft_level_candidates: int = 64
+    boundary_soft_level_temperature: float = 0.05
+    boundary_soft_level_radius_weight: float = 1.0
+    boundary_soft_level_missing_penalty: float = 4.0
+    boundary_soft_level_roughness_penalty: float = 0.2
     boundary_level_smoothing_alpha: float = 1.0
     boundary_level_search_span_fraction: float = 0.02
     boundary_continuity_weight_radii: float = 1.0
@@ -435,6 +442,40 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
     if boundary_legacy_precision_index2 <= 0.0:
         raise ValueError("boundary.legacy_precision_index2 must be > 0")
     boundary_track_level = _coerce_bool(boundary_node.get("track_level", False), "boundary.track_level")
+    boundary_smooth_selected_level = _coerce_bool(
+        boundary_node.get("smooth_selected_level", False),
+        "boundary.smooth_selected_level",
+    )
+    boundary_soft_level_selection = _coerce_bool(
+        boundary_node.get("soft_level_selection", False),
+        "boundary.soft_level_selection",
+    )
+    if boundary_soft_level_selection and boundary_smooth_selected_level:
+        raise ValueError("boundary.soft_level_selection and boundary.smooth_selected_level are mutually exclusive")
+    boundary_soft_level_candidates = _coerce_int(
+        boundary_node.get("soft_level_candidates", 64),
+        "boundary.soft_level_candidates",
+    )
+    if boundary_soft_level_candidates < 3:
+        raise ValueError("boundary.soft_level_candidates must be >= 3")
+    boundary_soft_level_temperature = _coerce_float(
+        boundary_node.get("soft_level_temperature", 0.05),
+        "boundary.soft_level_temperature",
+    )
+    if boundary_soft_level_temperature <= 0.0:
+        raise ValueError("boundary.soft_level_temperature must be > 0")
+    boundary_soft_level_radius_weight = _coerce_float(
+        boundary_node.get("soft_level_radius_weight", 1.0),
+        "boundary.soft_level_radius_weight",
+    )
+    boundary_soft_level_missing_penalty = _coerce_float(
+        boundary_node.get("soft_level_missing_penalty", 4.0),
+        "boundary.soft_level_missing_penalty",
+    )
+    boundary_soft_level_roughness_penalty = _coerce_float(
+        boundary_node.get("soft_level_roughness_penalty", 0.2),
+        "boundary.soft_level_roughness_penalty",
+    )
     boundary_level_smoothing_alpha = _coerce_float(
         boundary_node.get("level_smoothing_alpha", 1.0),
         "boundary.level_smoothing_alpha",
@@ -458,6 +499,9 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         "boundary.continuity_weight_center": boundary_continuity_weight_center,
         "boundary.continuity_weight_area": boundary_continuity_weight_area,
         "boundary.continuity_weight_level": boundary_continuity_weight_level,
+        "boundary.soft_level_radius_weight": boundary_soft_level_radius_weight,
+        "boundary.soft_level_missing_penalty": boundary_soft_level_missing_penalty,
+        "boundary.soft_level_roughness_penalty": boundary_soft_level_roughness_penalty,
     }.items():
         if value < 0.0:
             raise ValueError(f"{name} must be >= 0")
@@ -483,6 +527,13 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         boundary_base_mode=boundary_base_mode,
         boundary_legacy_precision_index2=boundary_legacy_precision_index2,
         boundary_track_level=boundary_track_level,
+        boundary_smooth_selected_level=boundary_smooth_selected_level,
+        boundary_soft_level_selection=boundary_soft_level_selection,
+        boundary_soft_level_candidates=boundary_soft_level_candidates,
+        boundary_soft_level_temperature=boundary_soft_level_temperature,
+        boundary_soft_level_radius_weight=boundary_soft_level_radius_weight,
+        boundary_soft_level_missing_penalty=boundary_soft_level_missing_penalty,
+        boundary_soft_level_roughness_penalty=boundary_soft_level_roughness_penalty,
         boundary_level_smoothing_alpha=boundary_level_smoothing_alpha,
         boundary_level_search_span_fraction=boundary_level_search_span_fraction,
         boundary_continuity_weight_radii=boundary_continuity_weight_radii,
@@ -511,6 +562,13 @@ def dump_config(
     boundary_base_mode: BoundaryMode = "legacy_contour_limited",
     boundary_legacy_precision_index2: float = 1.0e-3,
     boundary_track_level: bool = False,
+    boundary_smooth_selected_level: bool = False,
+    boundary_soft_level_selection: bool = False,
+    boundary_soft_level_candidates: int = 64,
+    boundary_soft_level_temperature: float = 0.05,
+    boundary_soft_level_radius_weight: float = 1.0,
+    boundary_soft_level_missing_penalty: float = 4.0,
+    boundary_soft_level_roughness_penalty: float = 0.2,
     boundary_level_smoothing_alpha: float = 1.0,
     boundary_level_search_span_fraction: float = 0.02,
     boundary_continuity_weight_radii: float = 1.0,
@@ -589,6 +647,13 @@ def dump_config(
             "base_mode": str(boundary_base_mode),
             "legacy_precision_index2": float(boundary_legacy_precision_index2),
             "track_level": bool(boundary_track_level),
+            "smooth_selected_level": bool(boundary_smooth_selected_level),
+            "soft_level_selection": bool(boundary_soft_level_selection),
+            "soft_level_candidates": int(boundary_soft_level_candidates),
+            "soft_level_temperature": float(boundary_soft_level_temperature),
+            "soft_level_radius_weight": float(boundary_soft_level_radius_weight),
+            "soft_level_missing_penalty": float(boundary_soft_level_missing_penalty),
+            "soft_level_roughness_penalty": float(boundary_soft_level_roughness_penalty),
             "level_smoothing_alpha": float(boundary_level_smoothing_alpha),
             "level_search_span_fraction": float(boundary_level_search_span_fraction),
             "continuity_weight_radii": float(boundary_continuity_weight_radii),

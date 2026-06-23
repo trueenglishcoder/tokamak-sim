@@ -421,6 +421,13 @@ def _build_run_metadata(
             "base_mode": cfg.boundary_base_mode,
             "legacy_precision_index2": cfg.boundary_legacy_precision_index2,
             "track_level": cfg.boundary_track_level,
+            "smooth_selected_level": cfg.boundary_smooth_selected_level,
+            "soft_level_selection": cfg.boundary_soft_level_selection,
+            "soft_level_candidates": cfg.boundary_soft_level_candidates,
+            "soft_level_temperature": cfg.boundary_soft_level_temperature,
+            "soft_level_radius_weight": cfg.boundary_soft_level_radius_weight,
+            "soft_level_missing_penalty": cfg.boundary_soft_level_missing_penalty,
+            "soft_level_roughness_penalty": cfg.boundary_soft_level_roughness_penalty,
             "level_smoothing_alpha": cfg.boundary_level_smoothing_alpha,
             "level_search_span_fraction": cfg.boundary_level_search_span_fraction,
             "continuity_weight_radii": cfg.boundary_continuity_weight_radii,
@@ -1398,7 +1405,7 @@ def _write_profile_summary(
     logger.info("Profiling summary written: %s", path)
 
 
-def _run_learned_batched_gpu_artifacts(
+def _run_batched_gpu_fixed_angle_artifacts(
     *,
     cfg: LoadedConfig,
     config_source: str,
@@ -1417,13 +1424,11 @@ def _run_learned_batched_gpu_artifacts(
     logger: logging.Logger,
     run_profiler: Profiler,
 ) -> RunResult:
-    """Run exported learned policies through the batched-GPU training boundary path."""
+    """Run a clean controller through the batched-GPU fixed-angle boundary path."""
     if cfg.compute.backend != "gpu":
-        raise ValueError("learned batched-GPU artifact mode requires compute.backend='gpu'")
-    if controller_name != "learned_magnetic_controller":
-        raise ValueError("learned batched-GPU artifact mode is only for learned_magnetic_controller")
+        raise ValueError("batched-GPU fixed-angle artifact mode requires compute.backend='gpu'")
 
-    logger.info("Preparing learned-controller batched GPU simulator and scenario")
+    logger.info("Preparing batched GPU fixed-angle simulator and scenario")
     angles = np.linspace(-np.pi, np.pi, int(M_angles), endpoint=False, dtype=float)
     limiter_shape = (
         np.asarray(cfg.limiter_shape, dtype=float).reshape(-1, 2)
@@ -1440,6 +1445,14 @@ def _run_learned_batched_gpu_artifacts(
         limiter_shape=limiter_shape,
         boundary_mode=cfg.boundary_mode,
         boundary_base_mode=cfg.boundary_base_mode,
+        boundary_legacy_precision_index2=cfg.boundary_legacy_precision_index2,
+        boundary_smooth_selected_level=cfg.boundary_smooth_selected_level,
+        boundary_soft_level_selection=cfg.boundary_soft_level_selection,
+        boundary_soft_level_candidates=cfg.boundary_soft_level_candidates,
+        boundary_soft_level_temperature=cfg.boundary_soft_level_temperature,
+        boundary_soft_level_radius_weight=cfg.boundary_soft_level_radius_weight,
+        boundary_soft_level_missing_penalty=cfg.boundary_soft_level_missing_penalty,
+        boundary_soft_level_roughness_penalty=cfg.boundary_soft_level_roughness_penalty,
         boundary_level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
         boundary_level_search_span_fraction=cfg.boundary_level_search_span_fraction,
         boundary_continuity_weight_radii=cfg.boundary_continuity_weight_radii,
@@ -1484,7 +1497,7 @@ def _run_learned_batched_gpu_artifacts(
     progress = _make_progress(
         enabled=show_progress,
         total=int(steps),
-        desc=f"{controller_name}:{scenario_name}:batched-gpu",
+        desc=f"{controller_name}:{scenario_name}:batched-gpu-fixed-angle",
     )
     last_ref_radii = np.zeros_like(angles, dtype=float)
     completed_steps = 0
@@ -1591,6 +1604,10 @@ def _run_learned_batched_gpu_artifacts(
                         "Ip_ref": ip_ref_log,
                         "target_mean_radius": float(np.nanmean(refs.ref_radii)),
                         "boundary_status": "fixed_angle_gpu_found" if found_post else "fixed_angle_gpu_not_found",
+                        "boundary_mode": str(cfg.boundary_mode),
+                        "boundary_base_mode": str(cfg.boundary_base_mode),
+                        "boundary_gpu_status_code": int(np.asarray(result.boundary.status_code.detach().cpu())[0]),
+                        "boundary_gpu_level": float(np.asarray(result.boundary.level.detach().cpu())[0]),
                         "boundary_found": bool(found_post),
                         "boundary_fail_reason": None if found_post else "fixed-angle GPU boundary was not fully found",
                         "norm_u_pfc": float(np.linalg.norm(commands.pfc_cmd)),
@@ -1716,16 +1733,23 @@ def run(
         and canonical_controller_name != "t15md_replay"
         and RealismRuntime.has_any_effect(cfg_runtime.realism)
     )
+    gpu_fixed_angle_controllers = {"learned_magnetic_controller", "t15md_replay"}
+    use_batched_gpu_fixed_angle = (
+        cfg_runtime.compute.backend == "gpu"
+        and canonical_controller_name in gpu_fixed_angle_controllers
+    )
+
     if canonical_controller_name == "learned_magnetic_controller":
         if cfg_runtime.compute.backend != "gpu":
             raise ValueError(
                 "learned_magnetic_controller artifact runs require --compute-backend gpu "
                 "so deployment uses the same fixed-angle boundary path as RL training"
             )
+    if use_batched_gpu_fixed_angle:
         if realism_active or bool(disturbances):
             raise ValueError(
-                "learned_magnetic_controller artifact runs currently support the clean GPU plant path only; "
-                "disable realism/disturbances for policy deployment artifacts"
+                "batched GPU fixed-angle artifact runs currently support the clean plant path only; "
+                "disable realism/disturbances for this artifact mode"
             )
     paths = _allocate_paths_for_run(
         output_dir=output_dir,
@@ -1751,20 +1775,20 @@ def run(
         runtime_overrides=runtime_overrides,
     )
     run_meta = _json_safe(run_meta)
-    use_learned_batched_gpu = (
-        canonical_controller_name == "learned_magnetic_controller"
-    )
-    if use_learned_batched_gpu:
+    if use_batched_gpu_fixed_angle:
         meta_overrides = dict(run_meta.get("runtime_overrides", {})) if isinstance(run_meta, Mapping) else {}
-        meta_overrides["learned_controller_artifact_path"] = "batched_gpu_fixed_angle"
-        meta_overrides["learned_controller_boundary_signal"] = "fixed_angle_radii"
+        meta_overrides["controller_artifact_path"] = "batched_gpu_fixed_angle"
+        meta_overrides["controller_boundary_signal"] = "fixed_angle_radii"
+        if canonical_controller_name == "learned_magnetic_controller":
+            meta_overrides["learned_controller_artifact_path"] = "batched_gpu_fixed_angle"
+            meta_overrides["learned_controller_boundary_signal"] = "fixed_angle_radii"
         run_meta["runtime_overrides"] = meta_overrides
     _write_manifest(paths.manifest_path, run_meta)
     logger.info("Allocated run directory: %s", paths.run_dir)
 
-    if use_learned_batched_gpu:
-        logger.info("Using learned-controller batched GPU artifact path")
-        return _run_learned_batched_gpu_artifacts(
+    if use_batched_gpu_fixed_angle:
+        logger.info("Using batched GPU fixed-angle artifact path")
+        return _run_batched_gpu_fixed_angle_artifacts(
             cfg=cfg_runtime,
             config_source=config_source,
             paths=paths,

@@ -64,6 +64,14 @@ def fixed_angle_boundary_gpu(
     prev_level=None,
     prev_points=None,
     prev_radii=None,
+    legacy_precision_index2: float = 1.0e-3,
+    smooth_selected_level: bool = False,
+    soft_level_selection: bool = False,
+    soft_level_candidates: int = 64,
+    soft_level_temperature: float = 0.05,
+    soft_level_radius_weight: float = 1.0,
+    soft_level_missing_penalty: float = 4.0,
+    soft_level_roughness_penalty: float = 0.2,
     level_smoothing_alpha: float = 1.0,
     level_search_span_fraction: float = 0.02,
     continuity_weight_radii: float = 1.0,
@@ -129,11 +137,79 @@ def fixed_angle_boundary_gpu(
         angles=angles,
         max_radii=max_radii,
         ray_samples=int(ray_samples),
+        precision_index2=float(legacy_precision_index2),
     )
 
     if tracked is None:
         points, radii, found, level = reset
-        status_code = torch.where(found, torch.full((B,), 4 if mode == "tracked_flux_contour" else 2, dtype=torch.int64, device=device), torch.zeros((B,), dtype=torch.int64, device=device))
+        status_code = torch.where(
+            found,
+            torch.full((B,), 4 if mode == "tracked_flux_contour" else 2, dtype=torch.int64, device=device),
+            torch.zeros((B,), dtype=torch.int64, device=device),
+        )
+        if bool(soft_level_selection) and mode in {"legacy_contour", "legacy_contour_limited"}:
+            soft_points, soft_radii, soft_found, soft_level = _soft_fixed_angle_boundary(
+                psi=field,
+                grid=grid,
+                center_points=center_t,
+                center_level=center_level,
+                angles=angles,
+                max_radii=max_radii,
+                ray_samples=int(ray_samples),
+                candidate_count=int(soft_level_candidates),
+                temperature=float(soft_level_temperature),
+                radius_weight=float(soft_level_radius_weight),
+                missing_penalty=float(soft_level_missing_penalty),
+                roughness_penalty=float(soft_level_roughness_penalty),
+            )
+            use_soft = soft_found & torch.isfinite(soft_level)
+            points = torch.where(use_soft[:, None, None], soft_points, points)
+            radii = torch.where(use_soft[:, None], soft_radii, radii)
+            found = torch.where(use_soft, soft_found, found)
+            level = torch.where(use_soft, soft_level, level)
+            status_code = torch.where(
+                found,
+                torch.where(
+                    use_soft,
+                    torch.full((B,), 6, dtype=torch.int64, device=device),
+                    torch.full((B,), 2, dtype=torch.int64, device=device),
+                ),
+                torch.zeros((B,), dtype=torch.int64, device=device),
+            )
+        elif bool(smooth_selected_level) and mode in {"legacy_contour", "legacy_contour_limited"} and prev_level is not None:
+            reset_points, reset_radii, reset_found, reset_level = reset
+            prev = torch.as_tensor(prev_level, dtype=dtype, device=device).reshape(B)
+            prev_finite = torch.isfinite(prev)
+            alpha = max(0.0, min(float(level_smoothing_alpha), 1.0))
+            smooth_level = torch.where(
+                prev_finite & torch.isfinite(reset_level) & reset_found,
+                alpha * prev + (1.0 - alpha) * reset_level,
+                reset_level,
+            )
+            smooth_points, smooth_radii, smooth_found = _center_ray_crossings(
+                psi=field,
+                grid=grid,
+                center_points=center_t,
+                center_level=center_level,
+                level=smooth_level,
+                angles=angles,
+                max_radii=max_radii,
+                ray_samples=int(ray_samples),
+            )
+            use_smooth = prev_finite & reset_found & smooth_found & torch.isfinite(smooth_level)
+            points = torch.where(use_smooth[:, None, None], smooth_points, reset_points)
+            radii = torch.where(use_smooth[:, None], smooth_radii, reset_radii)
+            found = reset_found
+            level = torch.where(use_smooth, smooth_level, reset_level)
+            status_code = torch.where(
+                found,
+                torch.where(
+                    use_smooth,
+                    torch.full((B,), 5, dtype=torch.int64, device=device),
+                    torch.full((B,), 2, dtype=torch.int64, device=device),
+                ),
+                torch.zeros((B,), dtype=torch.int64, device=device),
+            )
     else:
         tracked_points, tracked_radii, tracked_found, tracked_level = tracked
         reset_points, reset_radii, reset_found, reset_level = reset
@@ -254,6 +330,105 @@ def _center_ray_crossings(*, psi, grid: Grid2D, center_points, center_level, lev
     return points, radii, found
 
 
+def _nanmean_count(values, dim: int):
+    torch = __import__("torch")
+    finite = torch.isfinite(values)
+    count = torch.sum(finite.to(torch.int64), dim=dim)
+    total = torch.sum(torch.where(finite, values, torch.zeros_like(values)), dim=dim)
+    mean = total / torch.clamp(count.to(values.dtype), min=1.0)
+    return mean, count
+
+
+def _soft_fixed_angle_boundary(
+    *,
+    psi,
+    grid: Grid2D,
+    center_points,
+    center_level,
+    angles,
+    max_radii,
+    ray_samples: int,
+    candidate_count: int,
+    temperature: float,
+    radius_weight: float,
+    missing_penalty: float,
+    roughness_penalty: float,
+):
+    torch = __import__("torch")
+    B = int(psi.shape[0])
+    A = int(angles.numel())
+    K = max(int(candidate_count), 3)
+    dirs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
+    endpoint_radii = 0.995 * max_radii.reshape(1, A).repeat(B, 1)
+    endpoint_points = center_points[:, None, :] + endpoint_radii[..., None] * dirs[None, :, :]
+    endpoint_values = _sample_points(psi, grid, endpoint_points)
+    finite_endpoint = torch.isfinite(endpoint_values)
+    edge_level = torch.nanmedian(endpoint_values, dim=1).values
+
+    finite_psi = torch.isfinite(psi)
+    vmax = torch.max(torch.where(finite_psi, psi, torch.full_like(psi, -float("inf"))).reshape(B, -1), dim=1).values
+    vmin = torch.min(torch.where(finite_psi, psi, torch.full_like(psi, float("inf"))).reshape(B, -1), dim=1).values
+    fallback_span = 0.25 * (vmax - vmin)
+    edge_level = torch.where(
+        torch.isfinite(edge_level) & torch.any(finite_endpoint, dim=1),
+        edge_level,
+        center_level + torch.where(torch.isfinite(fallback_span), fallback_span, torch.ones_like(center_level)),
+    )
+
+    fractions = torch.linspace(0.02, 0.98, K, dtype=psi.dtype, device=psi.device)
+    levels = center_level[:, None] + fractions[None, :] * (edge_level - center_level)[:, None]
+    max_radius_scale, _count_scale = _nanmean_count(max_radii.reshape(1, A).repeat(B, 1), dim=1)
+    max_radius_scale = torch.clamp(max_radius_scale, min=1.0e-6)
+
+    score_parts = []
+    for k in range(K):
+        level = levels[:, k]
+        _points, radii, _found = _center_ray_crossings(
+            psi=psi,
+            grid=grid,
+            center_points=center_points,
+            center_level=center_level,
+            level=level,
+            angles=angles,
+            max_radii=max_radii,
+            ray_samples=ray_samples,
+        )
+        mean_radius, count = _nanmean_count(radii, dim=1)
+        missing_fraction = 1.0 - count.to(psi.dtype) / float(A)
+        fill = mean_radius[:, None]
+        filled = torch.where(torch.isfinite(radii), radii, fill)
+        adjacent = torch.abs(filled - torch.roll(filled, shifts=-1, dims=1))
+        roughness = torch.mean(adjacent, dim=1) / max_radius_scale
+        radius_score = mean_radius / max_radius_scale
+        score = (
+            float(radius_weight) * radius_score
+            - float(missing_penalty) * missing_fraction
+            - float(roughness_penalty) * roughness
+        )
+        valid = (count > 0) & torch.isfinite(level) & torch.isfinite(score)
+        score_parts.append(torch.where(valid, score, torch.full_like(score, -float("inf"))))
+
+    scores = torch.stack(score_parts, dim=1)
+    any_valid = torch.any(torch.isfinite(scores), dim=1)
+    safe_scores = torch.where(torch.isfinite(scores), scores, torch.full_like(scores, -1.0e30))
+    temp = max(float(temperature), 1.0e-6)
+    weights = torch.softmax(safe_scores / temp, dim=1)
+    weights = torch.where(any_valid[:, None], weights, torch.zeros_like(weights))
+    soft_level = torch.sum(weights * levels, dim=1)
+    points, radii, found = _center_ray_crossings(
+        psi=psi,
+        grid=grid,
+        center_points=center_points,
+        center_level=center_level,
+        level=soft_level,
+        angles=angles,
+        max_radii=max_radii,
+        ray_samples=ray_samples,
+    )
+    found = found & any_valid & torch.isfinite(soft_level)
+    return points, radii, found, soft_level
+
+
 def _legacy_sample_center_level_gpu(psi, grid: Grid2D, p_index):
     torch = __import__("torch")
     B = int(psi.shape[0])
@@ -281,7 +456,18 @@ def _legacy_sample_center_level_gpu(psi, grid: Grid2D, p_index):
     return torch.where(valid, out, torch.full_like(out, float("nan")))
 
 
-def _legacy_fixed_angle_search(*, psi, grid: Grid2D, center, center_points, center_level, angles, max_radii, ray_samples: int):
+def _legacy_fixed_angle_search(
+    *,
+    psi,
+    grid: Grid2D,
+    center,
+    center_points,
+    center_level,
+    angles,
+    max_radii,
+    ray_samples: int,
+    precision_index2: float,
+):
     torch = __import__("torch")
     B = int(psi.shape[0])
     A = int(angles.numel())
@@ -297,7 +483,10 @@ def _legacy_fixed_angle_search(*, psi, grid: Grid2D, center, center_points, cent
     )
     p = o.reshape(1, 2).repeat(B, 1)
     new_step = (-o / 2.0).reshape(1, 2).repeat(B, 1)
-    precision = torch.as_tensor(1.0e-3, dtype=psi.dtype, device=psi.device)
+    precision_value = float(precision_index2)
+    if not np.isfinite(precision_value) or precision_value <= 0.0:
+        raise ValueError(f"legacy_precision_index2 must be finite and > 0, got {precision_index2!r}")
+    precision = torch.as_tensor(precision_value, dtype=psi.dtype, device=psi.device)
     best_level = torch.full((B,), float("nan"), dtype=psi.dtype, device=psi.device)
     best_radii = torch.full((B, A), float("nan"), dtype=psi.dtype, device=psi.device)
     best_points = torch.full((B, A, 2), float("nan"), dtype=psi.dtype, device=psi.device)

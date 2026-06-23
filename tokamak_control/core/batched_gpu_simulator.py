@@ -47,6 +47,14 @@ class BatchedGpuTokamakSimulator:
         limiter_shape: np.ndarray,
         boundary_mode: str = "legacy_contour",
         boundary_base_mode: str = "legacy_contour_limited",
+        boundary_legacy_precision_index2: float = 1.0e-3,
+        boundary_smooth_selected_level: bool = False,
+        boundary_soft_level_selection: bool = False,
+        boundary_soft_level_candidates: int = 64,
+        boundary_soft_level_temperature: float = 0.05,
+        boundary_soft_level_radius_weight: float = 1.0,
+        boundary_soft_level_missing_penalty: float = 4.0,
+        boundary_soft_level_roughness_penalty: float = 0.2,
         boundary_level_smoothing_alpha: float = 0.6,
         boundary_level_search_span_fraction: float = 0.02,
         boundary_continuity_weight_radii: float = 1.0,
@@ -74,6 +82,16 @@ class BatchedGpuTokamakSimulator:
         if self.boundary_mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour"}:
             raise ValueError("BatchedGpuTokamakSimulator only supports legacy contour boundary modes")
         self.boundary_base_mode = str(boundary_base_mode)
+        self.boundary_legacy_precision_index2 = float(boundary_legacy_precision_index2)
+        if not np.isfinite(self.boundary_legacy_precision_index2) or self.boundary_legacy_precision_index2 <= 0.0:
+            raise ValueError("boundary_legacy_precision_index2 must be finite and > 0")
+        self.boundary_smooth_selected_level = bool(boundary_smooth_selected_level)
+        self.boundary_soft_level_selection = bool(boundary_soft_level_selection)
+        self.boundary_soft_level_candidates = int(boundary_soft_level_candidates)
+        self.boundary_soft_level_temperature = float(boundary_soft_level_temperature)
+        self.boundary_soft_level_radius_weight = float(boundary_soft_level_radius_weight)
+        self.boundary_soft_level_missing_penalty = float(boundary_soft_level_missing_penalty)
+        self.boundary_soft_level_roughness_penalty = float(boundary_soft_level_roughness_penalty)
         self.boundary_level_smoothing_alpha = float(boundary_level_smoothing_alpha)
         self.boundary_level_search_span_fraction = float(boundary_level_search_span_fraction)
         self.boundary_continuity_weight_radii = float(boundary_continuity_weight_radii)
@@ -197,6 +215,14 @@ class BatchedGpuTokamakSimulator:
             prev_level=self._boundary_prev_levels,
             prev_points=self._boundary_prev_points,
             prev_radii=self._boundary_prev_radii,
+            legacy_precision_index2=self.boundary_legacy_precision_index2,
+            smooth_selected_level=self.boundary_smooth_selected_level,
+            soft_level_selection=self.boundary_soft_level_selection,
+            soft_level_candidates=self.boundary_soft_level_candidates,
+            soft_level_temperature=self.boundary_soft_level_temperature,
+            soft_level_radius_weight=self.boundary_soft_level_radius_weight,
+            soft_level_missing_penalty=self.boundary_soft_level_missing_penalty,
+            soft_level_roughness_penalty=self.boundary_soft_level_roughness_penalty,
             level_smoothing_alpha=self.boundary_level_smoothing_alpha,
             level_search_span_fraction=self.boundary_level_search_span_fraction,
             continuity_weight_radii=self.boundary_continuity_weight_radii,

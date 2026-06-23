@@ -64,33 +64,79 @@ def _read_events(path: Path | None) -> tuple[list[dict[str, str]], Counter[str]]
     return rows, status_counts
 
 
-def _write_strict_limited_config(*, base_config: Path, out_path: Path, legacy_precision_index2: float) -> Path:
+def _write_replay_boundary_config(
+    *,
+    base_config: Path,
+    out_path: Path,
+    boundary_mode: str,
+    legacy_precision_index2: float,
+    smooth_selected_level: bool,
+    soft_level_selection: bool,
+    soft_level_candidates: int,
+    soft_level_temperature: float,
+    soft_level_radius_weight: float,
+    soft_level_missing_penalty: float,
+    soft_level_roughness_penalty: float,
+    level_smoothing_alpha: float,
+    level_search_span_fraction: float,
+    continuity_weight_radii: float,
+    continuity_weight_mean_radius: float,
+    continuity_weight_center: float,
+    continuity_weight_area: float,
+    continuity_weight_level: float,
+) -> Path:
     with base_config.open("rb") as handle:
         data = tomllib.load(handle)
     boundary = data.setdefault("boundary", {})
     if not isinstance(boundary, dict):
         raise ValueError(f"{base_config} boundary section must be a TOML table")
+    if boundary_mode not in {"legacy_contour_limited", "tracked_flux_contour"}:
+        raise ValueError(
+            "replay boundary mode must be 'legacy_contour_limited' or 'tracked_flux_contour', "
+            f"got {boundary_mode!r}"
+        )
     boundary.update(
         {
-            "mode": "legacy_contour_limited",
+            "mode": str(boundary_mode),
             "base_mode": "legacy_contour_limited",
             "legacy_precision_index2": float(legacy_precision_index2),
             "track_level": False,
-            "level_smoothing_alpha": 1.0,
-            "level_search_span_fraction": 0.02,
-            "continuity_weight_radii": 1.0,
-            "continuity_weight_mean_radius": 0.3,
-            "continuity_weight_center": 0.2,
-            "continuity_weight_area": 0.2,
-            "continuity_weight_level": 0.1,
+            "smooth_selected_level": bool(smooth_selected_level),
+            "soft_level_selection": bool(soft_level_selection),
+            "soft_level_candidates": int(soft_level_candidates),
+            "soft_level_temperature": float(soft_level_temperature),
+            "soft_level_radius_weight": float(soft_level_radius_weight),
+            "soft_level_missing_penalty": float(soft_level_missing_penalty),
+            "soft_level_roughness_penalty": float(soft_level_roughness_penalty),
+            "level_smoothing_alpha": float(level_smoothing_alpha),
+            "level_search_span_fraction": float(level_search_span_fraction),
+            "continuity_weight_radii": float(continuity_weight_radii),
+            "continuity_weight_mean_radius": float(continuity_weight_mean_radius),
+            "continuity_weight_center": float(continuity_weight_center),
+            "continuity_weight_area": float(continuity_weight_area),
+            "continuity_weight_level": float(continuity_weight_level),
         }
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("wb") as handle:
         tomli_w.dump(data, handle)
     loaded = load_config(out_path)
-    if loaded.boundary_mode != "legacy_contour_limited":
-        raise RuntimeError(f"Strict replay config did not persist legacy_contour_limited: {loaded.boundary_mode!r}")
+    if loaded.boundary_mode != boundary_mode:
+        raise RuntimeError(f"Replay config did not persist {boundary_mode!r}: {loaded.boundary_mode!r}")
+    if loaded.boundary_base_mode != "legacy_contour_limited":
+        raise RuntimeError(
+            f"Replay config did not persist legacy_contour_limited base mode: {loaded.boundary_base_mode!r}"
+        )
+    if loaded.boundary_smooth_selected_level != bool(smooth_selected_level):
+        raise RuntimeError(
+            "Replay config did not persist smooth_selected_level="
+            f"{bool(smooth_selected_level)!r}: {loaded.boundary_smooth_selected_level!r}"
+        )
+    if loaded.boundary_soft_level_selection != bool(soft_level_selection):
+        raise RuntimeError(
+            "Replay config did not persist soft_level_selection="
+            f"{bool(soft_level_selection)!r}: {loaded.boundary_soft_level_selection!r}"
+        )
     if loaded.limiter_name is None:
         raise RuntimeError("Strict replay config has no limiter; limited replay dataset requires limiter geometry")
     return out_path
@@ -110,10 +156,10 @@ def _discover_data_shots(data_root: Path) -> list[str]:
     return shots
 
 
-def _validate_shot_files(shot: str, *, data_root: Path, initial_prefix: str) -> tuple[Path, Path, Path]:
+def _validate_shot_files(shot: str, *, data_root: Path, initial_root: Path, initial_prefix: str) -> tuple[Path, Path, Path]:
     coils = data_root / "coils" / f"t15md_{shot}_coils.csv"
     ip = data_root / "ip" / f"t15md_{shot}_ip.csv"
-    init = REPO_ROOT / "configs" / "initial_currents" / f"{initial_prefix}_{shot}.toml"
+    init = initial_root / f"{initial_prefix}_{shot}.toml"
     missing = [str(p) for p in (coils, ip, init) if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Shot {shot} is missing required files: {', '.join(missing)}")
@@ -129,15 +175,18 @@ def _run_one_shot(
     shot: str,
     config: Path,
     data_root: Path,
+    initial_root: Path,
     initial_prefix: str,
     dataset_root: Path,
     angles: int,
     frame_stride: int,
     frame_dpi: int,
     fps: int,
+    compute_backend: str,
+    gpu_device: str,
     dry_run: bool,
 ) -> Path | None:
-    coils, ip, init = _validate_shot_files(shot, data_root=data_root, initial_prefix=initial_prefix)
+    coils, ip, init = _validate_shot_files(shot, data_root=data_root, initial_root=initial_root, initial_prefix=initial_prefix)
     steps = _count_rows(ip)
     shot_parent = dataset_root / f"t15md_limited_replay_{shot}"
     before = {p.resolve() for p in shot_parent.iterdir() if p.is_dir()} if shot_parent.exists() else set()
@@ -164,7 +213,7 @@ def _run_one_shot(
         "--out",
         str(shot_parent),
         "--compute-backend",
-        "cpu",
+        str(compute_backend),
         "--video",
         "--frame-stride",
         str(frame_stride),
@@ -175,6 +224,8 @@ def _run_one_shot(
         "--verbose",
         "--no-progress",
     ]
+    if str(compute_backend) == "gpu":
+        cmd.extend(["--gpu-device", str(gpu_device)])
 
     print(f"===== shot {shot}: steps={steps} =====", flush=True)
     print(" ".join(cmd), flush=True)
@@ -346,31 +397,102 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shots", nargs="+", default=list(DEFAULT_SHOTS), help="Shot ids to run, or 'auto' for every paired shot.")
     parser.add_argument("--config", default="configs/T15MD_new_data.toml", help="Base config to copy from.")
     parser.add_argument("--data-root", default="data/t15_data_new", help="Replay data root with ip/ and coils/ subdirectories.")
+    parser.add_argument("--initial-root", default="configs/initial_currents", help="Directory containing <initial-prefix>_<shot>.toml files.")
     parser.add_argument("--initial-prefix", default="T15MD_new_data", help="Prefix for configs/initial_currents/<prefix>_<shot>.toml")
-    parser.add_argument("--strict-config-name", default=None, help="Filename for the generated strict replay config.")
+    parser.add_argument("--strict-config-name", default=None, help="Filename for the generated replay boundary config.")
     parser.add_argument("--out", default="runs/t15md_limited_replay_dataset", help="Dataset output root.")
     parser.add_argument("--angles", type=int, default=32, help="Boundary radii sample count to store.")
+    parser.add_argument(
+        "--boundary-mode",
+        choices=("legacy_contour_limited", "tracked_flux_contour"),
+        default="legacy_contour_limited",
+        help=(
+            "Boundary mode for the generated replay config. legacy_contour_limited re-finds a fresh "
+            "limited boundary each step; tracked_flux_contour initializes from legacy_contour_limited "
+            "and then tracks the same flux-surface identity over time."
+        ),
+    )
     parser.add_argument("--legacy-precision-index2", type=float, default=1.0e-3)
+    parser.add_argument(
+        "--smooth-selected-level",
+        action="store_true",
+        help=(
+            "GPU fixed-angle replay only: re-find the legacy limited boundary every step, "
+            "then smooth the selected flux level before ray sampling. This reduces discrete "
+            "level jumps without tracking the first flux surface identity."
+        ),
+    )
+    parser.add_argument("--level-smoothing-alpha", type=float, default=0.6)
+    parser.add_argument(
+        "--soft-level-selection",
+        action="store_true",
+        help=(
+            "GPU fixed-angle replay only: choose a flux level from a stateless soft score over "
+            "many center-to-limiter/grid candidate levels. Unlike --smooth-selected-level this "
+            "does not use previous-step state, so full-shot and sub-window extraction match."
+        ),
+    )
+    parser.add_argument("--soft-level-candidates", type=int, default=64)
+    parser.add_argument("--soft-level-temperature", type=float, default=0.05)
+    parser.add_argument("--soft-level-radius-weight", type=float, default=1.0)
+    parser.add_argument("--soft-level-missing-penalty", type=float, default=4.0)
+    parser.add_argument("--soft-level-roughness-penalty", type=float, default=0.2)
+    parser.add_argument("--level-search-span-fraction", type=float, default=0.02)
+    parser.add_argument("--continuity-weight-radii", type=float, default=1.0)
+    parser.add_argument("--continuity-weight-mean-radius", type=float, default=0.3)
+    parser.add_argument("--continuity-weight-center", type=float, default=0.2)
+    parser.add_argument("--continuity-weight-area", type=float, default=0.2)
+    parser.add_argument("--continuity-weight-level", type=float, default=0.1)
     parser.add_argument("--frame-stride", type=int, default=10)
     parser.add_argument("--frame-dpi", type=int, default=100)
     parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument(
+        "--compute-backend",
+        choices=("cpu", "gpu"),
+        default="cpu",
+        help=(
+            "Boundary/artifact compute path. cpu preserves the legacy contour replay dataset; "
+            "gpu uses the batched fixed-angle GPU boundary path used by RL training."
+        ),
+    )
+    parser.add_argument("--gpu-device", default="cuda:0", help="GPU device for --compute-backend gpu.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands and validate inputs without running.")
     args = parser.parse_args(argv)
+    if bool(args.soft_level_selection) and bool(args.smooth_selected_level):
+        parser.error("--soft-level-selection and --smooth-selected-level are mutually exclusive")
+    if bool(args.soft_level_selection) and str(args.compute_backend) != "gpu":
+        parser.error("--soft-level-selection requires --compute-backend gpu")
 
     data_root = (REPO_ROOT / args.data_root).resolve() if not Path(args.data_root).is_absolute() else Path(args.data_root)
+    initial_root = (REPO_ROOT / args.initial_root).resolve() if not Path(args.initial_root).is_absolute() else Path(args.initial_root)
     shots = _discover_data_shots(data_root) if len(args.shots) == 1 and str(args.shots[0]).lower() == "auto" else [str(shot) for shot in args.shots]
     dataset_root = (REPO_ROOT / args.out).resolve() if not Path(args.out).is_absolute() else Path(args.out)
     dataset_root.mkdir(parents=True, exist_ok=True)
-    strict_config_name = args.strict_config_name or f"{Path(args.config).stem}_legacy_contour_limited_replay.toml"
+    strict_config_name = args.strict_config_name or f"{Path(args.config).stem}_{args.boundary_mode}_replay.toml"
     base_config = (REPO_ROOT / args.config).resolve() if not Path(args.config).is_absolute() else Path(args.config)
-    config = _write_strict_limited_config(
+    config = _write_replay_boundary_config(
         base_config=base_config,
         out_path=dataset_root / strict_config_name,
+        boundary_mode=str(args.boundary_mode),
         legacy_precision_index2=float(args.legacy_precision_index2),
+        smooth_selected_level=bool(args.smooth_selected_level),
+        soft_level_selection=bool(args.soft_level_selection),
+        soft_level_candidates=int(args.soft_level_candidates),
+        soft_level_temperature=float(args.soft_level_temperature),
+        soft_level_radius_weight=float(args.soft_level_radius_weight),
+        soft_level_missing_penalty=float(args.soft_level_missing_penalty),
+        soft_level_roughness_penalty=float(args.soft_level_roughness_penalty),
+        level_smoothing_alpha=float(args.level_smoothing_alpha),
+        level_search_span_fraction=float(args.level_search_span_fraction),
+        continuity_weight_radii=float(args.continuity_weight_radii),
+        continuity_weight_mean_radius=float(args.continuity_weight_mean_radius),
+        continuity_weight_center=float(args.continuity_weight_center),
+        continuity_weight_area=float(args.continuity_weight_area),
+        continuity_weight_level=float(args.continuity_weight_level),
     )
 
     for shot in shots:
-        _validate_shot_files(str(shot), data_root=data_root, initial_prefix=str(args.initial_prefix))
+        _validate_shot_files(str(shot), data_root=data_root, initial_root=initial_root, initial_prefix=str(args.initial_prefix))
 
     rows: list[dict[str, object]] = []
     for shot in shots:
@@ -378,12 +500,15 @@ def main(argv: list[str] | None = None) -> int:
             shot=str(shot),
             config=config,
             data_root=data_root,
+            initial_root=initial_root,
             initial_prefix=str(args.initial_prefix),
             dataset_root=dataset_root,
             angles=int(args.angles),
             frame_stride=int(args.frame_stride),
             frame_dpi=int(args.frame_dpi),
             fps=int(args.fps),
+            compute_backend=str(args.compute_backend),
+            gpu_device=str(args.gpu_device),
             dry_run=bool(args.dry_run),
         )
         if run_dir is None:
