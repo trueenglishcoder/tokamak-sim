@@ -364,7 +364,11 @@ def main(argv: list[str] | None = None) -> int:
             n_contours=60,
             coil_positions=coil_positions,
             limiter_shape=limiter_shape,
-            frame_stride=frame_stride,
+            # `snapshot_every` already selected one stored snapshot per requested
+            # simulation-step stride. Render every stored snapshot so
+            # --frame-stride N means "one video frame every N simulation steps",
+            # not every Nth saved snapshot.
+            frame_stride=1,
             dpi=frame_dpi,
         )
 
