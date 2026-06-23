@@ -232,8 +232,7 @@ def _fixed_angle_polyline(
     found: bool,
 ) -> np.ndarray | None:
     """Build a closed display polyline from fixed-angle boundary radii."""
-    if not bool(found):
-        return None
+    del found
     r = np.asarray(radii, dtype=float).reshape(-1)
     a = np.asarray(angles, dtype=float).reshape(-1)
     finite = np.isfinite(r) & (r > 0.0)
@@ -1509,7 +1508,7 @@ def _run_learned_batched_gpu_artifacts(
                     true_active_currents=measured_currents_pre,
                     measured_active_currents=measured_currents_pre.copy(),
                     true_boundary_poly=poly_pre,
-                    measured_boundary_poly=None if poly_pre is None else poly_pre.copy(),
+                    measured_boundary_poly=(poly_pre.copy() if found_pre and poly_pre is not None else None),
                     true_radii=np.asarray(radii_pre, dtype=float).reshape(-1),
                     measured_radii=np.asarray(radii_pre, dtype=float).reshape(-1),
                     true_psi=np.asarray(state_pre.psi, dtype=float).copy(),
