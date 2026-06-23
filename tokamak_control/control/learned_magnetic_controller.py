@@ -68,12 +68,32 @@ CONTROLLER_STATE_V5_FEATURE_ORDER = [
     "previous_action",
     "target_preview",
 ]
+CONTROLLER_STATE_V6_FEATURE_ORDER = [
+    "step_norm",
+    "ip",
+    "ip_ref",
+    "ip_error",
+    "active_currents",
+    "active_current_derivs",
+    "measured_boundary_radii",
+    "ref_radii",
+    "boundary_radii_error",
+    "boundary_found",
+    "ip_ref_rate",
+    "boundary_ref_rate",
+    "ip_measured_rate",
+    "integral_ip_error",
+    "integral_boundary_radii_error",
+    "previous_action",
+    "target_preview",
+]
 COMPACT_JOINT_STATE_V2_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
 OBSERVATION_KIND = "controller_state_v4"
 EXPECTED_FEATURE_ORDER = CONTROLLER_STATE_V4_FEATURE_ORDER
 SUPPORTED_FEATURE_ORDERS = {
     "controller_state_v4": CONTROLLER_STATE_V4_FEATURE_ORDER,
     "controller_state_v5": CONTROLLER_STATE_V5_FEATURE_ORDER,
+    "controller_state_v6": CONTROLLER_STATE_V6_FEATURE_ORDER,
 }
 
 
@@ -145,10 +165,16 @@ class LearnedMagneticController(Controller):
         self._validate_weights()
         self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
         self._previous_ip: float | None = None
+        self._integral_ip_error = 0.0
+        self._integral_boundary_radii_error = np.zeros((self.n_angles,), dtype=np.float32)
+        self._last_integral_step: int | None = None
 
     def reset(self) -> None:
         self._previous_action_norm = np.zeros((self.action_dim,), dtype=np.float32)
         self._previous_ip = None
+        self._integral_ip_error = 0.0
+        self._integral_boundary_radii_error = np.zeros((self.n_angles,), dtype=np.float32)
+        self._last_integral_step = None
         return None
 
     def compute_control(
@@ -272,6 +298,7 @@ class LearnedMagneticController(Controller):
             measured_radii = legacy_radii_at_angles(np.asarray(boundary_poly, dtype=float), center, angles)
             measured_radii = np.nan_to_num(measured_radii, nan=0.0, posinf=0.0, neginf=0.0)
             boundary_found = 1.0
+        self._sync_integral_errors(model=model, measured_ip=float(model.state.Ip), ip_ref=float(ip_ref), measured_radii=measured_radii, ref_radii=ref)
         current_scale = np.where(self.current_scale > 0.0, self.current_scale, 1.0)
         derivative_scale = np.where(self.derivative_scale > 0.0, self.derivative_scale, 1.0)
         measured_ip = float(model.state.Ip)
@@ -298,6 +325,8 @@ class LearnedMagneticController(Controller):
             "ip_ref_rate": np.array([ip_ref_rate], dtype=float),
             "boundary_ref_rate": boundary_ref_rate,
             "ip_measured_rate": np.array([ip_measured_rate], dtype=float),
+            "integral_ip_error": np.array([self._normalized_integral_ip_error()], dtype=float),
+            "integral_boundary_radii_error": self._normalized_integral_boundary_radii_error(),
             "previous_action": self._previous_action_norm.astype(float, copy=False),
             "target_preview": self._reference_preview(model=model, scenario=scenario, angles=angles, max_episode_steps=max_episode_steps),
         }
@@ -319,8 +348,8 @@ class LearnedMagneticController(Controller):
         ref_radii: np.ndarray,
         measured_ip: float,
     ) -> tuple[float, np.ndarray, float]:
-        """Return controller_state_v5 rate features in the same normalized units as training."""
-        if self.observation_kind != "controller_state_v5":
+        """Return controller_state_v5/v6 rate features in the same normalized units as training."""
+        if self.observation_kind not in {"controller_state_v5", "controller_state_v6"}:
             return 0.0, np.zeros((self.n_angles,), dtype=float), 0.0
         dt = max(float(getattr(model, "t_step")), 1.0e-12)
         t_next = float(model.state.t) + dt
@@ -335,6 +364,46 @@ class LearnedMagneticController(Controller):
         else:
             ip_measured_rate = ((float(measured_ip) - float(self._previous_ip)) / dt) / self.ip_rate_scale
         return float(ip_ref_rate), np.asarray(boundary_ref_rate, dtype=float), float(ip_measured_rate)
+
+    def _sync_integral_errors(
+        self,
+        *,
+        model,
+        measured_ip: float,
+        ip_ref: float,
+        measured_radii: np.ndarray,
+        ref_radii: np.ndarray,
+    ) -> None:
+        """Advance controller_state_v6 integral-error memory to the current model step."""
+        if self.observation_kind != "controller_state_v6":
+            return
+        step = int(getattr(model.state, "step", 0))
+        if self._last_integral_step is None:
+            self._last_integral_step = step
+            return
+        delta_steps = max(step - int(self._last_integral_step), 0)
+        if delta_steps <= 0:
+            return
+        dt = max(float(getattr(model, "t_step")), 1.0e-12) * float(delta_steps)
+        self._integral_ip_error += dt * (float(ip_ref) - float(measured_ip))
+        radii_error = np.asarray(ref_radii, dtype=float).reshape(self.n_angles) - np.nan_to_num(
+            np.asarray(measured_radii, dtype=float).reshape(self.n_angles),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        self._integral_boundary_radii_error = (self._integral_boundary_radii_error + dt * radii_error).astype(np.float32, copy=False)
+        self._last_integral_step = step
+
+    def _normalized_integral_ip_error(self) -> float:
+        """Return the v6 normalized integral Ip error used by training."""
+        scale = 15000.0 * 0.1
+        return float(np.clip(float(self._integral_ip_error) / scale, -1.0, 1.0))
+
+    def _normalized_integral_boundary_radii_error(self) -> np.ndarray:
+        """Return the v6 normalized integral boundary-radius errors used by training."""
+        scale = 0.02 * 0.1
+        return np.clip(np.asarray(self._integral_boundary_radii_error, dtype=float) / scale, -1.0, 1.0)
 
     def _reference_preview(self, *, model, scenario, angles: np.ndarray, max_episode_steps: int) -> np.ndarray:
         if self.target_preview_steps == 0:
@@ -395,8 +464,8 @@ class LearnedMagneticController(Controller):
             return _positive_scale(self.schema[name], name)
         if name in self.normalization:
             return _positive_scale(self.normalization[name], name)
-        if self.observation_kind == "controller_state_v5":
-            raise ValueError(f"{name} is required for controller_state_v5 learned-controller exports")
+        if self.observation_kind in {"controller_state_v5", "controller_state_v6"}:
+            raise ValueError(f"{name} is required for {self.observation_kind} learned-controller exports")
         return _positive_scale(default, name)
 
 

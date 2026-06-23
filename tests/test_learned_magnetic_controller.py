@@ -7,7 +7,11 @@ import numpy as np
 import pytest
 
 from tokamak_control.config.scenarios import make_scenario
-from tokamak_control.control.learned_magnetic_controller import CONTROLLER_STATE_V4_FEATURE_ORDER, CONTROLLER_STATE_V5_FEATURE_ORDER
+from tokamak_control.control.learned_magnetic_controller import (
+    CONTROLLER_STATE_V4_FEATURE_ORDER,
+    CONTROLLER_STATE_V5_FEATURE_ORDER,
+    CONTROLLER_STATE_V6_FEATURE_ORDER,
+)
 from tokamak_control.control.registry import build_controller_runtime_call, controller_runtime_inputs, make_controller
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.geometry.boundary import find_plasma_boundary_with_status
@@ -42,6 +46,8 @@ def _feature_slices(
         "ip_ref_rate": 1,
         "boundary_ref_rate": n_angles,
         "ip_measured_rate": 1,
+        "integral_ip_error": 1,
+        "integral_boundary_radii_error": n_angles,
         "previous_action": action_dim,
         "target_preview": preview_steps * (2 + n_angles),
     }
@@ -148,6 +154,77 @@ def _write_v5_export(
         "angles_rad": np.linspace(-np.pi, np.pi, n_angles, endpoint=False, dtype=float).tolist(),
         "grid_shape": list(model.state.psi.shape),
         "feature_order": CONTROLLER_STATE_V5_FEATURE_ORDER,
+        "feature_slices": slices,
+        "target_preview_steps": target_preview_steps,
+        "target_preview_stride": target_preview_stride,
+        "ip_rate_scale_aps": 5.0e5,
+        "boundary_rate_scale_mps": 1.0,
+        "action_contract": "absolute_jdot_command_v1",
+    }
+    (export / "controller_schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    (export / "normalization.json").write_text(
+        json.dumps(
+            {
+                "ip_scale": 5.0e5,
+                "radius_scale": 1.0,
+                "current_scale": [1.0e6] * action_dim,
+                "derivative_scale": derivative_scale.tolist(),
+                "ip_rate_scale_aps": 5.0e5,
+                "boundary_rate_scale_mps": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (export / "metadata.json").write_text(json.dumps({"layer_norm_eps": 1.0e-5}), encoding="utf-8")
+    hidden = 8
+    np.savez(
+        export / "policy_weights.npz",
+        **{
+            "input.weight": np.zeros((hidden, obs_dim), dtype=np.float32),
+            "input.bias": np.zeros((hidden,), dtype=np.float32),
+            "input_norm.weight": np.ones((hidden,), dtype=np.float32),
+            "input_norm.bias": np.zeros((hidden,), dtype=np.float32),
+            "hidden1.weight": np.zeros((hidden, hidden), dtype=np.float32),
+            "hidden1.bias": np.zeros((hidden,), dtype=np.float32),
+            "mean_head.weight": np.zeros((action_dim, hidden), dtype=np.float32),
+            "mean_head.bias": np.full((action_dim,), float(mean_bias), dtype=np.float32),
+        },
+    )
+    return derivative_scale
+
+
+def _write_v6_export(
+    export: Path,
+    *,
+    model: PlasmaModel,
+    n_angles: int,
+    mean_bias: float = 0.0,
+    target_preview_steps: int = 0,
+    target_preview_stride: int = 1,
+) -> np.ndarray:
+    """Write a minimal v6 learned-controller bundle and return derivative limits."""
+    n_pfc = int(model.pfc.n_coils)
+    n_sol = int(model.sol.n_coils)
+    action_dim = n_pfc + n_sol
+    slices, obs_dim = _feature_slices(
+        action_dim=action_dim,
+        n_angles=n_angles,
+        preview_steps=target_preview_steps,
+        feature_order=CONTROLLER_STATE_V6_FEATURE_ORDER,
+    )
+    derivative_scale = np.linspace(1.0e6, 9.0e6, action_dim, dtype=float)
+    export.mkdir()
+    schema = {
+        "observation_kind": "controller_state_v6",
+        "obs_dim": obs_dim,
+        "action_dim": action_dim,
+        "n_active_total": action_dim,
+        "n_pfc": n_pfc,
+        "n_sol": n_sol,
+        "n_angles": n_angles,
+        "angles_rad": np.linspace(-np.pi, np.pi, n_angles, endpoint=False, dtype=float).tolist(),
+        "grid_shape": list(model.state.psi.shape),
+        "feature_order": CONTROLLER_STATE_V6_FEATURE_ORDER,
         "feature_slices": slices,
         "target_preview_steps": target_preview_steps,
         "target_preview_stride": target_preview_stride,
@@ -341,6 +418,83 @@ def test_learned_controller_v5_outputs_absolute_next_currents(tmp_path: Path) ->
     assert np.allclose(first_jdot, requested_jdot * derivative_scale, rtol=1.0e-6, atol=1.0e-6)
     assert np.allclose(controller._previous_action_norm, requested_jdot)
     assert controller._previous_ip == pytest.approx(float(model.state.Ip))
+
+
+def test_learned_controller_v6_outputs_absolute_next_currents(tmp_path: Path) -> None:
+    """The v6 controller accepts current exports and keeps the absolute-Jdot contract."""
+    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    export = tmp_path / "export_v6"
+    derivative_scale = _write_v6_export(export, model=model, n_angles=8, mean_bias=0.25)
+    controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
+    call = build_controller_runtime_call("learned_magnetic_controller", _runtime_context(model, cfg, n_angles=8))
+
+    current_now = np.concatenate([model.state.pfc_currents, model.state.sol_currents]).astype(float)
+    action = controller.compute_control(**call)
+    next_current = np.concatenate([action.pfc_currents_next, action.sol_currents_next])
+    jdot = (next_current - current_now) / float(model.t_step)
+
+    requested_jdot = float(np.tanh(0.25))
+    assert np.allclose(jdot, requested_jdot * derivative_scale, rtol=1.0e-6, atol=1.0e-6)
+    assert np.allclose(controller._previous_action_norm, requested_jdot)
+    assert controller._previous_ip == pytest.approx(float(model.state.Ip))
+
+
+def test_learned_controller_v6_integral_features_match_training_units(tmp_path: Path) -> None:
+    """v6 exports should receive accumulated Ip and boundary error features."""
+    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    export = tmp_path / "export_v6"
+    _write_v6_export(export, model=model, n_angles=6, mean_bias=0.0)
+    controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
+    ctx = _runtime_context(model, cfg, n_angles=6)
+
+    angles = np.asarray(ctx["measure_angles"], dtype=float)
+    ref_now = np.asarray(ctx["ref_radii"], dtype=float)
+    measured_ip = float(model.state.Ip)
+    scenario = _LinearReferenceScenario(
+        ip0=measured_ip + 15000.0,
+        ip_rate=0.0,
+        radii0=ref_now + 0.002,
+        boundary_rate=np.zeros_like(ref_now),
+    )
+    slices = {name: tuple(bounds) for name, bounds in controller.schema["feature_slices"].items()}
+
+    obs0 = controller._observation(
+        model=ctx["model"],
+        psi=ctx["psi"],
+        boundary_poly=ctx["boundary_poly"],
+        center=ctx["center"],
+        measure_angles=angles,
+        ref_radii=scenario.ref_radii(angles, float(model.state.t)),
+        ip_ref=scenario.Ip_ref(float(model.state.t)),
+        scenario=scenario,
+        max_episode_steps=100,
+    )
+    start, stop = slices["integral_ip_error"]
+    assert np.allclose(obs0[start:stop], np.zeros((1,), dtype=np.float32))
+    start, stop = slices["integral_boundary_radii_error"]
+    assert np.allclose(obs0[start:stop], np.zeros((angles.size,), dtype=np.float32))
+
+    model.state.step += 1
+    model.state.t += float(model.t_step)
+    obs1 = controller._observation(
+        model=ctx["model"],
+        psi=ctx["psi"],
+        boundary_poly=ctx["boundary_poly"],
+        center=ctx["center"],
+        measure_angles=angles,
+        ref_radii=scenario.ref_radii(angles, float(model.state.t)),
+        ip_ref=scenario.Ip_ref(float(model.state.t)),
+        scenario=scenario,
+        max_episode_steps=100,
+    )
+    start, stop = slices["integral_ip_error"]
+    expected_ip = float(model.t_step) * 15000.0 / (15000.0 * 0.1)
+    assert np.allclose(obs1[start:stop], np.asarray([expected_ip], dtype=np.float32), rtol=1.0e-5, atol=1.0e-6)
+    start, stop = slices["integral_boundary_radii_error"]
+    expected_boundary = np.full((angles.size,), float(model.t_step) * 0.002 / (0.02 * 0.1), dtype=np.float32)
+    assert np.allclose(obs1[start:stop], expected_boundary, rtol=1.0e-5, atol=1.0e-6)
 
 
 def test_learned_controller_can_use_rolling_training_horizon_norm(tmp_path: Path) -> None:
