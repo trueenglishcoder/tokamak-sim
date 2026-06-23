@@ -22,6 +22,7 @@ from tokamak_control.control.registry import (
     make_controller,
     normalize_controller_launch,
 )
+from tokamak_control.core.batched_gpu_simulator import BatchedGpuTokamakSimulator, BatchedGpuSimulatorResult
 from tokamak_control.core.gpu_plasma_model import GpuPlasmaModel
 from tokamak_control.core.plasma_model import (
     PlasmaModel,
@@ -143,12 +144,106 @@ class _StepRecord:
     controller_diagnostics: dict[str, object]
 
 
+class _BatchedGpuModelView:
+    """Single-lane model facade passed to exported learned controllers.
+
+    Learned policies are trained against the batched GPU environment, whose
+    boundary signal is fixed-angle radii rather than a full CPU contour. This
+    view exposes the minimal ``PlasmaModel``-like surface the exported
+    controller expects while the actual plant state lives in
+    ``BatchedGpuTokamakSimulator``.
+    """
+
+    def __init__(self, *, simulator: BatchedGpuTokamakSimulator, state: PlasmaState) -> None:
+        self._simulator = simulator
+        self.grid = simulator.grid
+        self.pfc = simulator.pfc
+        self.sol = simulator.sol
+        self.R0 = float(simulator.settings.R0)
+        self.Z0 = float(simulator.settings.Z0)
+        self.t_step = float(simulator.settings.t_step)
+        self.actuator_tau = float(simulator.settings.actuator_tau)
+        self.state = state
+
+    def snapshot_state(self) -> PlasmaState:
+        return self.state.copied()
+
+
 
 def _as_numpy_psi(psi: object) -> np.ndarray:
     """Return a CPU NumPy psi array from either NumPy or Torch input."""
     if hasattr(psi, "detach"):
         return np.asarray(psi.detach().cpu().numpy(), dtype=float)
     return np.asarray(psi, dtype=float)
+
+
+def _tensor_lane_to_numpy(value: object, lane: int = 0, *, dtype=float) -> np.ndarray:
+    """Return one lane from a tensor/array batch as a NumPy array."""
+    item = value[lane]  # type: ignore[index]
+    if hasattr(item, "detach"):
+        item = item.detach()
+    if hasattr(item, "cpu"):
+        item = item.cpu()
+    return np.asarray(item, dtype=dtype)
+
+
+def _tensor_lane_scalar(value: object, lane: int = 0, *, cast=float) -> object:
+    """Return one scalar lane from a tensor/array batch."""
+    item = value[lane]  # type: ignore[index]
+    if hasattr(item, "detach"):
+        item = item.detach()
+    if hasattr(item, "cpu"):
+        item = item.cpu()
+    if hasattr(item, "item"):
+        item = item.item()
+    return cast(item)
+
+
+def _state_from_batched_result(result: BatchedGpuSimulatorResult, simulator: BatchedGpuTokamakSimulator) -> PlasmaState:
+    """Convert the single-lane batched GPU state to a normal artifact state."""
+    return PlasmaState(
+        t=float(_tensor_lane_scalar(result.state.t, cast=float)),
+        step=int(_tensor_lane_scalar(result.state.step, cast=int)),
+        Ip=float(_tensor_lane_scalar(result.state.Ip, cast=float)),
+        Ip0=float(_tensor_lane_scalar(simulator.Ip0, cast=float)),
+        psi=_tensor_lane_to_numpy(result.state.psi, dtype=float),
+        pfc_currents=_tensor_lane_to_numpy(result.state.pfc_currents, dtype=float).reshape(simulator.pfc.n_coils),
+        pfc_current_derivs=_tensor_lane_to_numpy(result.state.pfc_current_derivs, dtype=float).reshape(simulator.pfc.n_coils),
+        sol_currents=_tensor_lane_to_numpy(result.state.sol_currents, dtype=float).reshape(simulator.sol.n_coils),
+        sol_current_derivs=_tensor_lane_to_numpy(result.state.sol_current_derivs, dtype=float).reshape(simulator.sol.n_coils),
+    )
+
+
+def _fixed_angle_radii_from_result(result: BatchedGpuSimulatorResult) -> np.ndarray:
+    """Return the single-lane fixed-angle boundary radii from a batched GPU result."""
+    return _tensor_lane_to_numpy(result.boundary.radii, dtype=float).reshape(-1)
+
+
+def _fixed_angle_found_from_result(result: BatchedGpuSimulatorResult) -> bool:
+    """Return whether the single-lane fixed-angle boundary was found."""
+    return bool(_tensor_lane_scalar(result.boundary.found, cast=bool))
+
+
+def _fixed_angle_polyline(
+    *,
+    center: tuple[float, float],
+    angles: np.ndarray,
+    radii: np.ndarray,
+    found: bool,
+) -> np.ndarray | None:
+    """Build a closed display polyline from fixed-angle boundary radii."""
+    if not bool(found):
+        return None
+    r = np.asarray(radii, dtype=float).reshape(-1)
+    a = np.asarray(angles, dtype=float).reshape(-1)
+    finite = np.isfinite(r) & (r > 0.0)
+    if r.shape != a.shape or int(np.count_nonzero(finite)) < 3:
+        return None
+    R0, Z0 = center
+    points = np.stack([R0 + r[finite] * np.cos(a[finite]), Z0 + r[finite] * np.sin(a[finite])], axis=1)
+    if points.shape[0] >= 2 and not np.allclose(points[0], points[-1]):
+        points = np.vstack([points, points[:1]])
+    return points.astype(float, copy=False)
 
 
 def _coerce_value(token: str) -> object:
@@ -1304,6 +1399,266 @@ def _write_profile_summary(
     logger.info("Profiling summary written: %s", path)
 
 
+def _run_learned_batched_gpu_artifacts(
+    *,
+    cfg: LoadedConfig,
+    config_source: str,
+    paths: _RunPaths,
+    run_meta: Mapping[str, object],
+    controller_name: str,
+    ctor_kwargs: Mapping[str, object] | None,
+    scenario_name: ScenarioName,
+    scenario_params: Mapping[str, object] | None,
+    steps: int,
+    M_angles: int,
+    snapshot_every: int,
+    show_progress: bool,
+    verbose: bool,
+    profile: bool,
+    logger: logging.Logger,
+    run_profiler: Profiler,
+) -> RunResult:
+    """Run exported learned policies through the batched-GPU training boundary path."""
+    if cfg.compute.backend != "gpu":
+        raise ValueError("learned batched-GPU artifact mode requires compute.backend='gpu'")
+    if controller_name != "learned_magnetic_controller":
+        raise ValueError("learned batched-GPU artifact mode is only for learned_magnetic_controller")
+
+    logger.info("Preparing learned-controller batched GPU simulator and scenario")
+    angles = np.linspace(-np.pi, np.pi, int(M_angles), endpoint=False, dtype=float)
+    limiter_shape = (
+        np.asarray(cfg.limiter_shape, dtype=float).reshape(-1, 2)
+        if cfg.limiter_shape is not None
+        else np.zeros((0, 2), dtype=float)
+    )
+    simulator = BatchedGpuTokamakSimulator(
+        grid=cfg.grid,
+        pfc=cfg.pfc,
+        sol=cfg.sol,
+        settings=cfg.physics,
+        batch_size=1,
+        angles_rad=angles,
+        limiter_shape=limiter_shape,
+        boundary_mode=cfg.boundary_mode,
+        boundary_base_mode=cfg.boundary_base_mode,
+        boundary_level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
+        boundary_level_search_span_fraction=cfg.boundary_level_search_span_fraction,
+        boundary_continuity_weight_radii=cfg.boundary_continuity_weight_radii,
+        boundary_continuity_weight_mean_radius=cfg.boundary_continuity_weight_mean_radius,
+        boundary_continuity_weight_center=cfg.boundary_continuity_weight_center,
+        boundary_continuity_weight_area=cfg.boundary_continuity_weight_area,
+        boundary_continuity_weight_level=cfg.boundary_continuity_weight_level,
+        gpu_device=cfg.compute.gpu_device,
+    )
+    result = simulator.reset(
+        ip=np.asarray([cfg.physics.Ip0], dtype=float),
+        pfc_currents=np.asarray(cfg.pfc.initial_currents, dtype=float).reshape(1, cfg.pfc.n_coils),
+        sol_currents=np.asarray(cfg.sol.initial_currents, dtype=float).reshape(1, cfg.sol.n_coils),
+    )
+    state = _state_from_batched_result(result, simulator)
+    center = (float(cfg.physics.R0), float(cfg.physics.Z0))
+    base_radii = _fixed_angle_radii_from_result(result)
+    if not _fixed_angle_found_from_result(result):
+        base_radii = np.full((angles.shape[0],), np.nan, dtype=float)
+    scenario = make_scenario(
+        scenario_name,
+        base_radii,
+        float(state.Ip),
+        params=scenario_params,
+        center=center,
+    )
+    model_view = _BatchedGpuModelView(simulator=simulator, state=state)
+
+    writer = _make_writer(
+        paths=paths,
+        cfg=cfg,
+        snapshot_every=snapshot_every,
+        metadata=dict(run_meta),
+    )
+    logger.info("Constructing controller: %s", controller_name)
+    controller = _construct_controller(
+        controller_name=controller_name,
+        ctor_kwargs=ctor_kwargs,
+        run_profiler=run_profiler,
+    )
+
+    progress = _make_progress(
+        enabled=show_progress,
+        total=int(steps),
+        desc=f"{controller_name}:{scenario_name}:batched-gpu",
+    )
+    last_ref_radii = np.zeros_like(angles, dtype=float)
+    completed_steps = 0
+
+    try:
+        for k in range(int(steps)):
+            with run_profiler.time_block("step_total"):
+                state_pre = _state_from_batched_result(result, simulator)
+                model_view.state = state_pre
+                radii_pre = _fixed_angle_radii_from_result(result)
+                found_pre = _fixed_angle_found_from_result(result)
+                poly_pre = _fixed_angle_polyline(center=center, angles=angles, radii=radii_pre, found=found_pre)
+                refs = _scenario_refs(scenario, angles, float(state_pre.t))
+                measured_currents_pre = np.concatenate([
+                    np.asarray(state_pre.pfc_currents, dtype=float).reshape(-1),
+                    np.asarray(state_pre.sol_currents, dtype=float).reshape(-1),
+                ])
+                sensors_pre = SensorRealismResult(
+                    true_ip=float(state_pre.Ip),
+                    measured_ip=float(state_pre.Ip),
+                    true_active_currents=measured_currents_pre,
+                    measured_active_currents=measured_currents_pre.copy(),
+                    true_boundary_poly=poly_pre,
+                    measured_boundary_poly=None if poly_pre is None else poly_pre.copy(),
+                    true_radii=np.asarray(radii_pre, dtype=float).reshape(-1),
+                    measured_radii=np.asarray(radii_pre, dtype=float).reshape(-1),
+                    true_psi=np.asarray(state_pre.psi, dtype=float).copy(),
+                    measured_psi=np.asarray(state_pre.psi, dtype=float).copy(),
+                )
+                pfc_cmd, sol_cmd = _compute_controller_commands(
+                    controller=controller,
+                    controller_name=controller_name,
+                    model=model_view,
+                    psi_meas=np.asarray(state_pre.psi, dtype=float),
+                    boundary_meas=None if poly_pre is None else np.asarray(poly_pre, dtype=float),
+                    center=center,
+                    angles=angles,
+                    refs=refs,
+                    scenario=scenario,
+                    max_episode_steps=int(steps),
+                    sensors=sensors_pre,
+                    limiter_shape=cfg.limiter_shape,
+                    boundary_mode=cfg.boundary_mode,
+                    legacy_precision_index2=cfg.boundary_legacy_precision_index2,
+                    run_profiler=run_profiler,
+                )
+                commands = _StepCommands(pfc_cmd=pfc_cmd, sol_cmd=sol_cmd, pfc_eff=pfc_cmd, sol_eff=sol_cmd)
+                active_next = np.concatenate([commands.pfc_eff, commands.sol_eff], axis=0).reshape(1, -1)
+                with run_profiler.time_block("step_model"):
+                    result = simulator.step_currents(active_next)
+                state_post = _state_from_batched_result(result, simulator)
+                model_view.state = state_post
+                radii_post = _fixed_angle_radii_from_result(result)
+                found_post = _fixed_angle_found_from_result(result)
+                poly_post = _fixed_angle_polyline(center=center, angles=angles, radii=radii_post, found=found_post)
+                t_log = float(state_post.t)
+                ref_radii_log = np.asarray(scenario.ref_radii(angles, t_log), dtype=float)
+                ip_ref_log = float(scenario.Ip_ref(t_log))
+                last_ref_radii = ref_radii_log.copy()
+                pfc_cmd_deriv = (commands.pfc_cmd - state_pre.pfc_currents) / float(cfg.physics.t_step)
+                sol_cmd_deriv = (commands.sol_cmd - state_pre.sol_currents) / float(cfg.physics.t_step)
+                measured_currents_post = np.concatenate([
+                    np.asarray(state_post.pfc_currents, dtype=float).reshape(-1),
+                    np.asarray(state_post.sol_currents, dtype=float).reshape(-1),
+                ])
+                with run_profiler.time_block("step_writer"):
+                    writer.append(
+                        t=float(state_post.t),
+                        Ip=float(state_post.Ip),
+                        pfc_currents=np.asarray(state_post.pfc_currents, dtype=float),
+                        pfc_derivs=np.asarray(state_post.pfc_current_derivs, dtype=float),
+                        sol_currents=np.asarray(state_post.sol_currents, dtype=float),
+                        sol_derivs=np.asarray(state_post.sol_current_derivs, dtype=float),
+                        psi=(
+                            np.asarray(state_post.psi, dtype=float)
+                            if snapshot_every > 0 and ((k + 1) % snapshot_every == 0)
+                            else None
+                        ),
+                        pfc_derivs_cmd=pfc_cmd_deriv,
+                        sol_derivs_cmd=sol_cmd_deriv,
+                        pfc_derivs_eff=np.asarray(state_post.pfc_current_derivs, dtype=float),
+                        sol_derivs_eff=np.asarray(state_post.sol_current_derivs, dtype=float),
+                        pfc_currents_cmd=commands.pfc_cmd,
+                        sol_currents_cmd=commands.sol_cmd,
+                        pfc_currents_eff=commands.pfc_eff,
+                        sol_currents_eff=commands.sol_eff,
+                        psi_latest=np.asarray(state_post.psi, dtype=float),
+                        step=int(state_post.step),
+                        Ip_ref=ip_ref_log,
+                        radii_ref=ref_radii_log,
+                        Ip_meas=float(state_post.Ip),
+                        pfc_currents_meas=measured_currents_post[: cfg.pfc.n_coils],
+                        sol_currents_meas=measured_currents_post[cfg.pfc.n_coils :],
+                        radii_true=np.asarray(radii_post, dtype=float).reshape(-1),
+                        radii_meas=np.asarray(radii_post, dtype=float).reshape(-1),
+                        boundary_poly_true=poly_post,
+                        boundary_poly_meas=poly_post,
+                    )
+                    event_payload = {
+                        "type": "step",
+                        "k": int(state_post.step),
+                        "t": float(state_post.t),
+                        "Ip": float(state_post.Ip),
+                        "Ip_ref": ip_ref_log,
+                        "target_mean_radius": float(np.nanmean(refs.ref_radii)),
+                        "boundary_status": "fixed_angle_gpu_found" if found_post else "fixed_angle_gpu_not_found",
+                        "boundary_found": bool(found_post),
+                        "boundary_fail_reason": None if found_post else "fixed-angle GPU boundary was not fully found",
+                        "norm_u_pfc": float(np.linalg.norm(commands.pfc_cmd)),
+                        "norm_u_sol": float(np.linalg.norm(commands.sol_cmd)),
+                        "disturbances_applied": [],
+                    }
+                    event_payload.update(_controller_diagnostics(controller))
+                    writer.log_event(event_payload)
+                completed_steps += 1
+                run_profiler.step()
+                _update_progress(
+                    progress,
+                    _StepRecord(
+                        state=state_post,
+                        commands=commands,
+                        refs=refs,
+                        ref_radii_log=ref_radii_log,
+                        ip_ref_log=ip_ref_log,
+                        sensors=SensorRealismResult(
+                            true_ip=float(state_post.Ip),
+                            measured_ip=float(state_post.Ip),
+                            true_active_currents=measured_currents_post,
+                            measured_active_currents=measured_currents_post.copy(),
+                            true_boundary_poly=poly_post,
+                            measured_boundary_poly=None if poly_post is None else poly_post.copy(),
+                            true_radii=np.asarray(radii_post, dtype=float).reshape(-1),
+                            measured_radii=np.asarray(radii_post, dtype=float).reshape(-1),
+                            true_psi=np.asarray(state_post.psi, dtype=float),
+                            measured_psi=np.asarray(state_post.psi, dtype=float),
+                        ),
+                        disturbances_applied=[],
+                        controller_diagnostics={},
+                    ),
+                )
+                if verbose:
+                    logger.info(
+                        "Step %d/%d t=%.6f Ip=%.6g boundary_found=%s",
+                        k + 1,
+                        int(steps),
+                        float(state_post.t),
+                        float(state_post.Ip),
+                        bool(found_post),
+                    )
+    finally:
+        if progress is not None:
+            progress.close()
+
+    logger.info("Finalizing run artifacts")
+    with run_profiler.time_block("finalize_writer"):
+        npz_path = writer.finalize()
+    events_path = writer.events_csv_path
+    if profile:
+        _write_profile_summary(path=paths.profile_path, run_profiler=run_profiler, logger=logger)
+    logger.info("Run finished: %s", npz_path)
+    return RunResult(
+        run_dir=paths.run_dir,
+        manifest_path=paths.manifest_path,
+        npz_path=npz_path,
+        events_path=events_path,
+        angles=angles,
+        last_ref_radii=np.asarray(last_ref_radii, dtype=float),
+        completed_steps=int(completed_steps),
+        stop_reason=None,
+        boundary_missing_step=None,
+    )
+
+
 def run(
     config: str | Path | LoadedConfig,
     *,
@@ -1362,6 +1717,17 @@ def run(
         and canonical_controller_name != "t15md_replay"
         and RealismRuntime.has_any_effect(cfg_runtime.realism)
     )
+    if canonical_controller_name == "learned_magnetic_controller":
+        if cfg_runtime.compute.backend != "gpu":
+            raise ValueError(
+                "learned_magnetic_controller artifact runs require --compute-backend gpu "
+                "so deployment uses the same fixed-angle boundary path as RL training"
+            )
+        if realism_active or bool(disturbances):
+            raise ValueError(
+                "learned_magnetic_controller artifact runs currently support the clean GPU plant path only; "
+                "disable realism/disturbances for policy deployment artifacts"
+            )
     paths = _allocate_paths_for_run(
         output_dir=output_dir,
         controller_name=canonical_controller_name,
@@ -1386,8 +1752,37 @@ def run(
         runtime_overrides=runtime_overrides,
     )
     run_meta = _json_safe(run_meta)
+    use_learned_batched_gpu = (
+        canonical_controller_name == "learned_magnetic_controller"
+    )
+    if use_learned_batched_gpu:
+        meta_overrides = dict(run_meta.get("runtime_overrides", {})) if isinstance(run_meta, Mapping) else {}
+        meta_overrides["learned_controller_artifact_path"] = "batched_gpu_fixed_angle"
+        meta_overrides["learned_controller_boundary_signal"] = "fixed_angle_radii"
+        run_meta["runtime_overrides"] = meta_overrides
     _write_manifest(paths.manifest_path, run_meta)
     logger.info("Allocated run directory: %s", paths.run_dir)
+
+    if use_learned_batched_gpu:
+        logger.info("Using learned-controller batched GPU artifact path")
+        return _run_learned_batched_gpu_artifacts(
+            cfg=cfg_runtime,
+            config_source=config_source,
+            paths=paths,
+            run_meta=run_meta,
+            controller_name=canonical_controller_name,
+            ctor_kwargs=ctor_kwargs,
+            scenario_name=scenario_name,
+            scenario_params=scenario_params,
+            steps=int(steps),
+            M_angles=int(M_angles),
+            snapshot_every=int(snapshot_every),
+            show_progress=bool(show_progress),
+            verbose=bool(verbose),
+            profile=bool(profile),
+            logger=logger,
+            run_profiler=run_profiler,
+        )
 
     logger.info("Preparing model and scenario")
     with run_profiler.time_block("prepare"):
