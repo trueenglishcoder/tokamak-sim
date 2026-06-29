@@ -1,0 +1,21 @@
+version = 1
+
+[plasma]
+Ip0 = 0
+
+[coils.pfc]
+currents = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+]
+
+[coils.sol]
+currents = [
+    0,
+    0,
+    0,
+]

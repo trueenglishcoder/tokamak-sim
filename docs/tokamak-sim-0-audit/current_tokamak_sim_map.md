@@ -69,7 +69,7 @@ This file maps the current Python implementation as audited on 2026-06-21. Line 
 
 | File | Lines | Behavior |
 |---|---:|---|
-| `tokamak_control/bridge/simulation_session.py` | 192-258 | Programmatic `step_derivatives()` accepts active derivative commands and steps the plant. |
+| `tokamak_control/bridge/simulation_session.py` | current bridge | Programmatic `step_currents()` accepts absolute next active-coil currents and steps the plant. Older derivative-step notes in this audit are historical. |
 | `tokamak_control/bridge/simulation_session.py` | 325-412 | Snapshots expose current, derivative, boundary, reference, and margins to external callers. |
 | `tokamak_control/bridge/types.py` | full file | Bridge dataclasses use derivative-action vocabulary. |
 

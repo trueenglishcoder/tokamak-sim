@@ -12,7 +12,7 @@ class MachineSpec:
     """Стабильное описание активной runtime-машины для внешнего stepping-кода."""
 
     config_path: Path
-    initial_currents_path: Path | None
+    initial_state_path: Path | None
     boundary_mode: str
     compute_backend: str
     gpu_device: str

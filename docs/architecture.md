@@ -45,19 +45,19 @@ TOML configs are loaded through `tokamak_control/io/config_io.py` into `LoadedCo
 Important settings groups:
 
 - grid dimensions and center coordinates
-- PFC and SOL coil positions/currents
+- PFC and SOL coil geometry, active masks, and limits
 - optional boundary mode and limiter name for physical boundary extraction
 - physical parameters such as `sigma`, `inductance_L`, `t_step`, `R0`, `Z0`
 - actuator lag and optional current/derivative limits
 - optional neutral `[realism]` settings for actuator and sensor nonidealities
 
-Initial-current files live under `configs/initial_currents/`. They can define, per bank, both `active` masks and initial `currents`. Inactive actuators are removed from the runtime model dimensions, so controllers, replay tables, Green functions, and stored current vectors all see only active coils. If no initial-current file is provided, all configured coils are active with zero initial current.
+Machine configs do not contain initial plasma current or initial coil currents. Runtime initial states live under `configs/initial_states/` or are supplied directly by replay, RL, or bridge callers. An initial-state TOML contains `[plasma].Ip0`, `[coils.pfc].currents`, and `[coils.sol].currents`; active masks remain in the machine config. Runs must provide an explicit initial state, so there is no silent fallback to machine defaults.
 
 Each config grid axis stores `start`, `end`, `size`, and `center`. The loader derives the uniform runtime step as `(end - start) / (size - 1)`, keeping the range and number of points as the config source of truth while preserving the `Grid1D.step` value used by the solver.
 
 ## Plant Model
 
-`tokamak_control/core/plasma_model.py` owns the dynamic plant state. Controllers do not set coil currents directly; they return PFC/SOL current derivatives in a `ControlAction`. The model applies optional actuator lag, derivative/current limits, integrates currents, updates `Ip`, and composes the next `psi` field.
+`tokamak_control/core/plasma_model.py` owns the dynamic plant state. The public plant command is absolute next-step coil currents; the plant derives `Jdot = (J_next - J_now) / dt`, updates `Ip`, and composes the next `psi` field. Current and derivative limits are controller/diagnostic metadata, not hidden plant-side initialization.
 
 The current state is represented by `tokamak_control/core/plasma_state.py`.
 

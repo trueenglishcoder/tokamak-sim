@@ -14,7 +14,7 @@ from tokamak_control.core.gpu_plasma_model import GpuPlasmaModel
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.geometry.boundary import BoundaryMode, BoundaryNotFoundError, find_plasma_boundary_with_status
 from tokamak_control.geometry.legacy_metrics import legacy_radii_at_angles
-from tokamak_control.io.config_io import LoadedConfig, load_config
+from tokamak_control.io.config_io import LoadedConfig, apply_initial_state, load_config, load_initial_state, require_initial_state
 from tokamak_control.metrics import current_limit_margin, derivative_limit_margin
 from tokamak_control.realism import RealismRuntime, RealismSettings
 
@@ -26,7 +26,7 @@ class SimulationSession:
         self,
         *,
         config_path: Path,
-        initial_currents_path: Path | None,
+        initial_state_path: Path | None,
         scenario_name: ScenarioName,
         scenario_args: Mapping[str, object],
         angles: int,
@@ -43,7 +43,7 @@ class SimulationSession:
         if int(steps) <= 0:
             raise ValueError("steps must be > 0")
         self.config_path = Path(config_path)
-        self.initial_currents_path = None if initial_currents_path is None else Path(initial_currents_path)
+        self.initial_state_path = None if initial_state_path is None else Path(initial_state_path)
         self.scenario_name = scenario_name
         self.scenario_args = dict(scenario_args)
         self.angle_count = int(angles)
@@ -72,7 +72,7 @@ class SimulationSession:
     def from_paths(
         cls,
         config_path: str | Path,
-        initial_currents_path: str | Path | None,
+        initial_state_path: str | Path | None,
         scenario_name: ScenarioName,
         scenario_args: Mapping[str, object] | None,
         angles: int,
@@ -88,7 +88,7 @@ class SimulationSession:
         _ = seed
         return cls(
             config_path=Path(config_path),
-            initial_currents_path=None if initial_currents_path is None else Path(initial_currents_path),
+            initial_state_path=None if initial_state_path is None else Path(initial_state_path),
             scenario_name=scenario_name,
             scenario_args={} if scenario_args is None else dict(scenario_args),
             angles=int(angles),
@@ -103,19 +103,21 @@ class SimulationSession:
     def reset(
         self,
         *,
-        initial_currents_path: str | Path | None = None,
+        initial_state_path: str | Path | None = None,
         seed: int | None = None,
         realism_settings: RealismSettings | None = None,
         initial_state_override: InitialStateOverride | None = None,
     ) -> ResetResult:
         """Перезагрузить конфигурацию, модель, сценарий и начальную границу."""
         active_initial_path = (
-            self.initial_currents_path
-            if initial_currents_path is None
-            else Path(initial_currents_path)
+            self.initial_state_path
+            if initial_state_path is None
+            else Path(initial_state_path)
         )
         active_initial_override = initial_state_override if initial_state_override is not None else self.initial_state_override
-        cfg = load_config(self.config_path, initial_currents_path=active_initial_path)
+        cfg = load_config(self.config_path)
+        if active_initial_path is not None:
+            cfg = apply_initial_state(cfg, load_initial_state(cfg, active_initial_path))
         if self.compute_backend is not None or self.gpu_device is not None:
             cfg = replace(
                 cfg,
@@ -176,7 +178,7 @@ class SimulationSession:
             cfg=cfg,
             model=model,
             config_path=self.config_path,
-            initial_currents_path=active_initial_path,
+            initial_state_path=active_initial_path,
             initial_state_override=active_initial_override,
             angles_rad=angles_rad,
             base_radii=base_radii,
@@ -406,9 +408,10 @@ class SimulationSession:
 
 
 def _make_model(cfg: LoadedConfig) -> PlasmaModel | GpuPlasmaModel:
+    initial_state = require_initial_state(cfg)
     if cfg.compute.backend == "gpu":
-        return GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, gpu_device=cfg.compute.gpu_device)
-    return PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+        return GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=initial_state.ip0, gpu_device=cfg.compute.gpu_device)
+    return PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=initial_state.ip0)
 
 
 def _model_compute_psi_for_boundary(model: PlasmaModel | GpuPlasmaModel):
@@ -420,10 +423,17 @@ def _model_compute_psi_for_boundary(model: PlasmaModel | GpuPlasmaModel):
 def _apply_initial_state_override(cfg: LoadedConfig, override: InitialStateOverride | None) -> LoadedConfig:
     """Apply explicit bridge-only initial Ip/current overrides to a loaded config."""
     if override is None:
+        require_initial_state(cfg)
         return cfg
-    physics = cfg.physics if override.ip is None else replace(cfg.physics, Ip0=float(override.ip))
+    if override.ip is None:
+        require_initial_state(cfg)
+        ip0 = float(cfg.initial_ip0)
+    else:
+        ip0 = float(override.ip)
     pfc = cfg.pfc
     sol = cfg.sol
+    if override.coil_currents == "config":
+        require_initial_state(cfg)
     if override.coil_currents == "zero":
         pfc = CoilGroup(name=cfg.pfc.name, coils=list(cfg.pfc.coils), currents=np.zeros((cfg.pfc.n_coils,), dtype=float))
         sol = CoilGroup(name=cfg.sol.name, coils=list(cfg.sol.coils), currents=np.zeros((cfg.sol.n_coils,), dtype=float))
@@ -436,7 +446,7 @@ def _apply_initial_state_override(cfg: LoadedConfig, override: InitialStateOverr
             raise ValueError(f"initial override sol_currents shape {sol_values.shape} != ({cfg.sol.n_coils},)")
         pfc = CoilGroup(name=cfg.pfc.name, coils=list(cfg.pfc.coils), currents=pfc_values.copy())
         sol = CoilGroup(name=cfg.sol.name, coils=list(cfg.sol.coils), currents=sol_values.copy())
-    return replace(cfg, physics=physics, pfc=pfc, sol=sol)
+    return replace(cfg, pfc=pfc, sol=sol, initial_ip0=ip0)
 
 
 def _initial_state_override_metadata(override: InitialStateOverride | None) -> dict[str, object]:
@@ -460,7 +470,7 @@ def _build_machine_spec(
     cfg: LoadedConfig,
     model: PlasmaModel,
     config_path: Path,
-    initial_currents_path: Path | None,
+    initial_state_path: Path | None,
     initial_state_override: InitialStateOverride | None,
     angles_rad: np.ndarray,
     base_radii: np.ndarray,
@@ -480,7 +490,7 @@ def _build_machine_spec(
     radius_scale = _radius_scale(cfg=cfg, model=model, base_radii=base_radii)
     return MachineSpec(
         config_path=Path(config_path),
-        initial_currents_path=None if initial_currents_path is None else Path(initial_currents_path),
+        initial_state_path=None if initial_state_path is None else Path(initial_state_path),
         boundary_mode=str(cfg.boundary_mode),
         compute_backend=str(cfg.compute.backend),
         gpu_device=str(cfg.compute.gpu_device),

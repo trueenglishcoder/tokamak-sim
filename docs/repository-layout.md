@@ -1,76 +1,68 @@
 # Repository Layout
 
-This document describes the source-tree layout for GitHub preparation. The project keeps the existing `tokamak_control/` package structure and treats configs, data, and generated outputs as local ignored inputs/artifacts.
+This document describes the maintained `tokamak-sim` source tree and local
+artifact folders.
 
 ## Versioned Source Areas
 
 ```text
 README.md         Project overview and common commands
+CURRENT_PIPELINE.md Active plant/RL contract
 AGENTS.md         AI-agent coding rules
 pyproject.toml    Package metadata and dependencies
 Dockerfile        Runtime image for CLI/server use
-docker-compose.yml Local volume-mounted Docker runtime
-.dockerignore     Build-context exclusions
+docker-compose.yml Local volume-mounted runtime
 docs/             Human-facing project documentation
-scripts/          Directly runnable workflow scripts
-tests/            Workflow regression tests
-tokamak_control/  Importable Python package
+scripts/          Runnable workflow and diagnostic scripts
+tests/            Regression and parity tests
+tokamak_control/  Importable simulation/control package
 ```
 
-## Ignored Local Areas
+## Protected Local Inputs
+
+These folders are local inputs or preserved generated baselines:
 
 ```text
-configs/          Local TOML machine configs and initial-current files
-data/             Local shot tables and generated fitting datasets
-runs/             Simulation run folders
+configs/          TOML machine configs and initial-current files
+data/             T15 CSV datasets and fitting inputs
+runs/             Simulation run folders and replay reference datasets
 output/           Fitting/diagnostic outputs
-synthetic_iter/   Generated synthetic ITER tables
-_local_archive/   Local notes, old command logs, conversion scratch files
-.venv/            Local virtual environment
-.pytest_cache/    Pytest cache
 ```
 
-`configs/`, `data/`, and generated outputs are not deleted. They remain usable in this workspace, but they are ignored so the future GitHub repository can be source-focused.
+For the final RL pipeline, the important local paths are:
 
-## Configs
-
-`configs/` contains local TOML files used by simulation and fitting commands. Hard machine configs hold geometry, physics, optional boundary mode, and optional limiter names. Startup currents and active-coil masks live under `configs/initial_currents/`.
-
-Use paths like:
-
-```bash
---config configs/T15MD_new_data.toml
---initial-currents configs/initial_currents/T15MD_new_data_3864.toml
+```text
+data/t15_data_new_trim50/
+runs/t15md_trim50_plain_gpu_1e6_setup/
+runs/t15md_limited_replay_dataset_trim50_gpu_plain_1e6/
 ```
 
-For Docker/server use, these files should be provided through a mounted volume or another explicit deployment step.
+## Package Layout
 
-## Scripts
+```text
+tokamak_control/bridge/     programmatic reset/step API
+tokamak_control/cli/        single-run orchestration and CLI helpers
+tokamak_control/config/     settings dataclasses and scenario definitions
+tokamak_control/control/    controllers, replay tables, learned-controller loader
+tokamak_control/core/       grid, coils, Green functions, plant state/model
+tokamak_control/geometry/   boundary finding, limiter polygons, GPU fixed-angle path
+tokamak_control/io/         config loading, artifact IO, logging, profiling
+tokamak_control/metrics/    pure tracking and actuator diagnostics
+tokamak_control/realism/    optional neutral nonidealities
+tokamak_control/viz/        plotting, frames, video helpers
+```
 
-`scripts/` contains runnable entry points:
+## Maintained Scripts
 
-- `run_simulation_artifacts.py`: runs one simulation and writes plots, optional frames, and optional video.
-- `generate_synthetic_iter_dataset.py`: generates synthetic ITER Ip/coil-current tables for fitting checks.
-- `generate_synthetic_ip_tables.py`: generates synthetic T15-like Ip reference tables for algorithmic-controller runs.
-- `fit_sigma_L_grid.py`: grid search for effective `sigma` and `inductance_L`.
-- `fit_sigma_L_gradient.py`: SPSA-style gradient alternative for sigma/L fitting.
+```text
+scripts/run_simulation_artifacts.py        run one simulation and write artifacts
+scripts/run_t15md_limited_replay_dataset.py generate replay references
+scripts/compare_cpu_gpu_boundary_t15_replay.py compare boundary extractors
+scripts/fit_sigma_L_grid.py                sigma/L grid fit
+scripts/fit_sigma_L_gradient.py            sigma/L gradient fit
+scripts/fit_t15_boundary_parameters.py     boundary diagnostics
+```
 
-## Package
-
-`tokamak_control/` is the importable package:
-
-- `bridge/`: small programmatic reset/step API for external tools.
-- `cli/`: canonical single-run orchestration and the package CLI.
-- `config/`: settings dataclasses and scenario definitions.
-- `control/`: controllers, replay tables, linearization, and controller registry.
-- `core/`: grid, coils, Green functions, plasma state, and plasma model.
-- `experiments/`: runtime plant disturbances.
-- `geometry/`: boundary finding, limiter polygons, X-point detection, and coordinate utilities.
-- `io/`: config loading, artifact IO, logging, profiling.
-- `metrics/`: pure tracking, boundary, and actuator diagnostics.
-- `realism/`: neutral actuator and sensor nonidealities shared by CLI runs and bridge sessions.
-- `viz/`: plotting, frames, and video helpers.
-
-## Current Cleanup State
-
-Loose local files that were not part of project functionality were moved to `_local_archive/` and ignored. The top-level source tree now contains only project metadata/docs plus source directories.
+LittleScope audit docs and parity notes remain available under
+`docs/tokamak-sim-0-audit/` as historical/diagnostic material, not active launch
+instructions.

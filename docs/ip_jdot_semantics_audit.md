@@ -25,7 +25,7 @@ as active behavior.
 | Poloidal flux | Composed from updated true `Ip_next` and next coil currents |
 | LQR control variable | `delta_Jdot`, accumulated into `Jdot_cmd`, then converted to absolute `J_next` |
 | RL control variable | Normalized requested delta-Jdot; environment accumulates derivative command and sends absolute `J_next` |
-| Learned export contract | `delta_jdot_derivative_command_v3`; old exports are intentionally incompatible |
+| Historical learned export contract in this audit | `delta_jdot_derivative_command_v3`; superseded by the active `absolute_jdot_command_v1` learned-policy export contract |
 
 ## File Classification
 

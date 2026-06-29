@@ -26,6 +26,7 @@ class GpuPlasmaModel:
     pfc: CoilGroup
     sol: CoilGroup
     settings: PhysicsSettings
+    ip0: float
     gpu_device: str = "cuda:0"
 
     def __post_init__(self) -> None:
@@ -35,7 +36,7 @@ class GpuPlasmaModel:
         self.dtype = torch.float64
         self.R0 = float(self.settings.R0)
         self.Z0 = float(self.settings.Z0)
-        self.Ip0 = float(self.settings.Ip0)
+        self.Ip0 = float(self.ip0)
         self.mu0 = float(self.settings.mu0)
         self.sigma = float(self.settings.sigma)
         self.inductance_L = float(self.settings.inductance_L)
@@ -69,9 +70,9 @@ class GpuPlasmaModel:
         self.state = self._snapshot_state()
 
     @classmethod
-    def from_settings(cls, grid: Grid2D, pfc: CoilGroup, sol: CoilGroup, settings: PhysicsSettings, gpu_device: str = "cuda:0") -> "GpuPlasmaModel":
+    def from_settings(cls, grid: Grid2D, pfc: CoilGroup, sol: CoilGroup, settings: PhysicsSettings, *, ip0: float, gpu_device: str = "cuda:0") -> "GpuPlasmaModel":
         settings.validate()
-        return cls(grid=grid, pfc=pfc, sol=sol, settings=settings, gpu_device=gpu_device)
+        return cls(grid=grid, pfc=pfc, sol=sol, settings=settings, ip0=float(ip0), gpu_device=gpu_device)
 
     def _clip_currents(self, values, limit: float | None):
         if limit is None or float(limit) <= 0.0:

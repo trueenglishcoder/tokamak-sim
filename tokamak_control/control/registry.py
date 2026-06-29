@@ -10,7 +10,6 @@ import numpy as np
 from tokamak_control.control.base import Controller
 from tokamak_control.control.coil_replay import CoilReplayController
 from tokamak_control.control.learned_magnetic_controller import LearnedMagneticController
-from tokamak_control.control.lqr_t15_zaitsev import LQRT15ZaitsevController
 from tokamak_control.control.t15md_replay import T15MDReplayController
 
 
@@ -31,9 +30,22 @@ class ControllerSpec:
 
     name: str
     family: str
-    controller_cls: type[Controller]
+    controller_cls: type[Controller] | Callable[[], type[Controller]]
     launch_params: tuple[ControllerLaunchParam, ...] = ()
     runtime_inputs: tuple[str, ...] = ()
+
+
+def _load_lqr_t15_zaitsev_controller() -> type[Controller]:
+    # scipy is only required by the LQR controller, not by replay/artifact paths.
+    from tokamak_control.control.lqr_t15_zaitsev import LQRT15ZaitsevController
+
+    return LQRT15ZaitsevController
+
+
+def _resolve_controller_cls(spec: ControllerSpec) -> type[Controller]:
+    if isinstance(spec.controller_cls, type):
+        return spec.controller_cls
+    return spec.controller_cls()
 
 
 def _validate_finite_positive(name: str) -> Callable[[object], None]:
@@ -159,7 +171,7 @@ _SPECS: dict[str, ControllerSpec] = {
     "lqr_t15_zaitsev": ControllerSpec(
         name="lqr_t15_zaitsev",
         family="joint",
-        controller_cls=LQRT15ZaitsevController,
+        controller_cls=_load_lqr_t15_zaitsev_controller,
         launch_params=_ANALYTIC_PARAMS["lqr_t15_zaitsev"],
         runtime_inputs=_RUNTIME_INPUTS["lqr_t15_zaitsev"],
     ),
@@ -269,15 +281,16 @@ def make_controller(name: str, **kwargs: Any) -> Controller:
     """
     spec = get_controller_spec(name)
     cfg = kwargs.get("config")
+    controller_cls = _resolve_controller_cls(spec)
 
     if cfg is None:
-        return spec.controller_cls()
+        return controller_cls()
     if not isinstance(cfg, Mapping):
         raise TypeError(
             f'Controller "{spec.name}" expects launch parameters as a mapping; '
             f"got {type(cfg).__name__}"
         )
-    return spec.controller_cls(**dict(cfg))
+    return controller_cls(**dict(cfg))
 
 
 def _coerce_launch_value(value: object, annotation: object, param_name: str) -> object:

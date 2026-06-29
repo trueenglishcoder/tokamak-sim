@@ -7,12 +7,17 @@ import pytest
 
 from tokamak_control.core.green import build_green_for_coils, build_green_for_eind
 from tokamak_control.core.plasma_model import PlasmaModel
-from tokamak_control.io.config_io import load_config
+from tokamak_control.io.config_io import apply_initial_state, load_config, load_initial_state, require_initial_state
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 T15_CONFIG = REPO_ROOT / "configs/T15MD_new_data.toml"
-T15_INITIAL = REPO_ROOT / "configs/initial_currents/T15MD_new_data_3864.toml"
+T15_INITIAL = REPO_ROOT / "configs/initial_states/T15MD_new_data_3864.toml"
+
+
+def _load_t15_config():
+    cfg = load_config(T15_CONFIG)
+    return apply_initial_state(cfg, load_initial_state(cfg, T15_INITIAL))
 
 
 def _require_t15_config() -> None:
@@ -30,7 +35,7 @@ def test_t15_split_sol_green_fields_are_weighted_runtime_actuators() -> None:
     the split count.
     """
     _require_t15_config()
-    cfg = load_config(T15_CONFIG, initial_currents_path=T15_INITIAL)
+    cfg = _load_t15_config()
 
     counts = [group.shape[0] for group in cfg.sol.element_positions]
     assert cfg.sol.n_coils == 3
@@ -67,8 +72,8 @@ def test_t15_split_sol_green_fields_are_weighted_runtime_actuators() -> None:
 def test_t15_split_sol_step_currents_keeps_three_runtime_sol_channels() -> None:
     """The plant state and command interface expose SOL0/SOL1/SOL2 only."""
     _require_t15_config()
-    cfg = load_config(T15_CONFIG, initial_currents_path=T15_INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_t15_config()
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=require_initial_state(cfg).ip0)
 
     sol0 = np.asarray(model.state.sol_currents, dtype=float).copy()
     pfc0 = np.asarray(model.state.pfc_currents, dtype=float).copy()

@@ -9,16 +9,21 @@ from tokamak_control.bridge import SimulationSession
 from tokamak_control.compute import ComputeSettings, normalize_compute_backend, require_gpu_available
 from tokamak_control.core.gpu_plasma_model import GpuPlasmaModel
 from tokamak_control.core.plasma_model import PlasmaModel
-from tokamak_control.io.config_io import dump_config, load_config
+from tokamak_control.io.config_io import apply_initial_state, dump_config, load_config, load_initial_state, require_initial_state
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG = REPO_ROOT / "configs/T15MD_new_data.toml"
-INITIAL = REPO_ROOT / "configs/initial_currents/T15MD_new_data_3864.toml"
+INITIAL = REPO_ROOT / "configs/initial_states/T15MD_new_data_3864.toml"
+
+
+def _load_with_initial():
+    cfg = load_config(CONFIG)
+    return apply_initial_state(cfg, load_initial_state(cfg, INITIAL))
 
 
 def test_compute_settings_round_trip(tmp_path: Path) -> None:
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
+    cfg = _load_with_initial()
     out = tmp_path / "config.toml"
     dump_config(
         out,
@@ -64,9 +69,10 @@ def test_gpu_plasma_model_matches_cpu_for_fixed_actions() -> None:
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    cpu = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
-    gpu = GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, gpu_device="cuda:0")
+    cfg = _load_with_initial()
+    initial = require_initial_state(cfg)
+    cpu = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=initial.ip0)
+    gpu = GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=initial.ip0, gpu_device="cuda:0")
     rng = np.random.default_rng(123)
     for _ in range(5):
         pfc = rng.normal(0.0, 2.0e5, size=cfg.pfc.n_coils)

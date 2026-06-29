@@ -75,7 +75,7 @@ This audit treats the current working tree as truth, including dirty and untrack
 | `configs/T15MD_new_data_replay_start_3859.toml` | 843 | reviewed | Same structure with replay start. |
 | `configs/T15MD_new_data_zero_start.toml` | 843 | reviewed | Same structure with zero start. |
 | `configs/ITER*.toml`, `configs/JET.toml` | 6767 | reviewed | Non-T15 configs; not core to T15 parity, but schema compared. |
-| `configs/initial_currents/*.toml` | 1800+ | reviewed | Initial-current overrides; T15 shot files are 31 lines each. |
+| `configs/initial_states/*.toml` | 1800+ | reviewed | Runtime initial-state files; T15 shot files contain explicit Ip0, PFC currents, and SOL currents. |
 | `scripts/run_simulation_artifacts.py` | 360 | fully read | Artifact CLI and video path. |
 | `scripts/fit_sigma_L_gradient.py`, `fit_sigma_L_grid.py` | 1980 | reviewed | T15 fitted sigma/L generation; explains intentional tau mismatch. |
 | Other `scripts/*.py` and `run_t15md_replay_batch.sh` | 1247 | reviewed | Data/prep/artifact utilities; not old runtime math. |

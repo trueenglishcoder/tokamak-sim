@@ -46,7 +46,7 @@ from tokamak_control.geometry.boundary import (
     boundary_profiling_snapshot,
 )
 from tokamak_control.geometry.legacy_metrics import legacy_measurement_angles_from_actuators, legacy_radii_at_angles
-from tokamak_control.io.config_io import LoadedConfig, load_config
+from tokamak_control.io.config_io import LoadedConfig, apply_initial_state, load_config, load_initial_state, require_initial_state
 from tokamak_control.io.data_io import RunWriter
 from tokamak_control.io.logger import configure_logging, get_logger
 from tokamak_control.io.profiling import Profiler
@@ -368,7 +368,7 @@ def _build_run_metadata(
         "run_id": int(run_id),
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "config_source": config_source,
-        "initial_currents_source": cfg.initial_currents_source,
+        "initial_state_source": cfg.initial_state_source,
         "steps": int(steps),
         "controller": {
             "name": controller_name,
@@ -400,7 +400,7 @@ def _build_run_metadata(
             "Z0": float(cfg.physics.Z0),
         },
         "physics": {
-            "Ip0": float(cfg.physics.Ip0),
+            "Ip0": float(require_initial_state(cfg).ip0),
             "t_step": float(cfg.physics.t_step),
             "sigma": float(cfg.physics.sigma),
             "inductance_L": float(cfg.physics.inductance_L),
@@ -514,15 +514,17 @@ def _prepare(
     controller_name: str = "",
 ) -> tuple[PlasmaModel | GpuPlasmaModel, np.ndarray, Scenario, np.ndarray]:
     """Подготовить модель, опорные углы и сценарий для выбранного контроллера."""
+    initial_state = require_initial_state(cfg)
     model: PlasmaModel | GpuPlasmaModel
     if cfg.compute.backend == "gpu":
-        model = GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, gpu_device=cfg.compute.gpu_device)
+        model = GpuPlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=initial_state.ip0, gpu_device=cfg.compute.gpu_device)
     else:
         model = PlasmaModel.from_settings(
             grid=cfg.grid,
             pfc=cfg.pfc,
             sol=cfg.sol,
             settings=cfg.physics,
+            ip0=initial_state.ip0,
         )
 
     angles = np.linspace(-np.pi, np.pi, M_angles, endpoint=False, dtype=float)
@@ -677,12 +679,20 @@ def _configure_run_logging(
 def _load_config_for_run(
     config: str | Path | LoadedConfig,
     *,
-    initial_currents_path: str | Path | None,
+    initial_state_path: str | Path | None,
     run_profiler: Profiler,
 ) -> tuple[LoadedConfig, str]:
     """Загрузить TOML-конфигурацию или принять уже разобранный объект."""
     with run_profiler.time_block("load_config"):
-        cfg = load_config(config, initial_currents_path=initial_currents_path) if not isinstance(config, LoadedConfig) else config
+        if isinstance(config, LoadedConfig):
+            cfg = config
+            if cfg.initial_ip0 is None:
+                raise ValueError("LoadedConfig passed to run() must have an explicit initial state attached")
+        else:
+            if initial_state_path is None:
+                raise ValueError("run() requires an explicit initial_state_path")
+            cfg = load_config(config)
+            cfg = apply_initial_state(cfg, load_initial_state(cfg, initial_state_path))
         source = str(config) if not isinstance(config, LoadedConfig) else "<LoadedConfig>"
     return cfg, source
 
@@ -1463,7 +1473,7 @@ def _run_batched_gpu_fixed_angle_artifacts(
         gpu_device=cfg.compute.gpu_device,
     )
     result = simulator.reset(
-        ip=np.asarray([cfg.physics.Ip0], dtype=float),
+        ip=np.asarray([require_initial_state(cfg).ip0], dtype=float),
         pfc_currents=np.asarray(cfg.pfc.initial_currents, dtype=float).reshape(1, cfg.pfc.n_coils),
         sol_currents=np.asarray(cfg.sol.initial_currents, dtype=float).reshape(1, cfg.sol.n_coils),
     )
@@ -1678,7 +1688,7 @@ def _run_batched_gpu_fixed_angle_artifacts(
 def run(
     config: str | Path | LoadedConfig,
     *,
-    initial_currents_path: str | Path | None = None,
+    initial_state_path: str | Path | None = None,
     steps: int,
     output_dir: str | Path | None,
     controller_name: str = "lqr_t15_zaitsev",
@@ -1704,7 +1714,7 @@ def run(
     )
 
     logger.info("Loading configuration")
-    cfg, config_source = _load_config_for_run(config, initial_currents_path=initial_currents_path, run_profiler=run_profiler)
+    cfg, config_source = _load_config_for_run(config, initial_state_path=initial_state_path, run_profiler=run_profiler)
     logger.info("Normalizing controller launch: %s", controller_name)
     canonical_controller_name, normalized_controller_params, ctor_kwargs = _normalize_controller_for_run(
         controller_name,

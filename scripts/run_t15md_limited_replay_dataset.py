@@ -156,18 +156,59 @@ def _discover_data_shots(data_root: Path) -> list[str]:
     return shots
 
 
-def _validate_shot_files(shot: str, *, data_root: Path, initial_root: Path, initial_prefix: str) -> tuple[Path, Path, Path]:
+def _first_numeric_row(path: Path) -> list[float]:
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                return [float(x) for x in line.split(";")]
+    raise ValueError(f"{path} is empty")
+
+
+def _ensure_initial_state_file(
+    *,
+    shot: str,
+    config: Path,
+    coils: Path,
+    ip: Path,
+    initial_root: Path,
+    initial_prefix: str,
+) -> Path:
+    cfg = load_config(config)
+    row_ip = _first_numeric_row(ip)
+    row_coils = _first_numeric_row(coils)
+    currents = row_coils[1:]
+    n_sol = int(cfg.sol.n_coils)
+    n_pfc = int(cfg.pfc.n_coils)
+    expected = n_sol + n_pfc
+    if len(currents) != expected:
+        raise ValueError(f"Shot {shot} first coil row has {len(currents)} currents, expected {expected}")
+    out = initial_root / f"{initial_prefix}_{shot}.toml"
+    data = {
+        "version": 1,
+        "plasma": {"Ip0": float(row_ip[1])},
+        "coils": {
+            "pfc": {"currents": [float(x) for x in currents[n_sol:]]},
+            "sol": {"currents": [float(x) for x in currents[:n_sol]]},
+        },
+    }
+    initial_root.mkdir(parents=True, exist_ok=True)
+    with out.open("wb") as f:
+        tomli_w.dump(data, f)
+    return out
+
+
+def _validate_shot_files(shot: str, *, data_root: Path) -> tuple[Path, Path]:
     coils = data_root / "coils" / f"t15md_{shot}_coils.csv"
     ip = data_root / "ip" / f"t15md_{shot}_ip.csv"
-    init = initial_root / f"{initial_prefix}_{shot}.toml"
-    missing = [str(p) for p in (coils, ip, init) if not p.exists()]
+    missing = [str(p) for p in (coils, ip) if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Shot {shot} is missing required files: {', '.join(missing)}")
     if _count_rows(coils) != _count_rows(ip):
         raise ValueError(
             f"Shot {shot} has mismatched row counts: coils={_count_rows(coils)} ip={_count_rows(ip)}"
         )
-    return coils, ip, init
+    return coils, ip
 
 
 def _run_one_shot(
@@ -187,7 +228,15 @@ def _run_one_shot(
     gpu_device: str,
     dry_run: bool,
 ) -> Path | None:
-    coils, ip, init = _validate_shot_files(shot, data_root=data_root, initial_root=initial_root, initial_prefix=initial_prefix)
+    coils, ip = _validate_shot_files(shot, data_root=data_root)
+    init = _ensure_initial_state_file(
+        shot=shot,
+        config=config,
+        coils=coils,
+        ip=ip,
+        initial_root=initial_root,
+        initial_prefix=initial_prefix,
+    )
     steps = _count_rows(ip)
     shot_parent = dataset_root / f"t15md_limited_replay_{shot}"
     before = {p.resolve() for p in shot_parent.iterdir() if p.is_dir()} if shot_parent.exists() else set()
@@ -197,7 +246,7 @@ def _run_one_shot(
         "scripts/run_simulation_artifacts.py",
         "--config",
         str(config),
-        "--initial-currents",
+        "--initial-state",
         str(init.relative_to(REPO_ROOT)),
         "--steps",
         str(steps),
@@ -403,8 +452,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shots", nargs="+", default=list(DEFAULT_SHOTS), help="Shot ids to run, or 'auto' for every paired shot.")
     parser.add_argument("--config", default="configs/T15MD_new_data.toml", help="Base config to copy from.")
     parser.add_argument("--data-root", default="data/t15_data_new", help="Replay data root with ip/ and coils/ subdirectories.")
-    parser.add_argument("--initial-root", default="configs/initial_currents", help="Directory containing <initial-prefix>_<shot>.toml files.")
-    parser.add_argument("--initial-prefix", default="T15MD_new_data", help="Prefix for configs/initial_currents/<prefix>_<shot>.toml")
+    parser.add_argument("--initial-root", default="configs/initial_states", help="Directory for generated <initial-prefix>_<shot>.toml initial-state files.")
+    parser.add_argument("--initial-prefix", default="T15MD_new_data", help="Prefix for configs/initial_states/<prefix>_<shot>.toml")
     parser.add_argument("--strict-config-name", default=None, help="Filename for the generated replay boundary config.")
     parser.add_argument("--out", default="runs/t15md_limited_replay_dataset", help="Dataset output root.")
     parser.add_argument("--angles", type=int, default=32, help="Boundary radii sample count to store.")
@@ -506,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     for shot in shots:
-        _validate_shot_files(str(shot), data_root=data_root, initial_root=initial_root, initial_prefix=str(args.initial_prefix))
+        _validate_shot_files(str(shot), data_root=data_root)
 
     rows: list[dict[str, object]] = []
     for shot in shots:

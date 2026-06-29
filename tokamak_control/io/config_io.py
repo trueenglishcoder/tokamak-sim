@@ -50,7 +50,18 @@ class LoadedConfig:
     limiter_shape: np.ndarray | None = None
     pfc_active_mask: np.ndarray | None = None
     sol_active_mask: np.ndarray | None = None
-    initial_currents_source: str | None = None
+    initial_state_source: str | None = None
+    initial_ip0: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InitialState:
+    """Explicit runtime initial state for one simulation reset."""
+
+    ip0: float
+    pfc_currents: np.ndarray
+    sol_currents: np.ndarray
+    source: str | None = None
 
 
 def _require_mapping(obj: object, name: str) -> dict:
@@ -297,21 +308,16 @@ def _load_realism_settings(cfg: dict) -> RealismSettings:
 
 
 
-def load_config(path: str | Path, initial_currents_path: str | Path | None = None) -> LoadedConfig:
-    """Load a TOML configuration and construct domain objects."""
+def load_config(path: str | Path) -> LoadedConfig:
+    """Load a machine TOML configuration and construct domain objects.
+
+    Machine configs intentionally do not contain runtime initial conditions.
+    Use :func:`load_initial_state` and :func:`apply_initial_state` for Ip and
+    starting coil currents.
+    """
     path = Path(path)
     with path.open("rb") as f:
         cfg = tomllib.load(f)
-    initial_cfg: dict[str, object] | None = None
-    if initial_currents_path is not None:
-        initial_path = Path(initial_currents_path)
-        with initial_path.open("rb") as f:
-            loaded_initial = tomllib.load(f)
-        if not isinstance(loaded_initial, dict):
-            raise ValueError("Initial-current TOML content must be a table")
-        initial_cfg = loaded_initial
-    else:
-        initial_path = None
 
     if not isinstance(cfg, dict):
         raise ValueError("Top-level TOML content must be a table")
@@ -329,6 +335,8 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
     grid = Grid2D(r=r, z=z)
 
     p = _require_mapping(cfg.get("physics", {}), "physics")
+    if "Ip0" in p:
+        raise ValueError("physics.Ip0 is no longer allowed in machine configs; use an initial-state TOML")
     defaults = PhysicsSettings()
     physics = PhysicsSettings(
         mu0=_coerce_float(p.get("mu0", defaults.mu0), "physics.mu0"),
@@ -338,7 +346,6 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         plasma_psi_sign=_coerce_float(p.get("plasma_psi_sign", defaults.plasma_psi_sign), "physics.plasma_psi_sign"),
         t_step=_coerce_float(p.get("t_step", defaults.t_step), "physics.t_step"),
         actuator_tau=_coerce_float(p.get("actuator_tau", defaults.actuator_tau), "physics.actuator_tau"),
-        Ip0=_coerce_float(p.get("Ip0", defaults.Ip0), "physics.Ip0"),
         R0=_coerce_float(p.get("R0", defaults.R0), "physics.R0"),
         Z0=_coerce_float(p.get("Z0", defaults.Z0), "physics.Z0"),
         pfc_current_limit=_coerce_optional_float(p.get("pfc_current_limit", defaults.pfc_current_limit), "physics.pfc_current_limit"),
@@ -359,36 +366,17 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
     pfc_cfg = _require_mapping(_require_key(c, "pfc", "coils"), "coils.pfc")
     sol_cfg = _require_mapping(_require_key(c, "sol", "coils"), "coils.sol")
 
-    initial_coils_cfg: dict[str, object] | None = None
-    if initial_cfg is not None:
-        initial_coils_cfg = _require_mapping(initial_cfg.get("coils", {}), "coils")
-
-    def _initial_bank_node(bank: str) -> dict:
-        """Вернуть TOML-таблицу начального состояния для банка."""
-        if initial_coils_cfg is None:
-            return {}
-        return _require_mapping(_require_key(initial_coils_cfg, bank, "coils"), f"coils.{bank}")
-
-    def _mk_group(name: str, node: dict, initial_node: dict | None = None) -> tuple[CoilGroup, np.ndarray]:
+    def _mk_group(name: str, node: dict) -> tuple[CoilGroup, np.ndarray]:
         """Собрать банк катушек с учетом активной маски."""
         elements = _coerce_actuator_elements(node, name)
         element_weights = _coerce_optional_element_weights(node.get("element_weights"), f"{name}.element_weights", groups=elements)
-        state_node = node if initial_node is None or len(initial_node) == 0 else initial_node
-
-        if "currents" in state_node:
-            currents = np.asarray(state_node["currents"], dtype=float)
-        else:
-            currents = np.zeros((len(elements),), dtype=float)
-        if currents.shape != (len(elements),):
-            raise ValueError(f"{name}.currents must have shape ({len(elements)},)")
-        if not np.all(np.isfinite(currents)):
-            raise ValueError(f"{name}.currents must contain only finite values")
-        active_mask = _coerce_optional_bool_vector(state_node.get("active"), f"{name}.active", size=len(elements))
+        if "currents" in node:
+            raise ValueError(f"{name}.currents is no longer allowed in machine configs; use an initial-state TOML")
+        active_mask = _coerce_optional_bool_vector(node.get("active"), f"{name}.active", size=len(elements))
         if not np.any(active_mask):
             raise ValueError(f"{name}.active must contain at least one active actuator")
         active_elements = [group for group, is_active in zip(elements, active_mask, strict=True) if bool(is_active)]
         active_weights = None if element_weights is None else [weights for weights, is_active in zip(element_weights, active_mask, strict=True) if bool(is_active)]
-        active_currents = currents[active_mask]
         actuators = [
             CoilActuator(
                 elements=[Coil(R=float(R), Z=float(Z)) for R, Z in group],
@@ -396,10 +384,10 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
             )
             for i, group in enumerate(active_elements)
         ]
-        return CoilGroup(name=str(node.get("name", name)), coils=actuators, currents=active_currents), active_mask
+        return CoilGroup(name=str(node.get("name", name)), coils=actuators, currents=np.zeros((len(actuators),), dtype=float)), active_mask
 
-    pfc, pfc_active_mask = _mk_group("coils.pfc", pfc_cfg, _initial_bank_node("pfc"))
-    sol, sol_active_mask = _mk_group("coils.sol", sol_cfg, _initial_bank_node("sol"))
+    pfc, pfc_active_mask = _mk_group("coils.pfc", pfc_cfg)
+    sol, sol_active_mask = _mk_group("coils.sol", sol_cfg)
 
     def _active_couplings(values: tuple[float, ...] | None, mask: np.ndarray, active_count: int, name: str) -> tuple[float, ...] | None:
         """Согласовать вектор связи Ip с активными катушками."""
@@ -545,7 +533,74 @@ def load_config(path: str | Path, initial_currents_path: str | Path | None = Non
         limiter_shape=limiter_shape,
         pfc_active_mask=pfc_active_mask.copy(),
         sol_active_mask=sol_active_mask.copy(),
-        initial_currents_source=None if initial_path is None else str(initial_path),
+    )
+
+
+def load_initial_state(machine_cfg: LoadedConfig, path: str | Path) -> InitialState:
+    """Load explicit runtime initial Ip and coil currents for ``machine_cfg``."""
+    path = Path(path)
+    with path.open("rb") as f:
+        raw = tomllib.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError("Initial-state TOML content must be a table")
+    version = _coerce_int(raw.get("version", 1), "version")
+    if version != 1:
+        raise ValueError(f"Unsupported initial-state version: {version}")
+    plasma = _require_mapping(raw.get("plasma", {}), "plasma")
+    ip0 = _coerce_float(_require_key(plasma, "Ip0", "plasma"), "plasma.Ip0")
+    coils = _require_mapping(raw.get("coils", {}), "coils")
+    pfc_node = _require_mapping(_require_key(coils, "pfc", "coils"), "coils.pfc")
+    sol_node = _require_mapping(_require_key(coils, "sol", "coils"), "coils.sol")
+    for name, node in (("coils.pfc", pfc_node), ("coils.sol", sol_node)):
+        if "active" in node:
+            raise ValueError(f"{name}.active is machine topology and is not allowed in initial-state TOMLs")
+
+    def _currents(node: dict, name: str, count: int) -> np.ndarray:
+        arr = np.asarray(_require_key(node, "currents", name), dtype=float)
+        if arr.shape != (int(count),):
+            raise ValueError(f"{name}.currents must have shape ({int(count)},)")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name}.currents must contain only finite values")
+        return arr.copy()
+
+    return InitialState(
+        ip0=float(ip0),
+        pfc_currents=_currents(pfc_node, "coils.pfc", machine_cfg.pfc.n_coils),
+        sol_currents=_currents(sol_node, "coils.sol", machine_cfg.sol.n_coils),
+        source=str(path),
+    )
+
+
+def apply_initial_state(machine_cfg: LoadedConfig, initial_state: InitialState) -> LoadedConfig:
+    """Attach an explicit runtime initial state to a loaded machine config."""
+    pfc_currents = np.asarray(initial_state.pfc_currents, dtype=float).reshape(-1)
+    sol_currents = np.asarray(initial_state.sol_currents, dtype=float).reshape(-1)
+    if pfc_currents.shape != (machine_cfg.pfc.n_coils,):
+        raise ValueError(f"initial_state.pfc_currents shape {pfc_currents.shape} != ({machine_cfg.pfc.n_coils},)")
+    if sol_currents.shape != (machine_cfg.sol.n_coils,):
+        raise ValueError(f"initial_state.sol_currents shape {sol_currents.shape} != ({machine_cfg.sol.n_coils},)")
+    if not np.isfinite(float(initial_state.ip0)):
+        raise ValueError("initial_state.ip0 must be finite")
+    pfc = CoilGroup(name=machine_cfg.pfc.name, coils=list(machine_cfg.pfc.coils), currents=pfc_currents.copy())
+    sol = CoilGroup(name=machine_cfg.sol.name, coils=list(machine_cfg.sol.coils), currents=sol_currents.copy())
+    return replace(
+        machine_cfg,
+        pfc=pfc,
+        sol=sol,
+        initial_state_source=initial_state.source,
+        initial_ip0=float(initial_state.ip0),
+    )
+
+
+def require_initial_state(cfg: LoadedConfig) -> InitialState:
+    """Return the attached initial state or fail with the new contract error."""
+    if cfg.initial_ip0 is None:
+        raise ValueError("An explicit initial state is required; pass --initial-state or attach a reset payload")
+    return InitialState(
+        ip0=float(cfg.initial_ip0),
+        pfc_currents=np.asarray(cfg.pfc.initial_currents, dtype=float).copy(),
+        sol_currents=np.asarray(cfg.sol.initial_currents, dtype=float).copy(),
+        source=cfg.initial_state_source,
     )
 
 
@@ -599,7 +654,6 @@ def dump_config(
             "plasma_psi_sign": physics.plasma_psi_sign,
             "t_step": physics.t_step,
             "actuator_tau": physics.actuator_tau,
-            "Ip0": physics.Ip0,
             "R0": physics.R0,
             "Z0": physics.Z0,
             "pfc_current_limit": physics.pfc_current_limit,
@@ -667,13 +721,11 @@ def dump_config(
                 "name": pfc.name,
                 "elements": [arr.tolist() for arr in pfc.element_positions],
                 "element_weights": [arr.tolist() for arr in pfc.element_weights] if any(not np.allclose(arr, np.ones_like(arr)) for arr in pfc.element_weights) else None,
-                "currents": pfc.initial_currents.tolist(),
             },
             "sol": {
                 "name": sol.name,
                 "elements": [arr.tolist() for arr in sol.element_positions],
                 "element_weights": [arr.tolist() for arr in sol.element_weights] if any(not np.allclose(arr, np.ones_like(arr)) for arr in sol.element_weights) else None,
-                "currents": sol.initial_currents.tolist(),
             },
         },
     }

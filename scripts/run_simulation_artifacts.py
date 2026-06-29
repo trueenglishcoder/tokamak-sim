@@ -32,6 +32,7 @@ from tokamak_control.viz.plotting import (
     fig_boundary_from_poly,
     fig_time_series_from_npz,
     frames_to_video,
+    reference_polyline_from_radii,
     save_run_frames,
 )
 from tokamak_control.geometry.limiters import get_limiter_shape, limiter_names
@@ -132,9 +133,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--config", required=True, help="Path to TOML config.")
     ap.add_argument(
-        "--initial-currents",
-        default=None,
-        help="Optional TOML file with active coil masks and initial currents.",
+        "--initial-state",
+        required=True,
+        help="TOML file with explicit plasma Ip0 and initial coil currents.",
     )
     ap.add_argument("--steps", type=int, required=True, help="Number of steps.")
     ap.add_argument(
@@ -223,6 +224,11 @@ def main(argv: list[str] | None = None) -> int:
         help="DPI for saved frame PNGs. Lower values make frame and video generation faster.",
     )
     ap.add_argument(
+        "--presentation-mode",
+        action="store_true",
+        help="Render higher-resolution presentation figures with reference boundary overlays and clean Ip labels.",
+    )
+    ap.add_argument(
         "--verbose",
         action="store_true",
         help="Print stage logs and periodic run status while the simulation executes.",
@@ -275,13 +281,18 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(str(e))
 
     frame_stride = max(int(args.frame_stride), 1)
+    presentation_mode = bool(args.presentation_mode)
     frame_dpi = max(int(args.frame_dpi), 40)
+    if presentation_mode:
+        frame_dpi = max(frame_dpi, 260)
+    figure_dpi = 260 if presentation_mode else 160
+    contour_count = 60
     save_frames = bool(args.frames or args.video)
     snapshot_every = frame_stride if save_frames else args.steps
 
     result = run_simulation(
         config=Path(args.config),
-        initial_currents_path=(Path(args.initial_currents) if args.initial_currents is not None else None),
+        initial_state_path=Path(args.initial_state),
         steps=args.steps,
         output_dir=(Path(args.out) if args.out is not None else None),
         controller_name=args.controller,
@@ -333,25 +344,38 @@ def main(argv: list[str] | None = None) -> int:
 
     psi_boundary_path = out_dir / f"psi_boundary{run_id}.png"
     time_series_path = out_dir / f"time_series{run_id}.png"
+    ref_poly_final = None
+    if presentation_mode and "radii_ref" in run_data:
+        radii_ref = np.asarray(run_data["radii_ref"], dtype=float)
+        if 0 <= boundary_final_index < radii_ref.shape[0]:
+            try:
+                ref_poly_final = reference_polyline_from_radii(center, radii_ref[boundary_final_index])
+            except ValueError:
+                ref_poly_final = None
 
     fig1 = fig_boundary_from_poly(
         psi=psi_final,
         grid=grid,
         center=center,
         poly=boundary_final,
-        n_contours=60,
+        n_contours=contour_count,
         title=(
+            f"Step {boundary_final_index + 1}"
+            if presentation_mode
+            else
             "ψ contours, heatmap, and boundary (final step)"
             if boundary_final_index == boundary_polys.shape[0] - 1
             else f"ψ contours, heatmap, and boundary (last found step {boundary_final_index + 1})"
         ),
         coil_positions=coil_positions,
         limiter_shape=limiter_shape,
+        ref_poly=ref_poly_final,
+        presentation_mode=presentation_mode,
     )
-    fig1.savefig(psi_boundary_path, dpi=160, bbox_inches="tight")
+    fig1.savefig(psi_boundary_path, dpi=figure_dpi, bbox_inches="tight")
 
-    fig2 = fig_time_series_from_npz(str(result.npz_path))
-    fig2.savefig(time_series_path, dpi=160, bbox_inches="tight")
+    fig2 = fig_time_series_from_npz(str(result.npz_path), presentation_mode=presentation_mode)
+    fig2.savefig(time_series_path, dpi=figure_dpi, bbox_inches="tight")
 
     frames_dir: Path | None = None
     video_path: Path | None = None
@@ -361,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             npz_path=result.npz_path,
             frames_dir=frames_dir,
             n_levels_search=60,
-            n_contours=60,
+            n_contours=contour_count,
             coil_positions=coil_positions,
             limiter_shape=limiter_shape,
             # `snapshot_every` already selected one stored snapshot per requested
@@ -370,6 +394,7 @@ def main(argv: list[str] | None = None) -> int:
             # not every Nth saved snapshot.
             frame_stride=1,
             dpi=frame_dpi,
+            presentation_mode=presentation_mode,
         )
 
         if args.video:

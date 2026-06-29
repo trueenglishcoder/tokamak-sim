@@ -19,7 +19,6 @@ from tokamak_control.geometry.boundary import (
     boundary_status_is_real,
     find_plasma_boundary_with_status,
 )
-from tokamak_control.geometry.xpoints import find_x_points
 from tokamak_control.geometry.limiters import get_limiter_shape
 from tokamak_control.io.data_io import load_run
 
@@ -99,6 +98,17 @@ def _polyline_from_padded_row(row: np.ndarray) -> np.ndarray:
     return poly
 
 
+def reference_polyline_from_radii(center: Tuple[float, float], radii: np.ndarray) -> np.ndarray:
+    """Build the closed fixed-angle reference boundary polyline."""
+    r = np.asarray(radii, dtype=float).reshape(-1)
+    if r.size < 3:
+        raise ValueError(f"reference radii must contain at least 3 points, got {r.size}")
+    angles = np.linspace(-np.pi, np.pi, int(r.size), endpoint=False, dtype=float)
+    R0, Z0 = center
+    poly = np.column_stack((R0 + r * np.cos(angles), Z0 + r * np.sin(angles)))
+    return np.vstack((poly, poly[0]))
+
+
 def _boundary_mode_from_meta(meta: dict) -> BoundaryMode:
     """Прочитать режим физического определения границы из metadata запуска."""
     boundary_meta = meta.get("boundary")
@@ -153,24 +163,9 @@ def _plot_limiter_shape(ax: plt.Axes, limiter_shape: Optional[np.ndarray]) -> No
 
 
 def _plot_x_points(ax: plt.Axes, psi: np.ndarray, grid: Grid2D) -> None:
-    """Найти и отметить X-точки на графике поля."""
-    try:
-        sep = 4.0 * max(abs(float(grid.r.step)), abs(float(grid.z.step)))
-        points = find_x_points(psi, grid, max_points=8, min_separation=sep)
-    except Exception:
-        return
-    if points.size == 0:
-        return
-    ax.plot(
-        points[:, 0],
-        points[:, 1],
-        linestyle="none",
-        marker="x",
-        ms=7,
-        mew=1.8,
-        color="black",
-        zorder=7,
-    )
+    """Deliberately do not draw magnetic X-point markers in saved figures/videos."""
+    del ax, psi, grid
+    return
 
 
 def fig_psi_contours(
@@ -198,7 +193,6 @@ def fig_psi_contours(
     if center is not None:
         ax.plot([center[0]], [center[1]], "x", ms=6, color="red", zorder=4)
     _plot_limiter_shape(ax, limiter_shape)
-    _plot_x_points(ax, psi, grid)
     _plot_coil_markers(ax, coil_positions)
     ax.set_aspect("equal", adjustable="box")
     return fig
@@ -248,6 +242,8 @@ def _fig_boundary_from_poly(
     coil_positions: Optional[np.ndarray | dict[str, np.ndarray]] = None,
     limiter_shape: Optional[np.ndarray] = None,
     boundary_mode: BoundaryMode = "legacy_contour",
+    ref_poly: Optional[np.ndarray] = None,
+    presentation_mode: bool = False,
 ) -> plt.Figure:
     if psi.shape != grid.shape:
         raise ValueError(f"psi shape {psi.shape} != grid shape {grid.shape}")
@@ -261,15 +257,35 @@ def _fig_boundary_from_poly(
     fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
     pcm = ax.pcolormesh(R, Z, psi, shading="auto", vmin=vmin, vmax=vmax)
     ax.contour(R, Z, psi, levels=n_contours, colors="k", linestyles=":", linewidths=0.5, zorder=2)
+    if ref_poly is not None:
+        ref_arr = np.asarray(ref_poly, dtype=float)
+        if ref_arr.ndim != 2 or ref_arr.shape[1] != 2:
+            raise ValueError(f"reference polyline must have shape (n, 2), got {ref_arr.shape}")
+        ax.plot(
+            ref_arr[:, 0],
+            ref_arr[:, 1],
+            "--",
+            lw=3.0 if presentation_mode else 1.8,
+            color="tab:green" if presentation_mode else "black",
+            zorder=5,
+            label="Ref boundary",
+        )
     if poly is not None:
         poly_arr = np.asarray(poly, dtype=float)
         if poly_arr.ndim != 2 or poly_arr.shape[1] != 2:
             raise ValueError(f"boundary polyline must have shape (n, 2), got {poly_arr.shape}")
-        ax.plot(poly_arr[:, 0], poly_arr[:, 1], "-", lw=2.0, color="red", zorder=4)
+        ax.plot(
+            poly_arr[:, 0],
+            poly_arr[:, 1],
+            "-",
+            lw=1.7 if presentation_mode else 2.0,
+            color="red",
+            zorder=7,
+            label="Sim boundary" if ref_poly is not None else None,
+        )
     ax.plot([center[0]], [center[1]], "x", ms=6, color="red", zorder=5)
 
     _plot_limiter_shape(ax, limiter_shape)
-    _plot_x_points(ax, psi, grid)
     _plot_coil_markers(ax, coil_positions)
 
     ax.set_xlabel("R [m]")
@@ -277,6 +293,8 @@ def _fig_boundary_from_poly(
     if title:
         ax.set_title(title)
     ax.set_aspect("equal", adjustable="box")
+    if ref_poly is not None:
+        ax.legend(loc="best", fontsize=8)
     fig.colorbar(pcm, ax=ax, label="ψ")
     return fig
 
@@ -293,6 +311,8 @@ def fig_boundary_from_poly(
     title: Optional[str] = None,
     coil_positions: Optional[np.ndarray | dict[str, np.ndarray]] = None,
     limiter_shape: Optional[np.ndarray] = None,
+    ref_poly: Optional[np.ndarray] = None,
+    presentation_mode: bool = False,
 ) -> plt.Figure:
     """Построить psi и уже найденный в расчете физический контур плазмы."""
     return _fig_boundary_from_poly(
@@ -306,6 +326,8 @@ def fig_boundary_from_poly(
         title=title,
         coil_positions=coil_positions,
         limiter_shape=limiter_shape,
+        ref_poly=ref_poly,
+        presentation_mode=presentation_mode,
     )
 
 
@@ -322,22 +344,46 @@ def _draw_boundary_panel(
     title: str,
     coil_positions: Optional[np.ndarray | dict[str, np.ndarray]],
     limiter_shape: Optional[np.ndarray],
+    ref_poly: Optional[np.ndarray] = None,
+    presentation_mode: bool = False,
 ) -> object:
     """Нарисовать панель поля ψ и границы на существующей оси."""
     R, Z = grid.mesh()
     pcm = ax.pcolormesh(R, Z, psi, shading="auto", vmin=vmin, vmax=vmax)
     ax.contour(R, Z, psi, levels=n_contours, colors="k", linestyles=":", linewidths=0.45, zorder=2)
+    if ref_poly is not None:
+        ref_arr = np.asarray(ref_poly, dtype=float)
+        if ref_arr.ndim != 2 or ref_arr.shape[1] != 2:
+            raise ValueError(f"reference polyline must have shape (n, 2), got {ref_arr.shape}")
+        ax.plot(
+            ref_arr[:, 0],
+            ref_arr[:, 1],
+            "--",
+            lw=3.2 if presentation_mode else 1.8,
+            color="tab:green" if presentation_mode else "black",
+            zorder=5,
+            label="Ref boundary",
+        )
     if poly is not None:
         poly_arr = np.asarray(poly, dtype=float)
-        ax.plot(poly_arr[:, 0], poly_arr[:, 1], "-", lw=2.4, color="red", zorder=4)
+        ax.plot(
+            poly_arr[:, 0],
+            poly_arr[:, 1],
+            "-",
+            lw=1.9 if presentation_mode else 2.4,
+            color="red",
+            zorder=7,
+            label="Sim boundary" if ref_poly is not None else None,
+        )
     ax.plot([center[0]], [center[1]], "x", ms=7, color="red", zorder=5)
     _plot_limiter_shape(ax, limiter_shape)
-    _plot_x_points(ax, psi, grid)
     _plot_coil_markers(ax, coil_positions)
     ax.set_xlabel("R [m]")
     ax.set_ylabel("Z [m]")
     ax.set_title(title)
     ax.set_aspect("equal", adjustable="box")
+    if ref_poly is not None:
+        ax.legend(loc="best", fontsize=8)
     return pcm
 
 
@@ -380,6 +426,9 @@ def _plot_live_series(
     ylabel: str,
     labels: list[str],
     ref: np.ndarray | None = None,
+    ref_label: str = "ref",
+    ref_color: str = "black",
+    line_colors: list[str] | None = None,
     channel_plot_limit: int = 12,
     ylim: tuple[float, float] | None = None,
 ) -> None:
@@ -397,7 +446,7 @@ def _plot_live_series(
     if ref is not None:
         ref_arr = np.asarray(ref, dtype=float)
         if ref_arr.shape == (t.size,):
-            ax.plot(t[:end], ref_arr[:end], color="black", linestyle="--", linewidth=1.3, label="ref")
+            ax.plot(t[:end], ref_arr[:end], color=ref_color, linestyle="--", linewidth=2.2, label=ref_label)
         else:
             ref_arr = None
     else:
@@ -413,7 +462,8 @@ def _plot_live_series(
     else:
         for j in range(y_mat.shape[1]):
             label = labels[j] if j < len(labels) else f"ch{j + 1}"
-            ax.plot(t[:end], y_mat[:end, j], linewidth=1.25, label=label)
+            color = line_colors[j] if line_colors is not None and j < len(line_colors) else None
+            ax.plot(t[:end], y_mat[:end, j], linewidth=1.25, label=label, color=color)
 
     ax.axvline(t_now, color="red", linewidth=1.0, alpha=0.8)
     ax.set_xlim(float(t[0]), float(t[-1]) if t.size > 1 else float(t[0]) + 1.0e-6)
@@ -452,6 +502,8 @@ def _fig_boundary_with_live_timeseries(
     Ip_ylim: tuple[float, float] | None = None,
     pfc_ylim: tuple[float, float] | None = None,
     sol_ylim: tuple[float, float] | None = None,
+    ref_poly: Optional[np.ndarray] = None,
+    presentation_mode: bool = False,
 ) -> plt.Figure:
     """Собрать широкий кадр: сечение токамака слева, live-графики справа."""
     fig = plt.figure(figsize=(14.5, 7.2), constrained_layout=True)
@@ -470,6 +522,8 @@ def _fig_boundary_with_live_timeseries(
         title=title,
         coil_positions=coil_positions,
         limiter_shape=limiter_shape,
+        ref_poly=ref_poly,
+        presentation_mode=presentation_mode,
     )
     fig.colorbar(pcm, ax=ax_boundary, label="ψ", shrink=0.88)
 
@@ -480,8 +534,11 @@ def _fig_boundary_with_live_timeseries(
         Ip,
         frame_index,
         ylabel="Ip [A]",
-        labels=["Ip"],
+        labels=["Sim Ip"] if presentation_mode else ["Ip"],
         ref=Ip_ref,
+        ref_label="Ref Ip" if presentation_mode else "ref",
+        ref_color="tab:green" if presentation_mode else "black",
+        line_colors=["red"] if presentation_mode else None,
         ylim=Ip_ylim,
     )
 
@@ -602,7 +659,7 @@ def fig_boundary_vs_reference(
     return fig
 
 
-def fig_time_series_from_npz(npz_path: str | Path) -> plt.Figure:
+def fig_time_series_from_npz(npz_path: str | Path, *, presentation_mode: bool = False) -> plt.Figure:
     """Build a compact time-series figure for tracking, coil currents, and actuation."""
     run = load_run(npz_path)
 
@@ -631,9 +688,13 @@ def fig_time_series_from_npz(npz_path: str | Path) -> plt.Figure:
     fig, axes = plt.subplots(6, 1, figsize=(8, 14), sharex=True, constrained_layout=True)
 
     ax = axes[0]
-    ax.plot(t, Ip, label="Ip")
-    if Ip_ref is not None and Ip_ref.shape == Ip.shape:
-        ax.plot(t, Ip_ref, label="Ip_ref")
+    if presentation_mode and Ip_ref is not None and Ip_ref.shape == Ip.shape:
+        ax.plot(t, Ip_ref, label="Ref Ip", linewidth=2.3, linestyle="--", color="tab:green")
+        ax.plot(t, Ip, label="Sim Ip", linewidth=1.5, color="red")
+    else:
+        ax.plot(t, Ip, label="Ip")
+        if Ip_ref is not None and Ip_ref.shape == Ip.shape:
+            ax.plot(t, Ip_ref, label="Ip_ref")
     ax.set_ylabel("Ip [A]")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best", fontsize=8)
@@ -713,6 +774,7 @@ def save_run_frames(
     limiter_shape: Optional[np.ndarray] = None,
     frame_stride: int = 1,
     dpi: int = 240,
+    presentation_mode: bool = False,
 ) -> List[Path]:
     """Сохранить покадровые графики psi и границы с фиксированной шкалой цвета."""
     frames_dir = Path(frames_dir)
@@ -769,7 +831,15 @@ def save_run_frames(
                 poly = _polyline_from_padded_row(boundary_polys[step_to_index[step_label]])
             except RuntimeError:
                 poly = None
-        frame_title = f"ψ and boundary (step {step_label})"
+        ref_poly = None
+        if presentation_mode and radii_ref is not None:
+            row_idx = step_to_index[step_label]
+            if 0 <= row_idx < radii_ref.shape[0]:
+                try:
+                    ref_poly = reference_polyline_from_radii(center, radii_ref[row_idx])
+                except ValueError:
+                    ref_poly = None
+        frame_title = f"Step {step_label}" if presentation_mode else f"ψ and boundary (step {step_label})"
         fig = _fig_boundary_with_live_timeseries(
             psi=psi,
             grid=grid,
@@ -781,6 +851,8 @@ def save_run_frames(
             title=frame_title,
             coil_positions=coil_positions,
             limiter_shape=limiter_shape,
+            ref_poly=ref_poly,
+            presentation_mode=presentation_mode,
             t=t,
             frame_index=step_label,
             Ip=Ip,

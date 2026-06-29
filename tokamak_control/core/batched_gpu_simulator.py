@@ -116,7 +116,16 @@ class BatchedGpuTokamakSimulator:
         self.profile_enabled = str(os.environ.get("TOKAMAK_PROFILE", "")).lower() not in {"", "0", "false", "no"}
         self.last_profile: dict[str, float] = {}
         self._reset_boundary_tracking()
-        self.reset()
+        self.Ip = torch.zeros((self.batch_size,), dtype=self.dtype, device=self.device)
+        self.Ip0 = torch.zeros((self.batch_size,), dtype=self.dtype, device=self.device)
+        self.pfc_currents = torch.zeros((self.batch_size, self.pfc.n_coils), dtype=self.dtype, device=self.device)
+        self.sol_currents = torch.zeros((self.batch_size, self.sol.n_coils), dtype=self.dtype, device=self.device)
+        self.pfc_derivs = torch.zeros_like(self.pfc_currents)
+        self.sol_derivs = torch.zeros_like(self.sol_currents)
+        self.step_index = torch.zeros((self.batch_size,), dtype=torch.int64, device=self.device)
+        self.time_s = torch.zeros((self.batch_size,), dtype=self.dtype, device=self.device)
+        self.psi = self.compose_psi(self.Ip, self.pfc_currents, self.sol_currents)
+        self._has_state = False
 
     @classmethod
     def from_settings(cls, **kwargs) -> "BatchedGpuTokamakSimulator":
@@ -125,9 +134,11 @@ class BatchedGpuTokamakSimulator:
     def reset(self, *, ip=None, pfc_currents=None, sol_currents=None) -> BatchedGpuSimulatorResult:
         torch = self.torch
         B = self.batch_size
-        ip_t = torch.full((B,), float(self.settings.Ip0), dtype=self.dtype, device=self.device) if ip is None else torch.as_tensor(ip, dtype=self.dtype, device=self.device).reshape(B)
-        pfc_t = torch.as_tensor(np.asarray(self.pfc.initial_currents, dtype=float), dtype=self.dtype, device=self.device).reshape(1, self.pfc.n_coils).repeat(B, 1) if pfc_currents is None else torch.as_tensor(pfc_currents, dtype=self.dtype, device=self.device).reshape(B, self.pfc.n_coils)
-        sol_t = torch.as_tensor(np.asarray(self.sol.initial_currents, dtype=float), dtype=self.dtype, device=self.device).reshape(1, self.sol.n_coils).repeat(B, 1) if sol_currents is None else torch.as_tensor(sol_currents, dtype=self.dtype, device=self.device).reshape(B, self.sol.n_coils)
+        if ip is None or pfc_currents is None or sol_currents is None:
+            raise ValueError("BatchedGpuTokamakSimulator.reset requires explicit ip, pfc_currents, and sol_currents")
+        ip_t = torch.as_tensor(ip, dtype=self.dtype, device=self.device).reshape(B)
+        pfc_t = torch.as_tensor(pfc_currents, dtype=self.dtype, device=self.device).reshape(B, self.pfc.n_coils)
+        sol_t = torch.as_tensor(sol_currents, dtype=self.dtype, device=self.device).reshape(B, self.sol.n_coils)
         self.Ip = ip_t.clone()
         self.Ip0 = ip_t.clone()
         self.pfc_currents = pfc_t.clone()
@@ -138,11 +149,14 @@ class BatchedGpuTokamakSimulator:
         self.time_s = torch.zeros((B,), dtype=self.dtype, device=self.device)
         self.psi = self.compose_psi(self.Ip, self.pfc_currents, self.sol_currents)
         self._reset_boundary_tracking()
+        self._has_state = True
         return self._result()
 
     def reset_indices(self, indices: list[int], *, ip, pfc_currents, sol_currents) -> BatchedGpuSimulatorResult:
         if not indices:
             return self._result()
+        if not self._has_state:
+            raise RuntimeError("BatchedGpuTokamakSimulator.reset must be called before reset_indices")
         torch = self.torch
         idx = torch.as_tensor(indices, dtype=torch.long, device=self.device)
         self.Ip[idx] = torch.as_tensor(ip, dtype=self.dtype, device=self.device).reshape(-1)
@@ -159,6 +173,8 @@ class BatchedGpuTokamakSimulator:
 
     def step_currents(self, active_currents_next) -> BatchedGpuSimulatorResult:
         """Advance one old-parity batched step from absolute next active currents."""
+        if not self._has_state:
+            raise RuntimeError("BatchedGpuTokamakSimulator.reset must be called before step_currents")
         torch = self.torch
         B = self.batch_size
         actions = torch.as_tensor(active_currents_next, dtype=self.dtype, device=self.device).reshape(B, self.pfc.n_coils + self.sol.n_coils)

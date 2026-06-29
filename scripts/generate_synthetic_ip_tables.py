@@ -7,6 +7,10 @@ import json
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 local fallback
+    import tomli as tomllib
 
 import numpy as np
 
@@ -41,7 +45,7 @@ class SyntheticIpSummary:
     amplitude_scale: float
     duration_scale: float
     ip_csv: str
-    initial_currents_toml: str
+    initial_state_toml: str
 
 
 def _finite_nonnegative(name: str, value: float) -> float:
@@ -52,37 +56,57 @@ def _finite_nonnegative(name: str, value: float) -> float:
     return out
 
 
-def _source_initial_currents_path(
-    source_initial_currents_dir: Path,
+def _source_initial_state_path(
+    source_initial_state_dir: Path,
     *,
-    initial_currents_prefix: str,
+    initial_state_prefix: str,
     shot_id: str,
 ) -> Path:
-    """Построить путь к исходному TOML начальных токов для выбранного shot."""
-    path = source_initial_currents_dir / f"{initial_currents_prefix}_{shot_id}.toml"
+    """Построить путь к исходному TOML начального состояния для выбранного shot."""
+    path = source_initial_state_dir / f"{initial_state_prefix}_{shot_id}.toml"
     if not path.exists():
-        raise FileNotFoundError(f"Initial-currents TOML not found for shot {shot_id}: {path}")
+        raise FileNotFoundError(f"Initial-state TOML not found for shot {shot_id}: {path}")
     return path
 
 
-def _copy_initial_currents_toml(
-    source_initial_currents_dir: Path,
-    out_initial_currents_dir: Path,
+def _write_synthetic_initial_state_toml(
+    source_initial_state_dir: Path,
+    out_initial_state_dir: Path,
     *,
-    initial_currents_prefix: str,
+    initial_state_prefix: str,
     source_shot_id: str,
     target_shot_id: str,
+    ip0: float,
 ) -> Path:
-    """Скопировать TOML начальных токов под новое имя синтетического shot."""
-    source_path = _source_initial_currents_path(
-        source_initial_currents_dir,
-        initial_currents_prefix=initial_currents_prefix,
+    """Скопировать токи из шаблона и записать Ip0 новой синтетической траектории."""
+    source_path = _source_initial_state_path(
+        source_initial_state_dir,
+        initial_state_prefix=initial_state_prefix,
         shot_id=source_shot_id,
     )
-    out_path = out_initial_currents_dir / f"{initial_currents_prefix}_{target_shot_id}.toml"
+    raw = tomllib.loads(source_path.read_text(encoding="utf-8"))
+    pfc = raw["coils"]["pfc"]["currents"]
+    sol = raw["coils"]["sol"]["currents"]
+    out_path = out_initial_state_dir / f"{initial_state_prefix}_{target_shot_id}.toml"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+    out_path.write_text(
+        (
+            "version = 1\n\n"
+            "[plasma]\n"
+            f"Ip0 = {float(ip0):.17g}\n\n"
+            "[coils.pfc]\n"
+            f"currents = {_array(pfc)}\n\n"
+            "[coils.sol]\n"
+            f"currents = {_array(sol)}\n"
+        ),
+        encoding="utf-8",
+    )
     return out_path
+
+
+def _array(values: object) -> str:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    return "[\n" + "".join(f"    {float(v):.17g},\n" for v in arr) + "]"
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -95,8 +119,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     _finite_nonnegative("--amplitude-jitter", args.amplitude_jitter)
     _finite_nonnegative("--duration-jitter", args.duration_jitter)
     _finite_nonnegative("--shape-jitter", args.shape_jitter)
-    if str(args.initial_currents_prefix).strip() == "":
-        raise ValueError("--initial-currents-prefix must be non-empty")
+    if str(args.initial_state_prefix).strip() == "":
+        raise ValueError("--initial-state-prefix must be non-empty")
 
 
 def main() -> int:
@@ -110,19 +134,19 @@ def main() -> int:
     parser.add_argument("--source-ip-dir", required=True, help="Directory containing source t15md_*_ip.csv tables.")
     parser.add_argument("--out-root", required=True, help="Output root. Generated Ip tables are written into <out-root>/ip/.")
     parser.add_argument(
-        "--source-initial-currents-dir",
-        default="configs/initial_currents",
-        help="Directory containing source initial-current TOML files.",
+        "--source-initial-state-dir",
+        default="configs/initial_states",
+        help="Directory containing source initial-state TOML files.",
     )
     parser.add_argument(
-        "--out-initial-currents-dir",
-        default="configs/initial_currents",
-        help="Directory where generated initial-current TOML files are written.",
+        "--out-initial-state-dir",
+        default="configs/initial_states",
+        help="Directory where generated initial-state TOML files are written.",
     )
     parser.add_argument(
-        "--initial-currents-prefix",
+        "--initial-state-prefix",
         default="T15MD_new_data",
-        help="Filename prefix used for <prefix>_<shot>.toml initial-current files.",
+        help="Filename prefix used for <prefix>_<shot>.toml initial-state files.",
     )
     parser.add_argument("--n-shots", type=int, default=8, help="Number of synthetic Ip tables to generate.")
     parser.add_argument("--shot-start", type=int, default=950001, help="First synthetic shot number used in filenames.")
@@ -135,12 +159,12 @@ def main() -> int:
     _validate_args(args)
 
     source_ip_dir = Path(args.source_ip_dir)
-    source_initial_currents_dir = Path(args.source_initial_currents_dir)
+    source_initial_state_dir = Path(args.source_initial_state_dir)
     out_root = Path(args.out_root)
     out_ip_dir = out_root / "ip"
-    out_initial_currents_dir = Path(args.out_initial_currents_dir)
+    out_initial_state_dir = Path(args.out_initial_state_dir)
     out_ip_dir.mkdir(parents=True, exist_ok=True)
-    out_initial_currents_dir.mkdir(parents=True, exist_ok=True)
+    out_initial_state_dir.mkdir(parents=True, exist_ok=True)
 
     templates = discover_ip_templates(source_ip_dir)
     rng = np.random.default_rng(int(args.seed))
@@ -158,12 +182,13 @@ def main() -> int:
 
         ip_path = out_ip_dir / f"t15md_{shot_id}_ip.csv"
         write_semicolon_ip_table(ip_path, trajectory)
-        initial_currents_path = _copy_initial_currents_toml(
-            source_initial_currents_dir,
-            out_initial_currents_dir,
-            initial_currents_prefix=str(args.initial_currents_prefix),
+        initial_state_path = _write_synthetic_initial_state_toml(
+            source_initial_state_dir,
+            out_initial_state_dir,
+            initial_state_prefix=str(args.initial_state_prefix),
             source_shot_id=template.shot_id,
             target_shot_id=shot_id,
+            ip0=float(trajectory.ip_a[0]),
         )
 
         summary = SyntheticIpSummary(
@@ -175,7 +200,7 @@ def main() -> int:
             amplitude_scale=trajectory.amplitude_scale,
             duration_scale=trajectory.duration_scale,
             ip_csv=str(ip_path),
-            initial_currents_toml=str(initial_currents_path),
+            initial_state_toml=str(initial_state_path),
         )
         summaries.append(summary)
 
@@ -183,14 +208,14 @@ def main() -> int:
             f"Saved synthetic Ip shot {shot_id}: "
             f"template={template.shot_id}, rows={summary.rows}, "
             f"duration={summary.duration_s:.6f}s, max_abs_Ip={summary.peak_abs_ip:.6g}, "
-            f"initial_currents={initial_currents_path}"
+            f"initial_state={initial_state_path}"
         )
 
     metadata = {
         "source_ip_dir": str(source_ip_dir),
-        "source_initial_currents_dir": str(source_initial_currents_dir),
-        "out_initial_currents_dir": str(out_initial_currents_dir),
-        "initial_currents_prefix": str(args.initial_currents_prefix),
+        "source_initial_state_dir": str(source_initial_state_dir),
+        "out_initial_state_dir": str(out_initial_state_dir),
+        "initial_state_prefix": str(args.initial_state_prefix),
         "seed": int(args.seed),
         "amplitude_jitter": float(args.amplitude_jitter),
         "duration_jitter": float(args.duration_jitter),

@@ -28,7 +28,6 @@ def _small_machine(*, actuator_tau: float = 0.0) -> PlasmaModel:
         currents=np.array([50.0], dtype=float),
     )
     physics = PhysicsSettings(
-        Ip0=100.0,
         R0=1.0,
         Z0=0.0,
         sigma=4.0,
@@ -44,7 +43,7 @@ def _small_machine(*, actuator_tau: float = 0.0) -> PlasmaModel:
         ip_coupling_pfc=(0.25,),
         ip_coupling_sol=(-0.5,),
     )
-    return PlasmaModel.from_settings(grid=_small_grid(), pfc=pfc, sol=sol, settings=physics)
+    return PlasmaModel.from_settings(grid=_small_grid(), pfc=pfc, sol=sol, settings=physics, ip0=100.0)
 
 
 def test_grid_uses_old_center_half_cell_alignment() -> None:
@@ -136,8 +135,7 @@ def test_gpu_models_match_cpu_old_parity_step_if_cuda_available() -> None:
     from tokamak_control.core.gpu_plasma_model import GpuPlasmaModel
 
     cpu = _small_machine()
-    gpu = GpuPlasmaModel.from_settings(grid=cpu.grid, pfc=cpu.pfc, sol=cpu.sol, settings=PhysicsSettings(
-        Ip0=cpu.Ip0,
+    gpu_settings = PhysicsSettings(
         R0=cpu.R0,
         Z0=cpu.Z0,
         sigma=cpu.sigma,
@@ -152,7 +150,8 @@ def test_gpu_models_match_cpu_old_parity_step_if_cuda_available() -> None:
         sol_deriv_limit=cpu.sol_deriv_limit,
         ip_coupling_pfc=tuple(np.asarray(cpu.g, dtype=float)),
         ip_coupling_sol=tuple(np.asarray(cpu.g2, dtype=float)),
-    ))
+    )
+    gpu = GpuPlasmaModel.from_settings(grid=cpu.grid, pfc=cpu.pfc, sol=cpu.sol, settings=gpu_settings, ip0=cpu.Ip0)
     batched = BatchedGpuTokamakSimulator(
         grid=cpu.grid,
         pfc=cpu.pfc,
@@ -161,6 +160,11 @@ def test_gpu_models_match_cpu_old_parity_step_if_cuda_available() -> None:
         batch_size=2,
         angles_rad=np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False),
         limiter_shape=np.array([[0.5, -0.5], [1.5, -0.5], [1.5, 0.5], [0.5, 0.5]], dtype=float),
+    )
+    batched.reset(
+        ip=np.asarray([cpu.Ip0, cpu.Ip0], dtype=float),
+        pfc_currents=np.tile(cpu.state.pfc_currents, (2, 1)),
+        sol_currents=np.tile(cpu.state.sol_currents, (2, 1)),
     )
 
     pfc = np.array([1000.0], dtype=float)

@@ -39,9 +39,9 @@ def _add_simulate(p) -> None:
     ap = p.add_parser("simulate", help="Run a single closed-loop simulation.")
     ap.add_argument("--config", required=True, help="Path to TOML config.")
     ap.add_argument(
-        "--initial-currents",
-        default=None,
-        help="Optional TOML file with active coil masks and initial currents.",
+        "--initial-state",
+        required=True,
+        help="TOML file with explicit plasma Ip0 and initial coil currents.",
     )
     ap.add_argument("--steps", type=int, required=True, help="Number of time steps.")
     ap.add_argument(
@@ -112,7 +112,7 @@ def _add_simulate(p) -> None:
 
         res = run_sim(
             config=Path(args.config),
-            initial_currents_path=(Path(args.initial_currents) if args.initial_currents is not None else None),
+            initial_state_path=Path(args.initial_state),
             steps=args.steps,
             output_dir=(Path(args.out) if args.out is not None else None),
             controller_name=args.controller,

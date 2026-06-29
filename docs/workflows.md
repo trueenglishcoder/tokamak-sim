@@ -1,140 +1,86 @@
 # Workflows
 
-This document records current user-facing workflows. Commands assume the local ignored folders `configs/` and `data/` are present.
+This file records maintained simulator workflows. Commands assume local ignored
+`configs/`, `data/`, and `runs/` inputs exist.
 
 ## Run A Simulation With Artifacts
 
-Use `scripts/run_simulation_artifacts.py` when you want the simulation plus plots and optional video:
-
 ```bash
 python scripts/run_simulation_artifacts.py \
-  --config configs/T15MD_new_data.toml \
-  --initial-currents configs/initial_currents/T15MD_new_data_3864.toml \
+  --config runs/t15md_trim50_plain_gpu_1e6_setup/T15MD_new_data_trim50_plain_gpu_1e6_3864.toml \
+  --initial-state runs/t15md_trim50_plain_gpu_1e6_setup/T15MD_new_data_trim50_3864.toml \
   --steps 100 \
-  --controller lqr_boundary \
+  --controller t15md_replay \
+  --controller-arg replay_path=data/t15_data_new_trim50/coils/t15md_3864_coils.csv \
   --angles 32 \
-  --scenario nominal \
-  --out runs/example_t15 \
+  --scenario ip_table \
+  --scenario-arg ip_csv=data/t15_data_new_trim50/ip/t15md_3864_ip.csv \
+  --out runs/example_trim50_replay_3864 \
   --no-progress
 ```
 
-The script prints the run directory, manifest path, boundary plot path, time-series plot path, frame directory when frames are enabled, and video path when video is enabled.
+The artifact runner writes a manifest, time-series CSV, events CSV, boundary
+plot, time-series plot, and optional frames/video.
 
-If the selected physical boundary rule cannot find a boundary, the simulation stops cleanly, writes partial artifacts, records a `boundary_missing` event, and prints the no-boundary step/reason.
+## Generate Trim50 Plain GPU 1e-6 Replay References
 
-## T15MD Replay
+The current RL path expects replay references generated from
+`data/t15_data_new_trim50/` using the trim50 setup configs under:
+
+```text
+runs/t15md_trim50_plain_gpu_1e6_setup/
+```
+
+The resulting dataset should live at:
+
+```text
+runs/t15md_limited_replay_dataset_trim50_gpu_plain_1e6/
+```
+
+Each shot reference should include:
+
+```text
+lqr_boundary_reference_<SHOT>.npz
+lqr_boundary_reference_<SHOT>.json
+run_timeseries*.csv
+events*.csv
+manifest*.json
+```
+
+This dataset is the boundary reference source for the final `tokamak-rl-v2`
+replay-window/oracle-target builder.
+
+## Run A Learned Policy In Tokamak-Sim
 
 ```bash
 python scripts/run_simulation_artifacts.py \
-  --config configs/T15MD_new_data.toml \
-  --initial-currents configs/initial_currents/T15MD_new_data_3864.toml \
-  --steps 1439 \
-  --controller t15md_replay \
-  --controller-arg replay_path=data/t15_data_new/coils/t15md_3864_coils.csv \
-  --angles 32 \
-  --scenario ip_follow \
-  --scenario-arg ip_csv=data/t15_data_new/ip/t15md_3864_ip.csv \
-  --video \
-  --frame-stride 5 \
-  --frame-dpi 90 \
-  --fps 20 \
-  --verbose
-```
-
-`t15md_replay` disables actuator lag and plant-side current/derivative clipping at runtime so the simulation follows the supplied replay table as applied current data.
-
-The T15MD config declares `[boundary] mode = "limited"` and `[limiter] name = "T15MD"`. Limited boundary extraction uses the limiter-contact flux surface. Diverted mode is available for X-point separatrix boundaries. Use `--limiter T15MD` only when overriding or adding a plotting limiter for a config that does not declare one.
-
-## Generate Synthetic ITER Fitting Tables
-
-```bash
-python scripts/generate_synthetic_iter_dataset.py \
-  --config configs/ITER.toml \
-  --initial-currents configs/initial_currents/ITER_default_currents.toml \
-  --out-root synthetic_iter \
-  --n-shots 20
-```
-
-The generator writes:
-
-```text
-<out-root>/synthetic_iter_metadata.json
-<out-root>/ip/t15md_<shot>_ip.csv
-<out-root>/coils/t15md_<shot>_coils.csv
-```
-
-The generated coil tables store applied model currents, not controller derivative commands.
-
-## Generate Synthetic T15-Like Ip Tables
-
-Use `scripts/generate_synthetic_ip_tables.py` when you want controller-ready `Ip` references rather than replay-current fitting data.
-
-```bash
-python scripts/generate_synthetic_ip_tables.py \
-  --source-ip-dir data/t15_data_new_split/ip \
-  --out-root data/t15_synthetic_ip \
-  --out-initial-currents-dir configs/initial_currents \
-  --initial-currents-prefix T15MD_new_data \
-  --n-shots 12
-```
-
-The generator writes:
-
-```text
-<out-root>/synthetic_ip_metadata.json
-<out-root>/ip/t15md_<shot>_ip.csv
-configs/initial_currents/T15MD_new_data_<shot>.toml
-```
-
-Each generated table is a two-column semicolon-separated file:
-
-```text
-time_s;Ip
-```
-
-The reusable implementation lives in `tokamak_control.config.ip_trajectories`, so the same seeded template perturbation can be used by the CLI generator and by `t15_synthetic_follow` directly:
-
-```bash
-python scripts/run_simulation_artifacts.py \
-  --config configs/T15MD_new_data.toml \
-  --initial-currents configs/initial_currents/T15MD_new_data_3864.toml \
+  --config <rl-run>/generated_configs/T15MD_new_data.toml \
+  --initial-state runs/t15md_trim50_plain_gpu_1e6_setup/T15MD_new_data_trim50_3864.toml \
   --steps 500 \
-  --controller lqr_joint \
+  --controller learned_magnetic_controller \
+  --controller-arg export_dir=<rl-run>/exports/best_actor \
+  --controller-arg episode_norm_steps=100 \
+  --controller-arg rolling_episode_norm=true \
   --angles 32 \
-  --scenario t15_synthetic_follow \
-  --scenario-arg seed=11 \
-  --scenario-arg ip_template_dir=data/t15_data_new_split/ip \
-  --scenario-arg ip_seed=101 \
-  --scenario-arg amplitude_jitter=0.05 \
-  --scenario-arg duration_jitter=0.05 \
-  --scenario-arg shape_jitter=0.02
+  --scenario t15_replay_reference \
+  --scenario-arg reference_npz=runs/t15md_limited_replay_dataset_trim50_gpu_plain_1e6/lqr_boundary_reference_3864.npz \
+  --out runs/learned_policy_example_3864 \
+  --compute-backend gpu \
+  --no-progress
 ```
 
-Example closed-loop run with an algorithmic current controller:
+The learned controller uses `absolute_jdot_command_v1`; old delta-Jdot exports
+are rejected.
 
-```bash
-python scripts/run_simulation_artifacts.py \
-  --config configs/T15MD_new_data.toml \
-  --initial-currents configs/initial_currents/T15MD_new_data_950001.toml \
-  --steps 1439 \
-  --controller lqr_current \
-  --angles 32 \
-  --scenario ip_follow \
-  --scenario-arg ip_csv=data/t15_synthetic_ip/ip/t15md_950001_ip.csv \
-  --scenario-arg boundary_mode=t15_linear \
-  --video \
-  --verbose
-```
+## Sigma/L Fits
 
-`boundary_mode=t15_linear` is an `ip_follow` reference-shape option. It is separate from the physical boundary finder mode in `[boundary] mode`.
-
-## Sigma/L Grid Fit
+Grid fit:
 
 ```bash
 python scripts/fit_sigma_L_grid.py \
   --config configs/T15MD_new_data.toml \
-  --ip-dir data/t15_data_new/ip \
-  --coils-dir data/t15_data_new/coils \
+  --ip-dir data/t15_data_new_trim50/ip \
+  --coils-dir data/t15_data_new_trim50/coils \
   --sigma-min 1.5e6 \
   --sigma-max 3.5e6 \
   --sigma-points 31 \
@@ -143,106 +89,53 @@ python scripts/fit_sigma_L_grid.py \
   --L-points 31 \
   --top-k 100 \
   --out output \
-  --name t15_sigma_L_refined \
+  --name t15_trim50_sigma_L_refined \
   --plot
 ```
 
-The fitter creates one output folder per invocation. The exact path is printed as `top_k_csv=...`.
-
-You can also use the legacy path form:
+Gradient/SPSA alternative:
 
 ```bash
-python scripts/fit_sigma_L_grid.py \
-  --config configs/T15MD_new_data.toml \
-  --ip-dir data/t15_data_new/ip \
-  --coils-dir data/t15_data_new/coils \
-  --sigma-min 1.5e6 \
-  --sigma-max 3.5e6 \
-  --sigma-points 31 \
-  --L-min 5e-7 \
-  --L-max 5e-6 \
-  --L-points 31 \
-  --top-k 100 \
-  --out-csv output/t15_sigma_L_refined.csv \
-  --plot
+python scripts/fit_sigma_L_gradient.py --help
 ```
-
-Use `--plot` for plots. `-plot` is not defined by argparse.
-
-## Sigma/L Gradient Fit
-
-`scripts/fit_sigma_L_gradient.py` is the SPSA-style alternative to the grid search. It uses the same input semantics and the same run-folder output convention as the grid fitter.
-
 
 ## Programmatic Simulation Session
 
-Use `tokamak_control.bridge.SimulationSession` when another Python tool needs direct reset/step access without generating run artifacts:
+External tools can use the bridge without artifact generation:
 
 ```python
 import numpy as np
 
-from tokamak_control.bridge import DerivativeAction, SimulationSession
+from tokamak_control.bridge import CurrentAction, SimulationSession
 
 session = SimulationSession.from_paths(
     config_path="configs/T15MD_new_data.toml",
-    initial_currents_path="configs/initial_currents/T15MD_new_data_3864.toml",
+    initial_state_path="configs/initial_states/T15MD_new_data_3864.toml",
     scenario_name="nominal",
     scenario_args={},
     angles=32,
     steps=100,
 )
 reset = session.reset()
-action = DerivativeAction(np.zeros(reset.machine.n_active_total, dtype=float))
-step = session.step_derivatives(action)
+action = CurrentAction(
+    active_currents_next=reset.observation_snapshot.true_active_currents.copy(),
+)
+step = session.step_currents(action)
 ```
 
-The action vector is in physical A/s and follows the active actuator order reported by `reset.machine.active_order`. Normalization, search, training, or optimization logic should live outside this repository.
-
-## Docker Runtime
-
-The Docker setup is intended for CLI/server execution with local volumes. The image does not bake in `configs/`, `data/`, `runs/`, or `output/`.
-
-Build:
-
-```bash
-docker compose build
-```
-
-Default help command:
-
-```bash
-docker compose run --rm tokamak-sim
-```
-
-Example simulation:
-
-```bash
-docker compose run --rm tokamak-sim \
-  python scripts/run_simulation_artifacts.py \
-    --config configs/T15MD_new_data.toml \
-    --initial-currents configs/initial_currents/T15MD_new_data_3864.toml \
-    --steps 100 \
-    --controller lqr_boundary \
-    --angles 32 \
-    --scenario nominal \
-    --out runs/docker_example_t15 \
-    --no-progress
-```
-
-For a server deployment, clone the repository, provide `configs/` and `data/` as mounted directories, and keep `runs/` and `output/` writable.
+The bridge accepts absolute next currents. Normalization, RL, search, or
+optimization logic belongs outside this repository.
 
 ## Tests
 
-Run collection without requiring data fixtures:
+Focused simulator checks:
 
 ```bash
-python -m pytest --collect-only -q tests/test_workflows.py tests/test_bridge_and_metrics.py
+PYTHONPATH=. python3 -m pytest -q \
+  tests/test_learned_magnetic_controller.py \
+  tests/test_batched_gpu_training_path.py \
+  tests/test_legacy_boundary.py \
+  tests/test_lqr_t15_zaitsev.py
 ```
 
-Run focused boundary checks:
-
-```bash
-python -m pytest -q tests/test_workflows.py::test_split_t15md_boundary_uses_limiter_contact_by_default tests/test_workflows.py::test_boundary_search_uses_diverted_separatrix_rule
-```
-
-The full workflow suite includes tests that require local ignored datasets under `data/`.
+The full workflow suite may require local ignored datasets under `data/`.

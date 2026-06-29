@@ -35,7 +35,6 @@ def _write_bridge_config(path: Path, *, realism: RealismSettings | None = None) 
         currents=np.array([500.0], dtype=float),
     )
     physics = PhysicsSettings(
-        Ip0=5.0e4,
         R0=1.2,
         Z0=0.0,
         sigma=2.0e6,
@@ -55,6 +54,24 @@ def _write_bridge_config(path: Path, *, realism: RealismSettings | None = None) 
         realism=realism,
         limiter_name="T15MD",
         boundary_mode="legacy_contour",
+    )
+
+
+def _write_bridge_initial_state(path: Path, *, ip0: float = 5.0e4) -> None:
+    path.write_text(
+        f"""
+version = 1
+
+[plasma]
+Ip0 = {float(ip0)}
+
+[coils.pfc]
+currents = [1000.0, -1000.0]
+
+[coils.sol]
+currents = [500.0]
+""".strip(),
+        encoding="utf-8",
     )
 
 
@@ -108,11 +125,13 @@ def test_realism_runtime_does_not_invent_missing_boundary() -> None:
 def test_simulation_session_reset_and_step_shapes(tmp_path: Path) -> None:
     """Проверить reset/step bridge-сессии и стабильные формы основных массивов."""
     config_path = tmp_path / "bridge_machine.toml"
+    initial_state_path = tmp_path / "bridge_initial.toml"
     _write_bridge_config(config_path)
+    _write_bridge_initial_state(initial_state_path)
 
     session = SimulationSession.from_paths(
         config_path=config_path,
-        initial_currents_path=None,
+        initial_state_path=initial_state_path,
         scenario_name="nominal",
         scenario_args={},
         angles=8,
@@ -148,7 +167,7 @@ def test_simulation_session_accepts_zero_initial_state_override(tmp_path: Path) 
     _write_bridge_config(config_path)
     session = SimulationSession.from_paths(
         config_path=config_path,
-        initial_currents_path=None,
+        initial_state_path=None,
         scenario_name="t15_synthetic_follow",
         scenario_args={
             "duration_s": 0.05,
@@ -186,6 +205,7 @@ def test_simulation_session_accepts_zero_initial_state_override(tmp_path: Path) 
 def test_simulation_session_exposes_measured_channels_with_realism(tmp_path: Path) -> None:
     """Проверить, что bridge отдает measured channels из neutral realism."""
     config_path = tmp_path / "bridge_machine_realism.toml"
+    initial_state_path = tmp_path / "bridge_initial_realism.toml"
     realism = RealismSettings(
         seed=11,
         sensors=SensorRealismSettings(
@@ -195,10 +215,11 @@ def test_simulation_session_exposes_measured_channels_with_realism(tmp_path: Pat
         ),
     )
     _write_bridge_config(config_path, realism=realism)
+    _write_bridge_initial_state(initial_state_path)
 
     session = SimulationSession.from_paths(
         config_path=config_path,
-        initial_currents_path=None,
+        initial_state_path=initial_state_path,
         scenario_name="nominal",
         scenario_args={},
         angles=8,
@@ -219,12 +240,14 @@ def test_simulation_session_exposes_measured_channels_with_realism(tmp_path: Pat
 
 def test_simulation_session_accepts_realism_override_on_reset(tmp_path: Path) -> None:
     config_path = tmp_path / "bridge_machine_override.toml"
+    initial_state_path = tmp_path / "bridge_initial_override.toml"
     _write_bridge_config(config_path)
+    _write_bridge_initial_state(initial_state_path)
     override = RealismSettings(enabled=True, sensors=SensorRealismSettings(ip_bias=17.0))
 
     session = SimulationSession.from_paths(
         config_path=config_path,
-        initial_currents_path=None,
+        initial_state_path=initial_state_path,
         scenario_name="nominal",
         scenario_args={},
         angles=8,
@@ -242,10 +265,12 @@ def test_simulation_session_accepts_realism_override_on_reset(tmp_path: Path) ->
 
 def test_reference_at_time_matches_step_snapshot_reference(tmp_path: Path) -> None:
     config_path = tmp_path / "bridge_machine_reference.toml"
+    initial_state_path = tmp_path / "bridge_initial_reference.toml"
     _write_bridge_config(config_path)
+    _write_bridge_initial_state(initial_state_path)
     session = SimulationSession.from_paths(
         config_path=config_path,
-        initial_currents_path=None,
+        initial_state_path=initial_state_path,
         scenario_name="t15_synthetic_follow",
         scenario_args={
             "duration_s": 0.05,
@@ -277,8 +302,10 @@ def test_reference_at_time_matches_step_snapshot_reference(tmp_path: Path) -> No
 def test_simulation_session_truncates_at_configured_steps(tmp_path: Path) -> None:
     """Проверить, что bridge отличает нормальное окончание episode от failure."""
     config_path = tmp_path / "bridge_machine.toml"
+    initial_state_path = tmp_path / "bridge_initial.toml"
     _write_bridge_config(config_path)
-    session = SimulationSession.from_paths(config_path, None, "nominal", {}, 8, 1)
+    _write_bridge_initial_state(initial_state_path)
+    session = SimulationSession.from_paths(config_path, initial_state_path, "nominal", {}, 8, 1)
     reset = session.reset()
     machine = reset.machine
 

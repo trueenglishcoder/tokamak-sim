@@ -49,7 +49,7 @@ from tokamak_control.control.base import ControlAction
 from tokamak_control.control.lqr_t15_zaitsev import LQRT15ZaitsevController
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.core.plasma_state import PlasmaState
-from tokamak_control.io.config_io import load_config
+from tokamak_control.io.config_io import apply_initial_state, load_config, load_initial_state, require_initial_state
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +117,7 @@ def _make_profile(
     sign = 1.0 if float(ip_base) >= 0.0 else -1.0
     mag = abs(float(ip_base))
     if mag <= 0.0 or not np.isfinite(mag):
-        raise ValueError(f"Config Ip0 must be finite and nonzero, got {ip_base}")
+        raise ValueError(f"Initial-state Ip0 must be finite and nonzero, got {ip_base}")
 
     variation = float(args.profile_variation)
 
@@ -141,7 +141,7 @@ def _make_profile(
     )
 
 
-def _initial_currents_from_model(model: PlasmaModel) -> tuple[np.ndarray, np.ndarray]:
+def _runtime_currents_from_model(model: PlasmaModel) -> tuple[np.ndarray, np.ndarray]:
     state = model.state
     if state is None:
         raise RuntimeError("PlasmaModel has no initialized state")
@@ -187,8 +187,9 @@ def _simulate_one_shot(
     profile: ShotProfile,
     controller_params: dict[str, object],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
-    pfc0, sol0 = _initial_currents_from_model(model)
+    initial_state = require_initial_state(cfg)
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=initial_state.ip0)
+    pfc0, sol0 = _runtime_currents_from_model(model)
     _initialize_model_at_ip(model, ip0=float(profile.ip_start), pfc0=pfc0, sol0=sol0)
 
     controller = LQRT15ZaitsevController(**controller_params)
@@ -274,14 +275,14 @@ def main() -> int:
         )
     )
     ap.add_argument("--config", required=True, help="ITER TOML config used as the true synthetic plant")
-    ap.add_argument("--initial-currents", default=None, help="Optional TOML file with active coil masks and initial currents.")
+    ap.add_argument("--initial-state", required=True, help="TOML file with explicit plasma Ip0 and initial coil currents.")
     ap.add_argument("--out-root", default="synthetic_iter", help="Output root containing ip/ and coils/ subfolders")
     ap.add_argument("--n-shots", type=int, default=6)
     ap.add_argument("--shot-start", type=int, default=900001)
     ap.add_argument("--seed", type=int, default=12345)
 
-    ap.add_argument("--ip-start-frac", type=float, default=0.65, help="Starting Ip as a fraction of abs(config Ip0)")
-    ap.add_argument("--ip-peak-frac", type=float, default=1.00, help="Final target Ip as a fraction of abs(config Ip0)")
+    ap.add_argument("--ip-start-frac", type=float, default=0.65, help="Starting Ip as a fraction of abs(initial-state Ip0)")
+    ap.add_argument("--ip-peak-frac", type=float, default=1.00, help="Final target Ip as a fraction of abs(initial-state Ip0)")
     ap.add_argument("--rise-s", type=float, default=0.17, help="Duration of the saved rising segment in seconds")
     ap.add_argument("--profile-variation", type=float, default=0.035)
 
@@ -294,7 +295,8 @@ def main() -> int:
     args = ap.parse_args()
     _validate_args(args)
 
-    cfg = load_config(Path(args.config), initial_currents_path=(Path(args.initial_currents) if args.initial_currents is not None else None))
+    machine_cfg = load_config(Path(args.config))
+    cfg = apply_initial_state(machine_cfg, load_initial_state(machine_cfg, Path(args.initial_state)))
     true_sigma = float(cfg.physics.sigma)
     true_L = float(cfg.physics.inductance_L)
     true_tau = true_sigma * true_L
@@ -319,7 +321,7 @@ def main() -> int:
 
     for i in range(int(args.n_shots)):
         shot_id = str(int(args.shot_start) + i)
-        profile = _make_profile(shot_id=shot_id, ip_base=float(cfg.physics.Ip0), rng=rng, args=args)
+        profile = _make_profile(shot_id=shot_id, ip_base=float(require_initial_state(cfg).ip0), rng=rng, args=args)
         profiles.append(profile)
 
         t, ip, coils = _simulate_one_shot(
@@ -358,7 +360,7 @@ def main() -> int:
             f"Ip_end={summary.actual_ip_end:.6g}"
         )
 
-    meta_model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    meta_model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=require_initial_state(cfg).ip0)
     if meta_model.state is None:
         raise RuntimeError("Metadata model has no initialized state")
 

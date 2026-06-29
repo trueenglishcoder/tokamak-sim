@@ -16,12 +16,21 @@ from tokamak_control.control.registry import build_controller_runtime_call, cont
 from tokamak_control.core.plasma_model import PlasmaModel
 from tokamak_control.geometry.boundary import find_plasma_boundary_with_status
 from tokamak_control.geometry.legacy_metrics import legacy_radii_at_angles
-from tokamak_control.io.config_io import load_config
+from tokamak_control.io.config_io import apply_initial_state, load_config, load_initial_state, require_initial_state
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG = REPO_ROOT / "configs/T15MD_new_data.toml"
-INITIAL = REPO_ROOT / "configs/initial_currents/T15MD_new_data_3864.toml"
+INITIAL = REPO_ROOT / "configs/initial_states/T15MD_new_data_3864.toml"
+
+
+def _load_config_with_initial():
+    cfg = load_config(CONFIG)
+    return apply_initial_state(cfg, load_initial_state(cfg, INITIAL))
+
+
+def _model_from_config(cfg) -> PlasmaModel:
+    return PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=require_initial_state(cfg).ip0)
 
 
 def _feature_slices(
@@ -325,8 +334,8 @@ def test_learned_controller_runtime_inputs_are_current_contract() -> None:
 
 def test_learned_controller_uses_passed_measured_radii(tmp_path: Path) -> None:
     """Measured radii should be consumed directly instead of recomputing from the CPU polygon."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     export = tmp_path / "export"
     _write_v4_export(export, model=model, n_angles=8, mean_bias=0.0)
     controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
@@ -355,8 +364,8 @@ def test_learned_controller_uses_passed_measured_radii(tmp_path: Path) -> None:
 
 def test_learned_controller_v4_outputs_absolute_next_currents(tmp_path: Path) -> None:
     """The v4 controller maps actor output directly to absolute Jdot and next currents."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     export = tmp_path / "export"
     derivative_scale = _write_v4_export(export, model=model, n_angles=8, mean_bias=0.5)
     controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
@@ -379,8 +388,8 @@ def test_learned_controller_v4_outputs_absolute_next_currents(tmp_path: Path) ->
 
 def test_learned_controller_zero_action_holds_currents(tmp_path: Path) -> None:
     """A zero actor output should command the same absolute currents again."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     export = tmp_path / "export"
     _write_v4_export(export, model=model, n_angles=4, mean_bias=0.0)
     controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
@@ -393,8 +402,8 @@ def test_learned_controller_zero_action_holds_currents(tmp_path: Path) -> None:
 
 def test_learned_controller_v5_observation_rates_match_training_units(tmp_path: Path) -> None:
     """v5 exports should receive Ip/reference rate features in the same units as training."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     export = tmp_path / "export_v5"
     _write_v5_export(export, model=model, n_angles=6, mean_bias=0.0)
     controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
@@ -439,8 +448,8 @@ def test_learned_controller_v5_observation_rates_match_training_units(tmp_path: 
 
 def test_learned_controller_v5_outputs_absolute_next_currents(tmp_path: Path) -> None:
     """The v5 controller keeps the same absolute-Jdot action contract as v4."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     export = tmp_path / "export_v5"
     derivative_scale = _write_v5_export(export, model=model, n_angles=8, mean_bias=0.25)
     controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
@@ -459,8 +468,8 @@ def test_learned_controller_v5_outputs_absolute_next_currents(tmp_path: Path) ->
 
 def test_learned_controller_v6_outputs_absolute_next_currents(tmp_path: Path) -> None:
     """The v6 controller accepts current exports and keeps the absolute-Jdot contract."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     export = tmp_path / "export_v6"
     derivative_scale = _write_v6_export(export, model=model, n_angles=8, mean_bias=0.25)
     controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
@@ -479,8 +488,8 @@ def test_learned_controller_v6_outputs_absolute_next_currents(tmp_path: Path) ->
 
 def test_learned_controller_v6_integral_features_match_training_units(tmp_path: Path) -> None:
     """v6 exports should receive accumulated Ip and boundary error features."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     export = tmp_path / "export_v6"
     _write_v6_export(export, model=model, n_angles=6, mean_bias=0.0)
     controller = make_controller("learned_magnetic_controller", config={"export_dir": export})
@@ -536,8 +545,8 @@ def test_learned_controller_v6_integral_features_match_training_units(tmp_path: 
 
 def test_learned_controller_can_use_rolling_training_horizon_norm(tmp_path: Path) -> None:
     """Full-shot deployment can keep the 0.1 s training step normalization."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     model.state.step = 157
     export = tmp_path / "export"
     _write_v4_export(export, model=model, n_angles=4, mean_bias=0.0)
@@ -564,8 +573,8 @@ def test_learned_controller_can_use_rolling_training_horizon_norm(tmp_path: Path
 
 def test_learned_controller_rejects_old_action_contract(tmp_path: Path) -> None:
     """Old learned exports must not silently run under the v4 plant contract."""
-    cfg = load_config(CONFIG, initial_currents_path=INITIAL)
-    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    cfg = _load_config_with_initial()
+    model = _model_from_config(cfg)
     export = tmp_path / "export_old"
     _write_v4_export(export, model=model, n_angles=4, action_contract="delta_jdot_derivative_command_v3")
 

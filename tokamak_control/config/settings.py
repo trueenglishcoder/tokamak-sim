@@ -27,7 +27,6 @@ class PhysicsSettings:
     plasma_psi_sign: float = 1.0
     t_step: float = 1.0e-3
     actuator_tau: float = 0.0
-    Ip0: float = 8.0
     R0: float = 1.2
     Z0: float = 0.0
 
@@ -49,7 +48,6 @@ class PhysicsSettings:
             ("plasma_psi_sign", self.plasma_psi_sign),
             ("t_step", self.t_step),
             ("actuator_tau", self.actuator_tau),
-            ("Ip0", self.Ip0),
             ("R0", self.R0),
             ("Z0", self.Z0),
         ):

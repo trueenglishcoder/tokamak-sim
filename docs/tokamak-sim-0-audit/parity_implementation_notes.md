@@ -51,8 +51,10 @@ mathematical contract.
   - `lqr_t15_zaitsev` finite-differences the actual `step_currents(...)` transition and legacy boundary extraction.
 
 - Learned-policy export/runtime contracts are invalidated and bumped.
-  - New learned bundles must use `action_contract = "delta_jdot_derivative_command_v3"`.
-  - Observation schema is `controller_state_v3`.
+  - Historical note: this was later superseded for learned policies by
+    `action_contract = "absolute_jdot_command_v1"` and
+    `observation_kind = "controller_state_v6"`.
+  - Zaitsev/LQR diagnostics may still use delta-Jdot internally.
   - Old derivative-action bundles/checkpoints are rejected.
 
 ## Remaining Scope Notes

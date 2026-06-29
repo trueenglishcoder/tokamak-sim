@@ -14,11 +14,10 @@ center = 0.0
 
 [physics]
 mu0 = 1.2566370614359173e-06
-sigma = 3548133.8923357604
-inductance_L = 4.466835921509635e-07
+sigma = 3.8776264e6
+inductance_L = 3.1509209e-7
 t_step = 0.001
 actuator_tau = 0.01
-Ip0 = 124697.11538461539
 R0 = 1.48
 Z0 = 0.0
 pfc_deriv_limit = 5070038.4

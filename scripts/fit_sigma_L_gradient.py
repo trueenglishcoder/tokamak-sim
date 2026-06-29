@@ -201,12 +201,6 @@ def _discover_pairs(ip_dir: Path, coils_dir: Path) -> list[tuple[str, Path, Path
     return [(sid, ip_files[sid], coil_files[sid]) for sid in shot_ids]
 
 
-def _initial_currents_for_shot(config_path: Path, shot_id: str) -> Path | None:
-    """Найти файл начального состояния для shot_id рядом с конфигами."""
-    candidate = config_path.parent / "initial_currents" / f"{config_path.stem}_{shot_id}.toml"
-    return candidate if candidate.exists() else None
-
-
 def _resample_overlap(
     t_ip: np.ndarray,
     ip_raw: np.ndarray,
@@ -284,8 +278,7 @@ def _load_shots(
 
     for shot_id, ip_path, coil_path in pairs:
         try:
-            initial_path = _initial_currents_for_shot(config_path, str(shot_id))
-            shot_cfg = load_config(config_path, initial_currents_path=initial_path)
+            shot_cfg = load_config(config_path)
             n_pfc = int(shot_cfg.pfc.n_coils)
             n_sol = int(shot_cfg.sol.n_coils)
             ip_rows = _read_numeric_rows(ip_path, expected_cols=2)
@@ -395,7 +388,7 @@ def _model_for_scored_shot(shot: Shot, *, sigma: float, inductance_L: float) -> 
     """Создать модель с активными катушками конкретного shot."""
     if shot.cfg is None:
         raise RuntimeError(f"Shot {shot.shot_id} has no loaded config")
-    model = PlasmaModel.from_settings(grid=shot.cfg.grid, pfc=shot.cfg.pfc, sol=shot.cfg.sol, settings=shot.cfg.physics)
+    model = PlasmaModel.from_settings(grid=shot.cfg.grid, pfc=shot.cfg.pfc, sol=shot.cfg.sol, settings=shot.cfg.physics, ip0=float(shot.ip[0]))
     model.sigma = float(sigma)
     model.inductance_L = float(inductance_L)
     model.actuator_tau = 0.0
@@ -782,7 +775,7 @@ def main() -> int:
     )
 
     cfg = meta["cfg"]
-    base_model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics)
+    base_model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=1.0)
 
     # Applied-current tables: override actuator lag and disable clipping to avoid replay distortion.
     if float(cfg.physics.actuator_tau) != 0.0:

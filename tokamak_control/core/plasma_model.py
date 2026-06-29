@@ -140,6 +140,8 @@ class PlasmaModel:
         pfc: CoilGroup,
         sol: CoilGroup,
         settings: PhysicsSettings,
+        *,
+        ip0: float,
     ) -> "PlasmaModel":
         settings.validate()
         return cls(
@@ -148,7 +150,7 @@ class PlasmaModel:
             sol=sol,
             R0=settings.R0,
             Z0=settings.Z0,
-            Ip0=settings.Ip0,
+            Ip0=float(ip0),
             mu0=settings.mu0,
             sigma=settings.sigma,
             inductance_L=settings.inductance_L,
