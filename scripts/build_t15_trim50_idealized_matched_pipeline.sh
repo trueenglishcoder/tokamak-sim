@@ -51,16 +51,65 @@ PARAM_ROOT="output/t15_boundary_parameters_trim50_idealized_matched_gpu_plain_1e
 INITIAL_PREFIX="T15MD_new_data_trim50_idealized_matched"
 
 python3 scripts/idealize_t15_coil_actions.py \
-  --input-root data/t15_data_new \
+  --input-root data/t15_data_new_trim50 \
   --output-root "${DATA_ROOT}" \
-  --trim-reference-root data/t15_data_new_trim50 \
   --shots "${SHOTS[@]}" \
   --method bounded_smooth_jdot \
   --smooth-window-steps 21 \
-  --max-current-deviation-a 250 \
-  --trim-output-rows-start 50 \
-  --trim-output-rows-end 50 \
-  --rebase-time
+  --max-current-deviation-a 250
+
+python3 - <<'PY'
+from pathlib import Path
+
+import numpy as np
+
+shots = ("3856", "3857", "3858", "3863", "3864")
+source_root = Path("data/t15_data_new_trim50")
+ideal_root = Path("data/t15_data_new_trim50_idealized_matched")
+cap_a = 250.0 + 1.0e-6
+
+for shot in shots:
+    src_ip = np.loadtxt(source_root / "ip" / f"t15md_{shot}_ip.csv", delimiter=";")
+    out_ip = np.loadtxt(ideal_root / "ip" / f"t15md_{shot}_ip.csv", delimiter=";")
+    src_coils = np.loadtxt(source_root / "coils" / f"t15md_{shot}_coils.csv", delimiter=";")
+    out_coils = np.loadtxt(ideal_root / "coils" / f"t15md_{shot}_coils.csv", delimiter=";")
+
+    if src_ip.shape != out_ip.shape:
+        raise SystemExit(f"{shot}: idealized Ip shape {out_ip.shape} != trim50 shape {src_ip.shape}")
+    if src_coils.shape != out_coils.shape:
+        raise SystemExit(f"{shot}: idealized coil shape {out_coils.shape} != trim50 shape {src_coils.shape}")
+    if not np.allclose(src_ip, out_ip, rtol=0.0, atol=1.0e-9):
+        raise SystemExit(f"{shot}: idealized Ip table is not an exact trim50 copy")
+    if not np.allclose(src_coils[:, 0], out_coils[:, 0], rtol=0.0, atol=1.0e-12):
+        raise SystemExit(f"{shot}: idealized coil time grid differs from trim50")
+    if not np.allclose(src_coils[0, 1:], out_coils[0, 1:], rtol=0.0, atol=1.0e-7):
+        raise SystemExit(f"{shot}: idealized first coil row differs from trim50")
+    if not np.allclose(src_coils[-1, 1:], out_coils[-1, 1:], rtol=0.0, atol=1.0e-7):
+        raise SystemExit(f"{shot}: idealized final coil row differs from trim50")
+
+    max_diff = float(np.max(np.abs(out_coils[:, 1:] - src_coils[:, 1:])))
+    if max_diff > cap_a:
+        raise SystemExit(f"{shot}: idealized coil table deviates by {max_diff:.3f} A > {cap_a:.3f} A")
+
+    src_delta = np.diff(src_coils[:, 1:], axis=0)
+    out_delta = np.diff(out_coils[:, 1:], axis=0)
+    first = min(50, src_delta.shape[0])
+    src_first = np.max(np.abs(src_delta[:first]), axis=0)
+    out_first = np.max(np.abs(out_delta[:first]), axis=0)
+    flat = (src_first > 1.0) & (out_first < 0.2 * src_first)
+    if np.any(flat):
+        cols = np.where(flat)[0].tolist()
+        raise SystemExit(
+            f"{shot}: idealized first {first} steps are suspiciously flat for current columns {cols}; "
+            f"trim50_delta={src_first}, ideal_delta={out_first}"
+        )
+
+    print(
+        f"{shot}: idealized matched alignment ok; "
+        f"max_abs_current_diff={max_diff:.3f} A, "
+        f"first{first}_delta_ratio_min={float(np.min(out_first / (src_first + 1.0e-12))):.3f}"
+    )
+PY
 
 python3 scripts/run_t15md_limited_replay_dataset.py \
   --shots "${SHOTS[@]}" \
