@@ -19,11 +19,13 @@ class T15MDReplayController(Controller):
     """
     Exact replay controller for preprocessed T15MD current tables.
 
-    The controller expects a table whose first column is simulation time in
-    seconds starting from 0, and whose remaining columns are target coil
-    currents already expressed in the same current units used internally by the
-    plant model. The controller is intended for exact applied-current replay:
-    a step from ``t`` to ``t + dt`` targets the table current at ``t + dt``.
+    The controller expects a table whose first column is source time in seconds,
+    and whose remaining columns are target coil currents already expressed in
+    the same current units used internally by the plant model. The source time
+    origin is normalized to the first row so trimmed replay tables start
+    immediately in simulator time. The controller is intended for exact
+    applied-current replay: a step from ``t`` to ``t + dt`` targets the table
+    current at ``t + dt`` relative to the first numeric row.
 
     Expected table layout
     ---------------------
@@ -71,14 +73,15 @@ class T15MDReplayController(Controller):
             raise ValueError("Replay table time column must be finite")
         if np.any(np.diff(times) < 0.0):
             raise ValueError("Replay table time column must be nondecreasing")
-        if float(times[0]) < 0.0:
-            raise ValueError("Replay table time column must start at t >= 0 seconds")
+        if not np.isfinite(float(times[0])):
+            raise ValueError("Replay table first timestamp must be finite")
 
         currents = np.asarray(table[:, 1:], dtype=float)
         if not np.all(np.isfinite(currents)):
             raise ValueError("Replay table current columns must be finite")
 
-        self._times = times
+        self._source_time_origin = float(times[0])
+        self._times = times - self._source_time_origin
         self._currents = currents
 
     def reset(self) -> None:

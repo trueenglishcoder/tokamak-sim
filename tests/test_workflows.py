@@ -452,6 +452,27 @@ def test_t15md_replay_commands_exact_next_currents() -> None:
     assert np.allclose(action.pfc_currents_next, table[1, 4:10])
 
 
+def test_t15md_replay_rebases_trimmed_table_time(tmp_path: Path) -> None:
+    """A trimmed replay table starting at nonzero source time must start immediately."""
+    _require_local_paths(SMOKE_CONFIG, SMOKE_INITIAL_STATE)
+    cfg = _load_t15_with_initial()
+    model = PlasmaModel.from_settings(grid=cfg.grid, pfc=cfg.pfc, sol=cfg.sol, settings=cfg.physics, ip0=require_initial_state(cfg).ip0)
+
+    replay_path = tmp_path / "trimmed_like.csv"
+    row0 = [0.049, 1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    row1 = [0.050, 4.0, 5.0, 6.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0]
+    replay_path.write_text(
+        ";".join(str(x) for x in row0) + "\n" + ";".join(str(x) for x in row1) + "\n",
+        encoding="utf-8",
+    )
+
+    controller = T15MDReplayController(replay_path=replay_path)
+    action = controller.compute_control(model=model)
+
+    assert np.allclose(action.sol_currents_next, row1[1:4])
+    assert np.allclose(action.pfc_currents_next, row1[4:10])
+
+
 def test_t15md_replay_rejects_non_exact_u_clip_launch_arg() -> None:
     """T15 replay should not accept clipping because that is no longer exact replay."""
     _require_local_paths("data/t15_data_new/coils/t15md_3864_coils.csv")
