@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Create matched piecewise-linear idealized T15 coil-current replay tables.
+"""Create matched idealized T15 coil-current replay tables.
 
 The canonical idealized set intentionally uses the same five trim50 shots as the
 working replay-window RL pipeline.  It differs from the real trim50 data only in
 the coil-current table: Ip is copied byte-for-byte and coil currents are replaced
-by piecewise-linear low-noise traces on the same time grid.
+by low-noise traces on the same time grid.
 """
 
 from __future__ import annotations
@@ -54,7 +54,61 @@ def _format_table(path: Path, table: np.ndarray) -> None:
     np.savetxt(path, table, delimiter=";", fmt="%.12g")
 
 
-def _idealize_currents(time_s: np.ndarray, currents: np.ndarray, knot_step_s: float) -> tuple[np.ndarray, np.ndarray]:
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _triangle_kernel(width: int) -> np.ndarray:
+    if width <= 0 or width % 2 != 1:
+        raise ValueError("smooth_window_steps must be a positive odd integer")
+    half = width // 2
+    up = np.arange(1, half + 2, dtype=float)
+    kernel = np.concatenate([up, up[-2::-1]])
+    return kernel / np.sum(kernel)
+
+
+def _smooth_columns(values: np.ndarray, width: int) -> np.ndarray:
+    if width <= 1:
+        return np.array(values, copy=True)
+    kernel = _triangle_kernel(width)
+    pad = width // 2
+    padded = np.pad(values, ((pad, pad), (0, 0)), mode="edge")
+    out = np.empty_like(values, dtype=float)
+    for col in range(values.shape[1]):
+        out[:, col] = np.convolve(padded[:, col], kernel, mode="valid")
+    return out
+
+
+def _idealize_currents(
+    time_s: np.ndarray,
+    currents: np.ndarray,
+    *,
+    method: str,
+    knot_step_s: float,
+    smooth_window_steps: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if method == "smooth_jdot":
+        dt = np.diff(time_s)
+        if np.any(dt <= 0.0):
+            raise ValueError("time column must be strictly increasing")
+        jdot = np.diff(currents, axis=0) / dt[:, None]
+        smooth_jdot = _smooth_columns(jdot, int(smooth_window_steps))
+        increments = smooth_jdot * dt[:, None]
+        ideal = np.empty_like(currents, dtype=float)
+        ideal[0] = currents[0]
+        ideal[1:] = currents[0] + np.cumsum(increments, axis=0)
+
+        # Preserve the final replay current exactly without reintroducing local jumps.
+        drift = currents[-1] - ideal[-1]
+        ideal += np.linspace(0.0, 1.0, currents.shape[0], dtype=float)[:, None] * drift[None, :]
+        return ideal, np.arange(currents.shape[0], dtype=float)
+
+    if method != "piecewise_linear":
+        raise ValueError("method must be smooth_jdot or piecewise_linear")
+
     if knot_step_s <= 0.0:
         raise ValueError("knot_step_s must be positive")
 
@@ -91,7 +145,9 @@ def _write_summary(path: Path, rows: list[dict[str, object]]) -> None:
         "samples",
         "columns",
         "dt_median_s",
+        "method",
         "knot_step_s",
+        "smooth_window_steps",
         "knots",
         "max_abs_current_error_a",
         "rms_current_error_a",
@@ -118,10 +174,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Shot ids, or 'auto' for every paired shot. Defaults to the matched working RL shot set.",
     )
     parser.add_argument(
+        "--method",
+        choices=("smooth_jdot", "piecewise_linear"),
+        default="smooth_jdot",
+        help="Canonical mode smooths current derivatives and reintegrates currents.",
+    )
+    parser.add_argument(
         "--knot-step-s",
         type=float,
         default=0.05,
-        help="Spacing of piecewise-linear current knots. The canonical matched idealized set uses 0.05 s.",
+        help="Spacing of piecewise-linear current knots when --method=piecewise_linear.",
+    )
+    parser.add_argument(
+        "--smooth-window-steps",
+        type=int,
+        default=21,
+        help="Odd triangular smoothing window for Jdot when --method=smooth_jdot.",
     )
     parser.add_argument("--summary-name", default="idealized_coil_summary.csv")
     args = parser.parse_args(argv)
@@ -146,7 +214,13 @@ def main(argv: list[str] | None = None) -> int:
 
         time_s = coils[:, 0]
         currents = coils[:, 1:]
-        ideal_currents, knot_times = _idealize_currents(time_s, currents, knot_step_s=float(args.knot_step_s))
+        ideal_currents, knot_times = _idealize_currents(
+            time_s,
+            currents,
+            method=str(args.method),
+            knot_step_s=float(args.knot_step_s),
+            smooth_window_steps=int(args.smooth_window_steps),
+        )
         ideal_table = np.column_stack([time_s, ideal_currents])
 
         ip_out.parent.mkdir(parents=True, exist_ok=True)
@@ -160,14 +234,16 @@ def main(argv: list[str] | None = None) -> int:
                 "samples": int(coils.shape[0]),
                 "columns": int(coils.shape[1]),
                 "dt_median_s": float(np.median(np.diff(time_s))),
+                "method": str(args.method),
                 "knot_step_s": float(args.knot_step_s),
+                "smooth_window_steps": int(args.smooth_window_steps),
                 "knots": int(knot_times.size),
                 "max_abs_current_error_a": float(np.max(np.abs(diff))),
                 "rms_current_error_a": _rms(diff),
                 "orig_jdot_rms_aps": _jdot_rms(time_s, currents),
                 "ideal_jdot_rms_aps": _jdot_rms(time_s, ideal_currents),
-                "ip_path": str(ip_out.relative_to(REPO_ROOT)),
-                "coil_path": str(coil_out.relative_to(REPO_ROOT)),
+                "ip_path": _display_path(ip_out),
+                "coil_path": _display_path(coil_out),
             }
         )
 

@@ -54,7 +54,8 @@ python3 scripts/idealize_t15_coil_actions.py \
   --input-root data/t15_data_new_trim50 \
   --output-root "${DATA_ROOT}" \
   --shots "${SHOTS[@]}" \
-  --knot-step-s 0.05
+  --method smooth_jdot \
+  --smooth-window-steps 21
 
 python3 scripts/run_t15md_limited_replay_dataset.py \
   --shots "${SHOTS[@]}" \
