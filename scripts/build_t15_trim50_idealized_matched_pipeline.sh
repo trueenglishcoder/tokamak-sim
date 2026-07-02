@@ -55,8 +55,9 @@ python3 scripts/idealize_t15_coil_actions.py \
   --output-root "${DATA_ROOT}" \
   --trim-reference-root data/t15_data_new_trim50 \
   --shots "${SHOTS[@]}" \
-  --method smooth_jdot \
+  --method bounded_smooth_jdot \
   --smooth-window-steps 21 \
+  --max-current-deviation-a 250 \
   --trim-output-rows-start 50 \
   --trim-output-rows-end 50 \
   --rebase-time

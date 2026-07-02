@@ -88,8 +88,9 @@ def _idealize_currents(
     method: str,
     knot_step_s: float,
     smooth_window_steps: int,
+    max_current_deviation_a: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if method == "smooth_jdot":
+    if method in {"smooth_jdot", "bounded_smooth_jdot"}:
         dt = np.diff(time_s)
         if np.any(dt <= 0.0):
             raise ValueError("time column must be strictly increasing")
@@ -107,10 +108,17 @@ def _idealize_currents(
         # Preserve the final replay current exactly without reintroducing local jumps.
         drift = currents[-1] - ideal[-1]
         ideal += np.linspace(0.0, 1.0, currents.shape[0], dtype=float)[:, None] * drift[None, :]
+        if method == "bounded_smooth_jdot":
+            ideal = _cap_current_deviation(
+                ideal,
+                currents,
+                max_current_deviation_a=float(max_current_deviation_a),
+                preserve_endpoints=True,
+            )
         return ideal, np.arange(currents.shape[0], dtype=float)
 
     if method != "piecewise_linear":
-        raise ValueError("method must be smooth_jdot or piecewise_linear")
+        raise ValueError("method must be smooth_jdot, bounded_smooth_jdot, or piecewise_linear")
 
     if knot_step_s <= 0.0:
         raise ValueError("knot_step_s must be positive")
@@ -129,6 +137,27 @@ def _idealize_currents(
         knot_values = np.interp(knot_times, time_s, currents[:, col])
         ideal[:, col] = np.interp(time_s, knot_times, knot_values)
     return ideal, knot_times
+
+
+def _cap_current_deviation(
+    ideal_currents: np.ndarray,
+    reference_currents: np.ndarray,
+    *,
+    max_current_deviation_a: float,
+    preserve_endpoints: bool,
+) -> np.ndarray:
+    cap = float(max_current_deviation_a)
+    if not np.isfinite(cap) or cap <= 0.0:
+        raise ValueError(f"max_current_deviation_a must be finite and > 0, got {max_current_deviation_a!r}")
+    ideal = np.asarray(ideal_currents, dtype=float)
+    reference = np.asarray(reference_currents, dtype=float)
+    if ideal.shape != reference.shape:
+        raise ValueError(f"ideal/reference current shapes differ: {ideal.shape} != {reference.shape}")
+    bounded = reference + np.clip(ideal - reference, -cap, cap)
+    if bool(preserve_endpoints):
+        bounded[0] = reference[0]
+        bounded[-1] = reference[-1]
+    return bounded
 
 
 def _rms(values: np.ndarray) -> float:
@@ -191,6 +220,7 @@ def _write_summary(path: Path, rows: list[dict[str, object]]) -> None:
         "method",
         "knot_step_s",
         "smooth_window_steps",
+        "max_current_deviation_a",
         "knots",
         "max_abs_current_error_a",
         "rms_current_error_a",
@@ -226,8 +256,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--method",
-        choices=("smooth_jdot", "piecewise_linear"),
-        default="smooth_jdot",
+        choices=("bounded_smooth_jdot", "smooth_jdot", "piecewise_linear"),
+        default="bounded_smooth_jdot",
         help="Canonical mode smooths current derivatives and reintegrates currents.",
     )
     parser.add_argument(
@@ -241,6 +271,15 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=21,
         help="Odd triangular smoothing window for Jdot when --method=smooth_jdot.",
+    )
+    parser.add_argument(
+        "--max-current-deviation-a",
+        type=float,
+        default=250.0,
+        help=(
+            "Maximum absolute deviation from the source/reference current table when "
+            "--method=bounded_smooth_jdot. This keeps idealized replays physically matched."
+        ),
     )
     parser.add_argument(
         "--trim-output-rows-start",
@@ -290,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             method=str(args.method),
             knot_step_s=float(args.knot_step_s),
             smooth_window_steps=int(args.smooth_window_steps),
+            max_current_deviation_a=float(args.max_current_deviation_a),
         )
         ideal_table = np.column_stack([time_s, ideal_currents])
         ip_table = np.asarray(ip, dtype=float)
@@ -329,6 +369,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if int(args.trim_output_rows_start) or int(args.trim_output_rows_end) or trim_reference_root is not None:
             ideal_table[:, 1:] = _anchor_trimmed_currents_to_source(ideal_table[:, 1:], reference_currents)
+            if str(args.method) == "bounded_smooth_jdot":
+                ideal_table[:, 1:] = _cap_current_deviation(
+                    ideal_table[:, 1:],
+                    reference_currents,
+                    max_current_deviation_a=float(args.max_current_deviation_a),
+                    preserve_endpoints=True,
+                )
 
         ip_out.parent.mkdir(parents=True, exist_ok=True)
         _format_table(ip_out, ip_table)
@@ -356,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
                 "method": str(args.method),
                 "knot_step_s": float(args.knot_step_s),
                 "smooth_window_steps": int(args.smooth_window_steps),
+                "max_current_deviation_a": float(args.max_current_deviation_a),
                 "knots": int(knot_times.size),
                 "max_abs_current_error_a": float(np.max(np.abs(diff))),
                 "rms_current_error_a": _rms(diff),
