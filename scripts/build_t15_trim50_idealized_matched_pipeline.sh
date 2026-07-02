@@ -3,6 +3,47 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [[ "${TOKAMAK_PIPELINE_INSIDE_CONTAINER:-0}" != "1" ]]; then
+  if ! python3 - <<'PY' >/dev/null 2>&1
+import numpy
+import torch
+PY
+  then
+    IMAGE=${TOKAMAK_CONTAINER_IMAGE:-/scratch/$USER/tokamak/tokamak-rl-v2.sqsh}
+    WORKSPACE_ROOT=$(cd .. && pwd)
+    if [[ ! -f "${IMAGE}" ]]; then
+      echo "host python lacks numpy/torch and container image is missing: ${IMAGE}" >&2
+      echo "run this on a node with the project container, or set TOKAMAK_CONTAINER_IMAGE=/path/to/tokamak-rl-v2.sqsh" >&2
+      exit 2
+    fi
+    if ! command -v srun >/dev/null 2>&1; then
+      echo "host python lacks numpy/torch and srun is unavailable; cannot enter the project container automatically" >&2
+      exit 2
+    fi
+
+    echo "host python lacks numpy/torch; running matched idealized pipeline inside ${IMAGE}"
+    exec srun \
+      --partition=batch \
+      --nodes=1 \
+      --ntasks=1 \
+      --gres=gpu:1 \
+      --cpus-per-task="${TOKAMAK_PIPELINE_CPUS:-8}" \
+      --container-image "${IMAGE}" \
+      --container-mounts "${WORKSPACE_ROOT}:/workspace,/dev:/dev,/lib/x86_64-linux-gnu:/host-libs" \
+      bash -lc '
+        set -euo pipefail
+        mkdir -p /tmp/nvidia-lib
+        ln -sf /host-libs/libcuda.so.1 /tmp/nvidia-lib/libcuda.so.1
+        ln -sf /tmp/nvidia-lib/libcuda.so.1 /tmp/nvidia-lib/libcuda.so
+        export LD_LIBRARY_PATH=/tmp/nvidia-lib:${LD_LIBRARY_PATH:-}
+        export PYTHONPATH=/workspace/tokamak-sim:/workspace/tokamak-rl-v2:${PYTHONPATH:-}
+        export TOKAMAK_PIPELINE_INSIDE_CONTAINER=1
+        cd /workspace/tokamak-sim
+        bash scripts/build_t15_trim50_idealized_matched_pipeline.sh
+      '
+  fi
+fi
+
 SHOTS=(3856 3857 3858 3863 3864)
 DATA_ROOT="data/t15_data_new_trim50_idealized_matched"
 REPLAY_ROOT="runs/t15md_limited_replay_dataset_trim50_idealized_matched_gpu_plain_1e6"
