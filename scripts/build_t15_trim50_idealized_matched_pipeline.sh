@@ -123,6 +123,16 @@ python3 scripts/run_t15md_limited_replay_dataset.py \
   --legacy-precision-index2 1e-6 \
   --no-video
 
+for shot in "${SHOTS[@]}"; do
+  python3 scripts/audit_t15_matched_replay_alignment.py \
+    --shot "${shot}" \
+    --data-root "${DATA_ROOT}" \
+    --reference-root data/t15_data_new_trim50 \
+    --run-root "${REPLAY_ROOT}" \
+    --first-steps 50 \
+    --max-current-deviation-a 250
+done
+
 python3 scripts/fit_t15_boundary_parameters.py \
   --runs-root "${REPLAY_ROOT}" \
   --run-glob 't15md_limited_replay_*' \
