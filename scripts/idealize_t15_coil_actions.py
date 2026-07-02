@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Create piecewise-linear idealized T15 coil-current replay tables."""
+"""Create matched piecewise-linear idealized T15 coil-current replay tables.
+
+The canonical idealized set intentionally uses the same five trim50 shots as the
+working replay-window RL pipeline.  It differs from the real trim50 data only in
+the coil-current table: Ip is copied byte-for-byte and coil currents are replaced
+by piecewise-linear low-noise traces on the same time grid.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +19,7 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MATCHED_TRIM50_SHOTS = ("3856", "3857", "3858", "3863", "3864")
 
 
 def _resolve(path: str | Path) -> Path:
@@ -103,13 +110,18 @@ def _write_summary(path: Path, rows: list[dict[str, object]]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-root", default="data/t15_data_new_trim50")
-    parser.add_argument("--output-root", default="data/t15_data_new_trim50_idealized")
-    parser.add_argument("--shots", nargs="+", default=["auto"], help="Shot ids, or 'auto' for every paired shot.")
+    parser.add_argument("--output-root", default="data/t15_data_new_trim50_idealized_matched")
+    parser.add_argument(
+        "--shots",
+        nargs="+",
+        default=list(MATCHED_TRIM50_SHOTS),
+        help="Shot ids, or 'auto' for every paired shot. Defaults to the matched working RL shot set.",
+    )
     parser.add_argument(
         "--knot-step-s",
         type=float,
         default=0.05,
-        help="Spacing of piecewise-linear current knots. The old idealized fit used 0.05 s.",
+        help="Spacing of piecewise-linear current knots. The canonical matched idealized set uses 0.05 s.",
     )
     parser.add_argument("--summary-name", default="idealized_coil_summary.csv")
     args = parser.parse_args(argv)
