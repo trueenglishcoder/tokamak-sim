@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 from pathlib import Path
 from typing import Iterable
 
@@ -50,6 +52,48 @@ def _read_timeseries(path: Path) -> list[dict[str, float]]:
     if not rows:
         raise ValueError(f"{path} is empty")
     return rows
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_manifest_path(value: object, *, repo_root: Path) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    return repo_root / path
+
+
+def _read_manifest(run_dir: Path) -> tuple[Path, dict[str, object]]:
+    path = _find_one(run_dir, "manifest*.json")
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} did not contain a JSON object")
+    return path, data
+
+
+def _nested(mapping: dict[str, object], *keys: str) -> object | None:
+    current: object = mapping
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
 def _max_abs_delta(rows: list[list[float]], *, first: int) -> list[float]:
@@ -108,6 +152,10 @@ def _format(values: Iterable[float]) -> str:
     return "[" + ", ".join(f"{float(value):.6g}" for value in values) + "]"
 
 
+def _format_row(row: list[float], *, n: int = 10) -> str:
+    return "[" + ", ".join(f"{float(value):.12g}" for value in row[:n]) + ("]" if len(row) <= n else ", ...]")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shot", required=True)
@@ -122,15 +170,28 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     shot = str(args.shot)
+    repo_root = _repo_root()
     data_root = Path(args.data_root)
     reference_root = Path(args.reference_root)
     run_root = Path(args.run_root)
+    if not data_root.is_absolute():
+        data_root = repo_root / data_root
+    if not reference_root.is_absolute():
+        reference_root = repo_root / reference_root
+    if not run_root.is_absolute():
+        run_root = repo_root / run_root
     run_dir = Path(args.run_dir) if args.run_dir else _find_latest_run_dir(run_root, shot)
+    if not run_dir.is_absolute():
+        run_dir = repo_root / run_dir
 
-    ideal_coils = _read_numeric_table(data_root / "coils" / f"t15md_{shot}_coils.csv", delimiter=";")
-    ref_coils = _read_numeric_table(reference_root / "coils" / f"t15md_{shot}_coils.csv", delimiter=";")
-    ideal_ip = _read_numeric_table(data_root / "ip" / f"t15md_{shot}_ip.csv", delimiter=";")
-    ref_ip = _read_numeric_table(reference_root / "ip" / f"t15md_{shot}_ip.csv", delimiter=";")
+    ideal_coils_path = data_root / "coils" / f"t15md_{shot}_coils.csv"
+    ref_coils_path = reference_root / "coils" / f"t15md_{shot}_coils.csv"
+    ideal_ip_path = data_root / "ip" / f"t15md_{shot}_ip.csv"
+    ref_ip_path = reference_root / "ip" / f"t15md_{shot}_ip.csv"
+    ideal_coils = _read_numeric_table(ideal_coils_path, delimiter=";")
+    ref_coils = _read_numeric_table(ref_coils_path, delimiter=";")
+    ideal_ip = _read_numeric_table(ideal_ip_path, delimiter=";")
+    ref_ip = _read_numeric_table(ref_ip_path, delimiter=";")
 
     if len(ideal_coils) != len(ref_coils) or len(ideal_coils[0]) != len(ref_coils[0]):
         raise SystemExit(f"coil table shape mismatch: ideal={len(ideal_coils)} ref={len(ref_coils)}")
@@ -160,6 +221,34 @@ def main(argv: list[str] | None = None) -> int:
             f"ref_first_delta={_format(ref_first_delta)} ideal_first_delta={_format(ideal_first_delta)}"
         )
 
+    manifest_path, manifest = _read_manifest(run_dir)
+    replay_path = _resolve_manifest_path(_nested(manifest, "controller", "params", "replay_path"), repo_root=repo_root)
+    ip_csv_path = _resolve_manifest_path(_nested(manifest, "scenario", "params", "ip_csv"), repo_root=repo_root)
+    initial_state_path = _resolve_manifest_path(manifest.get("initial_state_source"), repo_root=repo_root)
+    config_path = _resolve_manifest_path(manifest.get("config_source"), repo_root=repo_root)
+
+    if replay_path is None:
+        raise SystemExit(f"{manifest_path}: missing controller.params.replay_path")
+    if ip_csv_path is None:
+        raise SystemExit(f"{manifest_path}: missing scenario.params.ip_csv")
+    if replay_path.resolve() != ideal_coils_path.resolve():
+        raise SystemExit(
+            "manifest replay_path does not point at the expected idealized coil table:\n"
+            f"  manifest: {replay_path}\n"
+            f"  expected: {ideal_coils_path}"
+        )
+    if ip_csv_path.resolve() != ideal_ip_path.resolve():
+        raise SystemExit(
+            "manifest ip_csv does not point at the expected idealized Ip table:\n"
+            f"  manifest: {ip_csv_path}\n"
+            f"  expected: {ideal_ip_path}"
+        )
+
+    if _sha256(replay_path) != _sha256(ideal_coils_path):
+        raise SystemExit(f"manifest replay_path hash differs from expected path hash: {replay_path}")
+    if _sha256(ip_csv_path) != _sha256(ideal_ip_path):
+        raise SystemExit(f"manifest ip_csv hash differs from expected path hash: {ip_csv_path}")
+
     timeseries_path = _find_one(run_dir, "run_timeseries*.csv")
     ts = _read_timeseries(timeseries_path)
     n = min(int(args.first_steps), len(ts), len(ideal_coils) - 1)
@@ -186,8 +275,21 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"shot: {shot}")
     print(f"run_dir: {run_dir}")
+    print(f"manifest: {manifest_path}")
+    print(f"manifest_config_source: {config_path}")
+    print(f"manifest_initial_state_source: {initial_state_path}")
+    print(f"manifest_replay_path: {replay_path}")
+    print(f"manifest_ip_csv: {ip_csv_path}")
     print(f"timeseries: {timeseries_path}")
     print(f"rows: {len(ideal_coils)}")
+    print(f"idealized_coils_sha256: {_sha256(ideal_coils_path)}")
+    print(f"idealized_ip_sha256: {_sha256(ideal_ip_path)}")
+    print(f"trim50_coils_sha256: {_sha256(ref_coils_path)}")
+    print(f"trim50_ip_sha256: {_sha256(ref_ip_path)}")
+    print(f"idealized_coils_row0: {_format_row(ideal_coils[0])}")
+    print(f"idealized_coils_row1: {_format_row(ideal_coils[1])}")
+    print(f"trim50_coils_row0: {_format_row(ref_coils[0])}")
+    print(f"trim50_coils_row1: {_format_row(ref_coils[1])}")
     print(f"max_idealized_current_deviation_a: {current_diff:.6g}")
     print(f"first{n}_ref_delta_a: {_format(ref_first_delta)}")
     print(f"first{n}_ideal_delta_a: {_format(ideal_first_delta)}")
