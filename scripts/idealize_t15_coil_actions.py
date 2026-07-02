@@ -93,7 +93,11 @@ def _idealize_currents(
         dt = np.diff(time_s)
         if np.any(dt <= 0.0):
             raise ValueError("time column must be strictly increasing")
-        jdot = np.diff(currents, axis=0) / dt[:, None]
+        nominal_dt = float(np.median(dt))
+        if nominal_dt <= 0.0:
+            raise ValueError("time column has no positive nominal step")
+        effective_dt = np.where(dt < 0.5 * nominal_dt, nominal_dt, dt)
+        jdot = np.diff(currents, axis=0) / effective_dt[:, None]
         smooth_jdot = _smooth_columns(jdot, int(smooth_window_steps))
         increments = smooth_jdot * dt[:, None]
         ideal = np.empty_like(currents, dtype=float)
@@ -135,7 +139,9 @@ def _jdot_rms(time_s: np.ndarray, currents: np.ndarray) -> float:
     dt = np.diff(time_s)
     if np.any(dt <= 0.0):
         raise ValueError("time column must be strictly increasing")
-    return _rms(np.diff(currents, axis=0) / dt[:, None])
+    nominal_dt = float(np.median(dt))
+    effective_dt = np.where(dt < 0.5 * nominal_dt, nominal_dt, dt)
+    return _rms(np.diff(currents, axis=0) / effective_dt[:, None])
 
 
 def _trim_table(table: np.ndarray, *, start_rows: int, end_rows: int, rebase_time: bool) -> np.ndarray:
@@ -157,25 +163,24 @@ def _trim_table(table: np.ndarray, *, start_rows: int, end_rows: int, rebase_tim
 
 def _anchor_trimmed_currents_to_source(
     ideal_currents: np.ndarray,
-    source_currents: np.ndarray,
-    *,
-    start_rows: int,
-    end_rows: int,
+    reference_currents: np.ndarray,
 ) -> np.ndarray:
-    start = int(start_rows)
-    end = int(end_rows)
-    if start == 0 and end == 0:
-        return ideal_currents
-    stop = source_currents.shape[0] - end if end else source_currents.shape[0]
-    source = np.asarray(source_currents[start:stop], dtype=float)
     ideal = np.asarray(ideal_currents, dtype=float).copy()
-    if ideal.shape != source.shape:
-        raise ValueError(f"trimmed ideal/source current shapes differ: {ideal.shape} != {source.shape}")
-    correction0 = source[0] - ideal[0]
-    correction1 = source[-1] - ideal[-1]
+    reference = np.asarray(reference_currents, dtype=float)
+    if ideal.shape != reference.shape:
+        raise ValueError(f"trimmed ideal/reference current shapes differ: {ideal.shape} != {reference.shape}")
+    correction0 = reference[0] - ideal[0]
+    correction1 = reference[-1] - ideal[-1]
     blend = np.linspace(0.0, 1.0, ideal.shape[0], dtype=float)[:, None]
     ideal += (1.0 - blend) * correction0[None, :] + blend * correction1[None, :]
     return ideal
+
+
+def _validate_same_grid(*, shot: str, table: np.ndarray, reference: np.ndarray, label: str) -> None:
+    if table.shape != reference.shape:
+        raise ValueError(f"Shot {shot}: {label} shape {table.shape} != reference shape {reference.shape}")
+    if not np.allclose(table[:, 0], reference[:, 0], rtol=0.0, atol=1.0e-10):
+        raise ValueError(f"Shot {shot}: {label} time grid differs from reference")
 
 
 def _write_summary(path: Path, rows: list[dict[str, object]]) -> None:
@@ -207,6 +212,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-root", default="data/t15_data_new_trim50")
     parser.add_argument("--output-root", default="data/t15_data_new_trim50_idealized_matched")
+    parser.add_argument(
+        "--trim-reference-root",
+        default=None,
+        help=(
+            "Optional already-trimmed dataset root. When provided, output Ip/time comes from "
+            "this root and idealized coil endpoints are anchored to this root exactly."
+        ),
+    )
     parser.add_argument(
         "--shots",
         nargs="+",
@@ -254,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
 
     input_root = _resolve(args.input_root)
     output_root = _resolve(args.output_root)
+    trim_reference_root = _resolve(args.trim_reference_root) if args.trim_reference_root else None
     shots = _discover_shots(input_root) if len(args.shots) == 1 and args.shots[0].lower() == "auto" else [str(s) for s in args.shots]
 
     rows: list[dict[str, object]] = []
@@ -294,17 +308,29 @@ def main(argv: list[str] | None = None) -> int:
                 end_rows=int(args.trim_output_rows_end),
                 rebase_time=bool(args.rebase_time),
             )
-            ideal_table[:, 1:] = _anchor_trimmed_currents_to_source(
-                ideal_table[:, 1:],
-                currents,
-                start_rows=int(args.trim_output_rows_start),
-                end_rows=int(args.trim_output_rows_end),
-            )
         elif bool(args.rebase_time):
             ideal_table = ideal_table.copy()
             ip_table = ip_table.copy()
             ideal_table[:, 0] -= float(ideal_table[0, 0])
             ip_table[:, 0] -= float(ip_table[0, 0])
+
+        reference_currents = ideal_table[:, 1:]
+        if trim_reference_root is not None:
+            ref_ip = _load_table(trim_reference_root / "ip" / f"t15md_{shot}_ip.csv")
+            ref_coils = _load_table(trim_reference_root / "coils" / f"t15md_{shot}_coils.csv")
+            _validate_same_grid(shot=shot, table=ip_table, reference=ref_ip, label="trimmed Ip")
+            _validate_same_grid(shot=shot, table=ideal_table, reference=ref_coils, label="trimmed coils")
+            ip_table = ref_ip
+            ideal_table[:, 0] = ref_coils[:, 0]
+            reference_currents = ref_coils[:, 1:]
+        elif int(args.trim_output_rows_start) or int(args.trim_output_rows_end):
+            start = int(args.trim_output_rows_start)
+            end = int(args.trim_output_rows_end)
+            stop = currents.shape[0] - end if end else currents.shape[0]
+            reference_currents = currents[start:stop]
+
+        if int(args.trim_output_rows_start) or int(args.trim_output_rows_end) or trim_reference_root is not None:
+            ideal_table[:, 1:] = _anchor_trimmed_currents_to_source(ideal_table[:, 1:], reference_currents)
 
         ip_out.parent.mkdir(parents=True, exist_ok=True)
         _format_table(ip_out, ip_table)
@@ -312,12 +338,15 @@ def main(argv: list[str] | None = None) -> int:
 
         compare_currents = currents
         compare_ideal = ideal_currents
-        if int(args.trim_output_rows_start) or int(args.trim_output_rows_end):
+        if trim_reference_root is not None:
+            compare_currents = reference_currents
+            compare_ideal = ideal_table[:, 1:]
+        elif int(args.trim_output_rows_start) or int(args.trim_output_rows_end):
             start = int(args.trim_output_rows_start)
             end = int(args.trim_output_rows_end)
             stop = currents.shape[0] - end if end else currents.shape[0]
             compare_currents = currents[start:stop]
-            compare_ideal = ideal_currents[start:stop]
+            compare_ideal = ideal_table[:, 1:]
         diff = compare_ideal - compare_currents
         rows.append(
             {

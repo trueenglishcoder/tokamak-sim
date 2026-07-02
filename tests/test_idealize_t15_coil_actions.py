@@ -25,3 +25,27 @@ def test_smooth_jdot_idealizer_preserves_endpoints_and_reduces_jdot_jumps() -> N
     np.testing.assert_allclose(ideal[0], currents[0])
     np.testing.assert_allclose(ideal[-1], currents[-1])
     assert _jdot_jump_p90(time_s, ideal) < 0.4 * _jdot_jump_p90(time_s, currents)
+
+
+def test_smooth_jdot_idealizer_ignores_near_duplicate_timestamp_spike() -> None:
+    time_s = np.concatenate([[0.0, 1.0e-16], np.arange(0.001, 0.2, 0.001)])
+    currents = np.column_stack(
+        [
+            1.0e5 + 2.0e5 * time_s,
+            -5.0e4 - 1.0e5 * time_s,
+        ]
+    )
+    currents[1] += np.array([500.0, -300.0])
+
+    ideal, _ = _idealize_currents(
+        time_s,
+        currents,
+        method="smooth_jdot",
+        knot_step_s=0.05,
+        smooth_window_steps=21,
+    )
+
+    assert np.isfinite(ideal).all()
+    assert float(np.max(np.abs(ideal))) < 2.0e5
+    np.testing.assert_allclose(ideal[0], currents[0])
+    np.testing.assert_allclose(ideal[-1], currents[-1])
