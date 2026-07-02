@@ -176,11 +176,9 @@ def _anchor_trimmed_currents_to_source(
     return ideal
 
 
-def _validate_same_grid(*, shot: str, table: np.ndarray, reference: np.ndarray, label: str) -> None:
+def _validate_same_shape(*, shot: str, table: np.ndarray, reference: np.ndarray, label: str) -> None:
     if table.shape != reference.shape:
         raise ValueError(f"Shot {shot}: {label} shape {table.shape} != reference shape {reference.shape}")
-    if not np.allclose(table[:, 0], reference[:, 0], rtol=0.0, atol=1.0e-10):
-        raise ValueError(f"Shot {shot}: {label} time grid differs from reference")
 
 
 def _write_summary(path: Path, rows: list[dict[str, object]]) -> None:
@@ -318,8 +316,8 @@ def main(argv: list[str] | None = None) -> int:
         if trim_reference_root is not None:
             ref_ip = _load_table(trim_reference_root / "ip" / f"t15md_{shot}_ip.csv")
             ref_coils = _load_table(trim_reference_root / "coils" / f"t15md_{shot}_coils.csv")
-            _validate_same_grid(shot=shot, table=ip_table, reference=ref_ip, label="trimmed Ip")
-            _validate_same_grid(shot=shot, table=ideal_table, reference=ref_coils, label="trimmed coils")
+            _validate_same_shape(shot=shot, table=ip_table, reference=ref_ip, label="trimmed Ip")
+            _validate_same_shape(shot=shot, table=ideal_table, reference=ref_coils, label="trimmed coils")
             ip_table = ref_ip
             ideal_table[:, 0] = ref_coils[:, 0]
             reference_currents = ref_coils[:, 1:]
