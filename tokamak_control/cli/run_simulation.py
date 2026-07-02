@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -349,6 +350,61 @@ def _serialize_disturbance_template(d: Disturbance) -> dict[str, object]:
     }
 
 
+def _resolve_run_input_path(value: object) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
+def _file_fingerprint(path: Path) -> dict[str, object]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "sha256": digest.hexdigest(),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _collect_input_file_fingerprints(
+    *,
+    config_source: str,
+    initial_state_source: str | None,
+    controller_params: Mapping[str, object],
+    scenario_params: Mapping[str, object],
+) -> dict[str, object]:
+    candidates = {
+        "config_source": config_source,
+        "initial_state_source": initial_state_source,
+        "controller.replay_path": controller_params.get("replay_path"),
+        "scenario.ip_csv": scenario_params.get("ip_csv"),
+        "scenario.reference_npz": scenario_params.get("reference_npz"),
+    }
+    out: dict[str, object] = {}
+    for name, value in candidates.items():
+        path = _resolve_run_input_path(value)
+        if path is None:
+            continue
+        if path.is_file():
+            out[name] = _file_fingerprint(path)
+        else:
+            out[name] = {
+                "path": str(path),
+                "missing": True,
+            }
+    return out
+
+
 def _build_run_metadata(
     *,
     run_id: int,
@@ -385,6 +441,12 @@ def _build_run_metadata(
         "realism": _json_safe(cfg.realism),
         "profiling_enabled": bool(profiling_enabled),
         "runtime_overrides": dict(runtime_overrides or {}),
+        "input_files": _collect_input_file_fingerprints(
+            config_source=config_source,
+            initial_state_source=cfg.initial_state_source,
+            controller_params=controller_params,
+            scenario_params=scenario_params,
+        ),
         "grid": {
             "r_start": float(cfg.grid.r.start),
             "r_step": float(cfg.grid.r.step),

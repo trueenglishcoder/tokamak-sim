@@ -92,6 +92,14 @@ def _nested(mapping: dict[str, object], *keys: str) -> object | None:
     return current
 
 
+def _manifest_file_hash(manifest: dict[str, object], key: str) -> str | None:
+    node = _nested(manifest, "input_files", key)
+    if not isinstance(node, dict):
+        return None
+    value = node.get("sha256")
+    return None if value is None else str(value)
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -248,6 +256,26 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"manifest replay_path hash differs from expected path hash: {replay_path}")
     if _sha256(ip_csv_path) != _sha256(ideal_ip_path):
         raise SystemExit(f"manifest ip_csv hash differs from expected path hash: {ip_csv_path}")
+    manifest_replay_hash = _manifest_file_hash(manifest, "controller.replay_path")
+    manifest_ip_hash = _manifest_file_hash(manifest, "scenario.ip_csv")
+    current_replay_hash = _sha256(ideal_coils_path)
+    current_ip_hash = _sha256(ideal_ip_path)
+    if manifest_replay_hash is not None and manifest_replay_hash != current_replay_hash:
+        raise SystemExit(
+            "run manifest replay_path hash does not match the current idealized table. "
+            "This run was made with stale/different CSV contents:\n"
+            f"  manifest sha256: {manifest_replay_hash}\n"
+            f"  current  sha256: {current_replay_hash}\n"
+            f"  path: {ideal_coils_path}"
+        )
+    if manifest_ip_hash is not None and manifest_ip_hash != current_ip_hash:
+        raise SystemExit(
+            "run manifest ip_csv hash does not match the current idealized Ip table. "
+            "This run was made with stale/different CSV contents:\n"
+            f"  manifest sha256: {manifest_ip_hash}\n"
+            f"  current  sha256: {current_ip_hash}\n"
+            f"  path: {ideal_ip_path}"
+        )
 
     timeseries_path = _find_one(run_dir, "run_timeseries*.csv")
     ts = _read_timeseries(timeseries_path)
@@ -284,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"rows: {len(ideal_coils)}")
     print(f"idealized_coils_sha256: {_sha256(ideal_coils_path)}")
     print(f"idealized_ip_sha256: {_sha256(ideal_ip_path)}")
+    print(f"manifest_replay_sha256: {manifest_replay_hash or '<not recorded by this old run>'}")
+    print(f"manifest_ip_sha256: {manifest_ip_hash or '<not recorded by this old run>'}")
     print(f"trim50_coils_sha256: {_sha256(ref_coils_path)}")
     print(f"trim50_ip_sha256: {_sha256(ref_ip_path)}")
     print(f"idealized_coils_row0: {_format_row(ideal_coils[0])}")
