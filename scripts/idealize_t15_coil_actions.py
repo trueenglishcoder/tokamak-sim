@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -139,10 +138,51 @@ def _jdot_rms(time_s: np.ndarray, currents: np.ndarray) -> float:
     return _rms(np.diff(currents, axis=0) / dt[:, None])
 
 
+def _trim_table(table: np.ndarray, *, start_rows: int, end_rows: int, rebase_time: bool) -> np.ndarray:
+    start = int(start_rows)
+    end = int(end_rows)
+    if start < 0 or end < 0:
+        raise ValueError("trim output row counts must be non-negative")
+    stop = table.shape[0] - end if end else table.shape[0]
+    if start >= stop:
+        raise ValueError(
+            f"trim removes all rows: table has {table.shape[0]} rows, "
+            f"start_rows={start}, end_rows={end}"
+        )
+    out = np.asarray(table[start:stop], dtype=float).copy()
+    if bool(rebase_time):
+        out[:, 0] -= float(out[0, 0])
+    return out
+
+
+def _anchor_trimmed_currents_to_source(
+    ideal_currents: np.ndarray,
+    source_currents: np.ndarray,
+    *,
+    start_rows: int,
+    end_rows: int,
+) -> np.ndarray:
+    start = int(start_rows)
+    end = int(end_rows)
+    if start == 0 and end == 0:
+        return ideal_currents
+    stop = source_currents.shape[0] - end if end else source_currents.shape[0]
+    source = np.asarray(source_currents[start:stop], dtype=float)
+    ideal = np.asarray(ideal_currents, dtype=float).copy()
+    if ideal.shape != source.shape:
+        raise ValueError(f"trimmed ideal/source current shapes differ: {ideal.shape} != {source.shape}")
+    correction0 = source[0] - ideal[0]
+    correction1 = source[-1] - ideal[-1]
+    blend = np.linspace(0.0, 1.0, ideal.shape[0], dtype=float)[:, None]
+    ideal += (1.0 - blend) * correction0[None, :] + blend * correction1[None, :]
+    return ideal
+
+
 def _write_summary(path: Path, rows: list[dict[str, object]]) -> None:
     fieldnames = [
         "shot",
         "samples",
+        "output_samples",
         "columns",
         "dt_median_s",
         "method",
@@ -191,6 +231,24 @@ def main(argv: list[str] | None = None) -> int:
         default=21,
         help="Odd triangular smoothing window for Jdot when --method=smooth_jdot.",
     )
+    parser.add_argument(
+        "--trim-output-rows-start",
+        type=int,
+        default=0,
+        help="Trim this many rows from the start after idealizing on the full input table.",
+    )
+    parser.add_argument(
+        "--trim-output-rows-end",
+        type=int,
+        default=0,
+        help="Trim this many rows from the end after idealizing on the full input table.",
+    )
+    parser.add_argument(
+        "--rebase-time",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="After output trimming, subtract the first remaining timestamp from the time column.",
+    )
     parser.add_argument("--summary-name", default="idealized_coil_summary.csv")
     args = parser.parse_args(argv)
 
@@ -222,26 +280,60 @@ def main(argv: list[str] | None = None) -> int:
             smooth_window_steps=int(args.smooth_window_steps),
         )
         ideal_table = np.column_stack([time_s, ideal_currents])
+        ip_table = np.asarray(ip, dtype=float)
+        if int(args.trim_output_rows_start) or int(args.trim_output_rows_end):
+            ideal_table = _trim_table(
+                ideal_table,
+                start_rows=int(args.trim_output_rows_start),
+                end_rows=int(args.trim_output_rows_end),
+                rebase_time=bool(args.rebase_time),
+            )
+            ip_table = _trim_table(
+                ip_table,
+                start_rows=int(args.trim_output_rows_start),
+                end_rows=int(args.trim_output_rows_end),
+                rebase_time=bool(args.rebase_time),
+            )
+            ideal_table[:, 1:] = _anchor_trimmed_currents_to_source(
+                ideal_table[:, 1:],
+                currents,
+                start_rows=int(args.trim_output_rows_start),
+                end_rows=int(args.trim_output_rows_end),
+            )
+        elif bool(args.rebase_time):
+            ideal_table = ideal_table.copy()
+            ip_table = ip_table.copy()
+            ideal_table[:, 0] -= float(ideal_table[0, 0])
+            ip_table[:, 0] -= float(ip_table[0, 0])
 
         ip_out.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ip_in, ip_out)
+        _format_table(ip_out, ip_table)
         _format_table(coil_out, ideal_table)
 
-        diff = ideal_currents - currents
+        compare_currents = currents
+        compare_ideal = ideal_currents
+        if int(args.trim_output_rows_start) or int(args.trim_output_rows_end):
+            start = int(args.trim_output_rows_start)
+            end = int(args.trim_output_rows_end)
+            stop = currents.shape[0] - end if end else currents.shape[0]
+            compare_currents = currents[start:stop]
+            compare_ideal = ideal_currents[start:stop]
+        diff = compare_ideal - compare_currents
         rows.append(
             {
                 "shot": shot,
                 "samples": int(coils.shape[0]),
+                "output_samples": int(ideal_table.shape[0]),
                 "columns": int(coils.shape[1]),
-                "dt_median_s": float(np.median(np.diff(time_s))),
+                "dt_median_s": float(np.median(np.diff(ideal_table[:, 0]))),
                 "method": str(args.method),
                 "knot_step_s": float(args.knot_step_s),
                 "smooth_window_steps": int(args.smooth_window_steps),
                 "knots": int(knot_times.size),
                 "max_abs_current_error_a": float(np.max(np.abs(diff))),
                 "rms_current_error_a": _rms(diff),
-                "orig_jdot_rms_aps": _jdot_rms(time_s, currents),
-                "ideal_jdot_rms_aps": _jdot_rms(time_s, ideal_currents),
+                "orig_jdot_rms_aps": _jdot_rms(ideal_table[:, 0], compare_currents),
+                "ideal_jdot_rms_aps": _jdot_rms(ideal_table[:, 0], compare_ideal),
                 "ip_path": _display_path(ip_out),
                 "coil_path": _display_path(coil_out),
             }

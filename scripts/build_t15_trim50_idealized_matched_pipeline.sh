@@ -51,11 +51,14 @@ PARAM_ROOT="output/t15_boundary_parameters_trim50_idealized_matched_gpu_plain_1e
 INITIAL_PREFIX="T15MD_new_data_trim50_idealized_matched"
 
 python3 scripts/idealize_t15_coil_actions.py \
-  --input-root data/t15_data_new_trim50 \
+  --input-root data/t15_data_new_trim \
   --output-root "${DATA_ROOT}" \
   --shots "${SHOTS[@]}" \
   --method smooth_jdot \
-  --smooth-window-steps 21
+  --smooth-window-steps 21 \
+  --trim-output-rows-start 40 \
+  --trim-output-rows-end 40 \
+  --rebase-time
 
 python3 scripts/run_t15md_limited_replay_dataset.py \
   --shots "${SHOTS[@]}" \
