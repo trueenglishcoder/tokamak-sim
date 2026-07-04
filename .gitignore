@@ -34,6 +34,8 @@ configs/initial_states/*
 data/
 runs/
 output/
+.stale_output_*/
+.stale_runs_*/
 synthetic_iter/
 _local_archive/
 .pytest_cache/
