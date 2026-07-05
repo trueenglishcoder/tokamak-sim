@@ -87,6 +87,9 @@ CONTROLLER_STATE_V6_FEATURE_ORDER = [
     "previous_action",
     "target_preview",
 ]
+CONTROLLER_STATE_V7_NO_STEP_NORM_FEATURE_ORDER = [
+    name for name in CONTROLLER_STATE_V6_FEATURE_ORDER if name != "step_norm"
+]
 COMPACT_JOINT_STATE_V2_FEATURE_ORDER = CONTROLLER_STATE_V2_FEATURE_ORDER
 OBSERVATION_KIND = "controller_state_v4"
 EXPECTED_FEATURE_ORDER = CONTROLLER_STATE_V4_FEATURE_ORDER
@@ -94,6 +97,7 @@ SUPPORTED_FEATURE_ORDERS = {
     "controller_state_v4": CONTROLLER_STATE_V4_FEATURE_ORDER,
     "controller_state_v5": CONTROLLER_STATE_V5_FEATURE_ORDER,
     "controller_state_v6": CONTROLLER_STATE_V6_FEATURE_ORDER,
+    "controller_state_v7_no_step_norm": CONTROLLER_STATE_V7_NO_STEP_NORM_FEATURE_ORDER,
 }
 
 
@@ -371,8 +375,8 @@ class LearnedMagneticController(Controller):
         ref_radii: np.ndarray,
         measured_ip: float,
     ) -> tuple[float, np.ndarray, float]:
-        """Return controller_state_v5/v6 rate features in the same normalized units as training."""
-        if self.observation_kind not in {"controller_state_v5", "controller_state_v6"}:
+        """Return controller_state_v5/v6/v7 rate features in the same normalized units as training."""
+        if self.observation_kind not in {"controller_state_v5", "controller_state_v6", "controller_state_v7_no_step_norm"}:
             return 0.0, np.zeros((self.n_angles,), dtype=float), 0.0
         dt = max(float(getattr(model, "t_step")), 1.0e-12)
         t_next = float(model.state.t) + dt
@@ -397,8 +401,8 @@ class LearnedMagneticController(Controller):
         measured_radii: np.ndarray,
         ref_radii: np.ndarray,
     ) -> None:
-        """Advance controller_state_v6 integral-error memory to the current model step."""
-        if self.observation_kind != "controller_state_v6":
+        """Advance controller_state_v6/v7 integral-error memory to the current model step."""
+        if self.observation_kind not in {"controller_state_v6", "controller_state_v7_no_step_norm"}:
             return
         step = int(getattr(model.state, "step", 0))
         if self._last_integral_step is None:
@@ -419,12 +423,12 @@ class LearnedMagneticController(Controller):
         self._last_integral_step = step
 
     def _normalized_integral_ip_error(self) -> float:
-        """Return the v6 normalized integral Ip error used by training."""
+        """Return the v6/v7 normalized integral Ip error used by training."""
         scale = 15000.0 * 0.1
         return float(np.clip(float(self._integral_ip_error) / scale, -1.0, 1.0))
 
     def _normalized_integral_boundary_radii_error(self) -> np.ndarray:
-        """Return the v6 normalized integral boundary-radius errors used by training."""
+        """Return the v6/v7 normalized integral boundary-radius errors used by training."""
         scale = 0.02 * 0.1
         return np.clip(np.asarray(self._integral_boundary_radii_error, dtype=float) / scale, -1.0, 1.0)
 
@@ -487,7 +491,7 @@ class LearnedMagneticController(Controller):
             return _positive_scale(self.schema[name], name)
         if name in self.normalization:
             return _positive_scale(self.normalization[name], name)
-        if self.observation_kind in {"controller_state_v5", "controller_state_v6"}:
+        if self.observation_kind in {"controller_state_v5", "controller_state_v6", "controller_state_v7_no_step_norm"}:
             raise ValueError(f"{name} is required for {self.observation_kind} learned-controller exports")
         return _positive_scale(default, name)
 
