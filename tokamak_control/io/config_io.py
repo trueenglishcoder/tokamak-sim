@@ -122,9 +122,9 @@ def _coerce_boundary_mode(value: object, name: str) -> BoundaryMode:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
     mode = value.strip().lower()
-    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "spline_contour"}:
+    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}:
         raise ValueError(
-            f"{name} must be 'legacy_contour', 'legacy_contour_limited', 'tracked_flux_contour', or 'spline_contour', got {value!r}"
+            f"{name} must be 'legacy_contour', 'legacy_contour_limited', 'tracked_flux_contour', or 'suchkov_spline_contour', got {value!r}"
         )
     return cast(BoundaryMode, mode)
 

@@ -14,6 +14,13 @@ from tokamak_control.geometry.boundary_common import (
     BoundaryNotFoundError as _SharedBoundaryNotFoundError,
     normalize_boundary_mode,
 )
+from tokamak_control.geometry.boundary_suchkov import (
+    SuchkovSplinePlan,
+    build_suchkov_spline_plan,
+    interpolate_closed_curve_numpy,
+    uniform_periodic_angles,
+)
+from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
 from tokamak_control.geometry.xpoints import find_x_points
 from tokamak_control.io.logger import get_logger
 from tokamak_control.io.profiling import Profiler
@@ -27,6 +34,7 @@ _PROFILER = Profiler(
 _time_block = _PROFILER.time_block
 _record_path = _PROFILER.record_path
 _LEGACY_LIMITER_CONTAINMENT_TOL_M = 1.0e-9
+
 
 class BoundaryNotFoundError(_SharedBoundaryNotFoundError):
     """Ошибка отсутствия физически определенной границы плазмы."""
@@ -70,6 +78,7 @@ def boundary_profiling_snapshot() -> dict[str, object]:
             "legacy_contour_limited_success",
             "tracked_flux_contour_success",
             "tracked_flux_contour_reset",
+            "suchkov_spline_contour_success",
         ),
         title="boundary",
     )
@@ -89,6 +98,7 @@ def log_boundary_profiling_summary() -> None:
             "legacy_contour_limited_success",
             "tracked_flux_contour_success",
             "tracked_flux_contour_reset",
+            "suchkov_spline_contour_success",
         ),
         title="boundary",
     )
@@ -131,15 +141,29 @@ def find_plasma_boundary_cpu_with_status(
         if psi.shape != grid.shape:
             raise ValueError(f"psi shape {psi.shape} != grid shape {grid.shape}")
 
-        del n_levels, local_n_levels, local_span_frac
+        del local_n_levels, local_span_frac
         del target_mean_radius, target_switch_ratio, target_switch_abs_delta
         del local_bbox_pad_r, local_bbox_pad_z
         limiter_poly = None
         strict_mode = base_mode if mode == "tracked_flux_contour" else mode
-        if strict_mode in {"legacy_contour_limited", "spline_contour"}:
+        if strict_mode in {"legacy_contour_limited", "suchkov_spline_contour"}:
             limiter_poly = _prepare_limiter_shape(limiter_shape)
-            if strict_mode == "legacy_contour_limited" and limiter_poly is None:
+            if strict_mode in {"legacy_contour_limited", "suchkov_spline_contour"} and limiter_poly is None:
                 raise BoundaryNotFoundError(f"{strict_mode} boundary mode requires limiter geometry")
+        if mode == "suchkov_spline_contour":
+            suchkov_boundary = _suchkov_spline_contour_boundary(
+                psi=psi,
+                grid=grid,
+                center=center,
+                limiter_poly=limiter_poly,
+            )
+            if suchkov_boundary is None:
+                raise BoundaryNotFoundError("No suchkov_spline_contour plasma boundary found")
+            poly, level = suchkov_boundary
+            status: BoundaryStatus = "suchkov_spline_contour_success"
+            _record_path(status)
+            return _close_poly(poly), float(level), status
+
         should_track = mode == "tracked_flux_contour" or bool(track_level)
         if should_track and prev_poly is not None and prev_level is not None and np.isfinite(float(prev_level)):
             tracked_boundary = _legacy_tracked_contour_boundary(
@@ -191,20 +215,6 @@ def find_plasma_boundary_cpu_with_status(
             poly, level = legacy_boundary
             if mode == "tracked_flux_contour":
                 status = "tracked_flux_contour_reset"
-            elif mode == "spline_contour":
-                spline_boundary = _spline_contour_boundary(
-                    psi=psi,
-                    grid=grid,
-                    center=center,
-                    precision_index2=legacy_precision_index2,
-                    limiter_poly=limiter_poly,
-                )
-                if spline_boundary is not None:
-                    poly, level = spline_boundary
-                    status = "spline_contour_success"
-                    _record_path(status)
-                    return _close_poly(poly), float(level), status
-                status = "legacy_contour_limited_success" if limiter_poly is not None else "legacy_contour_success"
             else:
                 status = "legacy_contour_limited_success" if limiter_poly is not None else "legacy_contour_success"
             _record_path(status)
@@ -220,7 +230,7 @@ def boundary_status_is_real(status: BoundaryStatus) -> bool:
         "legacy_contour_limited_success",
         "tracked_flux_contour_success",
         "tracked_flux_contour_reset",
-        "spline_contour_success",
+        "suchkov_spline_contour_success",
     }
 
 
@@ -1085,96 +1095,144 @@ def _point_to_polyline_distance(point: np.ndarray, polyline: np.ndarray) -> floa
     return best
 
 
-def _spline_contour_boundary(
+def _suchkov_spline_contour_boundary(
     *,
     psi: np.ndarray,
     grid: Grid2D,
     center: tuple[float, float],
-    precision_index2: float,
-    limiter_poly: np.ndarray | None = None,
+    limiter_poly: np.ndarray | None,
 ) -> tuple[np.ndarray, float] | None:
-    """Найти границу плазмы с использованием сплайнового восстановления.
+    """Восстановить LCFS как замкнутые сплайны ``R(xi)`` и ``Z(xi)``.
 
-    Работает аналогично _legacy_contour_boundary, но использует spline_max_width
-    как критерий выбора уровня вместо длины контура.
+    Специализация метода Сучкова использует уже рассчитанное поле ``psi``.
+    Среди допустимых замкнутых линий уровня выбирается линия максимальной
+    горизонтальной ширины. Координаты выбранного кандидата независимо
+    интерполируются периодическими кубическими сплайнами по параметру ``xi``.
     """
-    from tokamak_control.geometry.boundary_spline import fit_periodic_cubic_spline, spline_max_width
-
-    psi_arr = np.asarray(psi, dtype=float)
-    if psi_arr.shape != grid.shape or not bool(np.any(np.isfinite(psi_arr))):
+    if limiter_poly is None:
+        raise BoundaryNotFoundError("suchkov_spline_contour requires limiter geometry")
+    psi_array = np.asarray(psi, dtype=np.float64)
+    axis = _find_magnetic_axis(
+        psi=psi_array,
+        grid=grid,
+        center=center,
+        limiter_poly=limiter_poly,
+        limiter_tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
+    )
+    contact_level = _suchkov_contact_level_cpu(
+        psi=psi_array,
+        grid=grid,
+        axis=axis,
+        limiter_poly=limiter_poly,
+    )
+    if contact_level is None:
         return None
-    precision = float(precision_index2)
-    if not np.isfinite(precision) or precision <= 0.0:
-        raise ValueError(f"legacy_precision_index2 must be finite and > 0, got {precision_index2!r}")
 
-    o = _physical_center_to_legacy_index(grid, center)
-    if not np.all(np.isfinite(o)):
+    control_count = 32
+    output_count = 128
+    control_angles = uniform_periodic_angles(control_count)
+    output_angles = uniform_periodic_angles(output_count)
+    plan = build_suchkov_spline_plan(output_angles, control_count=control_count)
+    axis_point = np.asarray(axis.point, dtype=np.float64).reshape(1, 2)
+    directions = np.stack([np.cos(control_angles), np.sin(control_angles)], axis=1)
+    lower_fraction = 0.0
+    upper_fraction = 1.0
+    best: tuple[np.ndarray, float, float] | None = None
+
+    for _ in range(18):
+        fraction = 0.5 * (lower_fraction + upper_fraction)
+        level = float(axis.level + fraction * (contact_level - axis.level))
+        candidate = _suchkov_spline_at_level_cpu(
+            psi=psi_array,
+            grid=grid,
+            axis=axis,
+            level=level,
+            limiter_poly=limiter_poly,
+            control_angles=control_angles,
+            directions=directions,
+            axis_point=axis_point,
+            plan=plan,
+        )
+        if candidate is None:
+            upper_fraction = fraction
+            continue
+        closed, width = candidate
+        lower_fraction = fraction
+        if best is None or width > best[2]:
+            best = (closed, level, width)
+
+    if best is None:
         return None
+    return best[0], best[1]
 
-    p = o.copy()
-    new_step = -o / 2.0
-    best_poly_index: np.ndarray | None = None
-    best_level: float | None = None
-    best_width = -float("inf")
 
-    def contour_fits_limiter(contour_index: np.ndarray) -> bool:
-        if limiter_poly is None:
-            return True
-        contour_physical = _legacy_index_poly_to_physical(grid, contour_index)
-        return _poly_fits_limiter(
-            _close_poly(contour_physical),
+def _suchkov_spline_at_level_cpu(
+    *,
+    psi: np.ndarray,
+    grid: Grid2D,
+    axis: _MagneticAxis,
+    level: float,
+    limiter_poly: np.ndarray,
+    control_angles: np.ndarray,
+    directions: np.ndarray,
+    axis_point: np.ndarray,
+    plan: SuchkovSplinePlan,
+) -> tuple[np.ndarray, float] | None:
+    """Построить лучший допустимый сплайн для одного уровня потока."""
+    best: tuple[np.ndarray, float] | None = None
+    for polyline in _contours_at_level(psi, grid, float(level)):
+        if not _is_closed_poly(polyline) or not _encloses_center(polyline, axis.point):
+            continue
+        raw_closed = _close_poly(polyline)
+        if not _poly_fits_limiter(
+            raw_closed,
             limiter_poly,
             tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
-        )
+        ):
+            continue
+        try:
+            control_radii = radii_from_polyline_ray_intersections(
+                raw_closed,
+                axis.point,
+                control_angles,
+            )
+        except ValueError:
+            continue
+        control_points = axis_point + control_radii[:, None] * directions
+        spline_points = interpolate_closed_curve_numpy(control_points, plan)
+        closed = _close_poly(spline_points)
+        if not _is_closed_poly(closed):
+            continue
+        if not _poly_fits_limiter(
+            closed,
+            limiter_poly,
+            tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
+        ):
+            continue
+        width = float(np.max(closed[:, 0]) - np.min(closed[:, 0]))
+        if not np.isfinite(width) or width <= 0.0:
+            continue
+        if best is None or width > best[1]:
+            best = (closed, width)
+    return best
 
-    with _time_block("legacy_contour_search"):
-        while float(np.dot(new_step, new_step)) >= precision and p[0] >= 1.0 and p[1] >= 1.0:
-            p = p + new_step
-            level = _legacy_sample_center_level(psi_arr, p)
-            if level is None:
-                break
 
-            accepted = _legacy_first_accepted_contour(psi_arr, level, o, accept_predicate=contour_fits_limiter)
-            if accepted is not None:
-                length, contour = accepted
-                contour_physical = _legacy_index_poly_to_physical(grid, contour)
-                angles = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=float)
-                radii = _radii_at_angles_from_contour(contour_physical, center, angles)
-                if np.all(np.isfinite(radii)):
-                    try:
-                        coeffs = fit_periodic_cubic_spline(angles, radii)
-                        width = spline_max_width(coeffs, angles, center[0])
-                        if width > best_width:
-                            best_width = width
-                            best_poly_index = np.asarray(contour, dtype=float)
-                            best_level = float(level)
-                    except (ValueError, np.linalg.LinAlgError):
-                        pass
-                new_step = -np.abs(new_step) / 2.0
-            else:
-                new_step = np.abs(new_step) / 2.0
-
-    if best_poly_index is None or best_level is None or best_poly_index.shape[0] < 3:
+def _suchkov_contact_level_cpu(
+    *,
+    psi: np.ndarray,
+    grid: Grid2D,
+    axis: _MagneticAxis,
+    limiter_poly: np.ndarray,
+) -> float | None:
+    """Найти первый достижимый уровень контакта поверхности с лимитером."""
+    limiter_points = _sample_limiter_points(limiter_poly, grid)
+    limiter_values = _sample_psi_bilinear(psi, grid, limiter_points)
+    values = limiter_values[np.isfinite(limiter_values)]
+    if values.size == 0:
         return None
-    return _legacy_index_poly_to_physical(grid, best_poly_index), float(best_level)
-
-
-def _radii_at_angles_from_contour(contour: np.ndarray, center: tuple[float, float], angles: np.ndarray) -> np.ndarray:
-    """Конвертировать контур в радиусы на заданных углах от центра.
-
-    Для каждого угла находит пересечение луча из центра с контуром.
-    """
-    pts = np.asarray(contour, dtype=float)
-    c = np.asarray(center, dtype=float).reshape(1, 2)
-    rel = pts - c
-    theta = np.arctan2(rel[:, 1], rel[:, 0])
-    radii_pts = np.sqrt(np.sum(rel * rel, axis=1))
-
-    order = np.argsort(theta)
-    theta_sorted = theta[order]
-    radii_sorted = radii_pts[order]
-
-    theta_ext = np.concatenate([theta_sorted - 2.0 * np.pi, theta_sorted, theta_sorted + 2.0 * np.pi])
-    radii_ext = np.concatenate([radii_sorted, radii_sorted, radii_sorted])
-
-    return np.interp(angles, theta_ext, radii_ext)
+    axis_level = float(axis.level)
+    if axis.kind == "maximum":
+        candidates = values[values < axis_level]
+        return None if candidates.size == 0 else float(np.max(candidates))
+    candidates = values[values > axis_level]
+    return None if candidates.size == 0 else float(np.min(candidates))

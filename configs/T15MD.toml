@@ -29,7 +29,9 @@ ip_coupling_sign = 1.0
 plasma_psi_sign = -1.0
 
 [boundary]
-mode = "spline_contour"
+mode = "suchkov_spline_contour"
+base_mode = "legacy_contour_limited"
+legacy_precision_index2 = 1e-6
 
 [limiter]
 name = "T15MD"

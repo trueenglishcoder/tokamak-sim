@@ -85,25 +85,28 @@ def _write_replay_boundary_config(
     continuity_weight_area: float,
     continuity_weight_level: float,
 ) -> Path:
+    """Создать конфигурацию строгого replay с выбранным режимом границы."""
     with base_config.open("rb") as handle:
         data = tomllib.load(handle)
     boundary = data.setdefault("boundary", {})
     if not isinstance(boundary, dict):
         raise ValueError(f"{base_config} boundary section must be a TOML table")
-    if boundary_mode not in {"legacy_contour_limited", "tracked_flux_contour", "spline_contour"}:
+    supported = {
+        "legacy_contour_limited",
+        "tracked_flux_contour",
+        "suchkov_spline_contour",
+    }
+    if boundary_mode not in supported:
         raise ValueError(
-            "replay boundary mode must be 'legacy_contour_limited', 'tracked_flux_contour', or 'spline_contour', "
+            "replay boundary mode must be 'legacy_contour_limited', "
+            "'tracked_flux_contour', or 'suchkov_spline_contour', "
             f"got {boundary_mode!r}"
         )
-    if boundary_mode == "spline_contour":
-        boundary["mode"] = "spline_contour"
-        # spline mode: no extra params needed
-    else:
-        boundary.update(
-            {
-                "mode": str(boundary_mode),
-                "base_mode": "legacy_contour_limited",
-                "legacy_precision_index2": float(legacy_precision_index2),
+    boundary.update(
+        {
+            "mode": str(boundary_mode),
+            "base_mode": "legacy_contour_limited",
+            "legacy_precision_index2": float(legacy_precision_index2),
             "track_level": False,
             "smooth_selected_level": bool(smooth_selected_level),
             "soft_level_selection": bool(soft_level_selection),
@@ -119,33 +122,26 @@ def _write_replay_boundary_config(
             "continuity_weight_center": float(continuity_weight_center),
             "continuity_weight_area": float(continuity_weight_area),
             "continuity_weight_level": float(continuity_weight_level),
-            }
-        )
+        }
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("wb") as handle:
         tomli_w.dump(data, handle)
     loaded = load_config(out_path)
     if loaded.boundary_mode != boundary_mode:
-        raise RuntimeError(f"Replay config did not persist {boundary_mode!r}: {loaded.boundary_mode!r}")
-    if boundary_mode != "spline_contour":
-        if loaded.boundary_base_mode != "legacy_contour_limited":
-            raise RuntimeError(
-                f"Replay config did not persist legacy_contour_limited base mode: {loaded.boundary_base_mode!r}"
-            )
-        if loaded.boundary_smooth_selected_level != bool(smooth_selected_level):
-            raise RuntimeError(
-                "Replay config did not persist smooth_selected_level="
-                f"{bool(smooth_selected_level)!r}: {loaded.boundary_smooth_selected_level!r}"
-            )
-        if loaded.boundary_soft_level_selection != bool(soft_level_selection):
-            raise RuntimeError(
-                "Replay config did not persist soft_level_selection="
-                f"{bool(soft_level_selection)!r}: {loaded.boundary_soft_level_selection!r}"
-            )
+        raise RuntimeError(
+            f"Replay config did not persist {boundary_mode!r}: {loaded.boundary_mode!r}"
+        )
+    if loaded.boundary_base_mode != "legacy_contour_limited":
+        raise RuntimeError(
+            "Replay config did not persist legacy_contour_limited base mode: "
+            f"{loaded.boundary_base_mode!r}"
+        )
     if loaded.limiter_name is None:
-        raise RuntimeError("Strict replay config has no limiter; limited replay dataset requires limiter geometry")
+        raise RuntimeError(
+            "Strict replay config has no limiter; limited replay dataset requires limiter geometry"
+        )
     return out_path
-
 
 def _discover_data_shots(data_root: Path) -> list[str]:
     """Найти разряды по наличию пар ip/coils CSV."""
@@ -464,12 +460,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--angles", type=int, default=32, help="Boundary radii sample count to store.")
     parser.add_argument(
         "--boundary-mode",
-        choices=("legacy_contour_limited", "tracked_flux_contour", "spline_contour"),
-        default="spline_contour",
+        choices=("legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"),
+        default="suchkov_spline_contour",
         help=(
             "Boundary mode for the generated replay config. legacy_contour_limited re-finds a fresh "
             "limited boundary each step; tracked_flux_contour initializes from legacy_contour_limited "
-            "and then tracks the same flux-surface identity over time."
+            "and then tracks the same flux-surface identity over time; suchkov_spline_contour "
+            "represents the selected closed level by periodic cubic splines R(xi), Z(xi)."
         ),
     )
     parser.add_argument("--legacy-precision-index2", type=float, default=1.0e-3)

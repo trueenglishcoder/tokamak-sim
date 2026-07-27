@@ -115,7 +115,7 @@ def _boundary_mode_from_meta(meta: dict) -> BoundaryMode:
     if not isinstance(boundary_meta, dict):
         return "legacy_contour"
     mode = str(boundary_meta.get("mode", "legacy_contour")).strip().lower()
-    if mode not in {"legacy_contour", "legacy_contour_limited"}:
+    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}:
         raise ValueError(f"Invalid boundary mode in run metadata: {mode!r}")
     return cast(BoundaryMode, mode)
 

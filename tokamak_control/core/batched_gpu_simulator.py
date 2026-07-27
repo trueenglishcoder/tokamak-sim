@@ -11,7 +11,11 @@ from tokamak_control.config.settings import PhysicsSettings
 from tokamak_control.core.coils import CoilGroup
 from tokamak_control.core.green import build_green_for_coils, build_green_for_eind, build_green_for_plasma_center
 from tokamak_control.core.grid import Grid2D
-from tokamak_control.geometry.boundary_gpu import FixedAngleBoundaryGpuResult, fixed_angle_boundary_gpu
+from tokamak_control.geometry.boundary_gpu import (
+    FixedAngleBoundaryGpuResult,
+    fixed_angle_boundary_gpu,
+    prepare_fixed_angle_boundary_gpu_geometry,
+)
 
 
 @dataclass(slots=True)
@@ -79,8 +83,8 @@ class BatchedGpuTokamakSimulator:
         self.angles_rad = np.asarray(angles_rad, dtype=float).reshape(-1)
         self.limiter_shape = np.asarray(limiter_shape, dtype=float).reshape(-1, 2)
         self.boundary_mode = str(boundary_mode)
-        if self.boundary_mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "spline_contour"}:
-            raise ValueError("BatchedGpuTokamakSimulator only supports legacy contour and spline_contour boundary modes")
+        if self.boundary_mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}:
+            raise ValueError("BatchedGpuTokamakSimulator received an unsupported boundary mode")
         self.boundary_base_mode = str(boundary_base_mode)
         self.boundary_legacy_precision_index2 = float(boundary_legacy_precision_index2)
         if not np.isfinite(self.boundary_legacy_precision_index2) or self.boundary_legacy_precision_index2 <= 0.0:
@@ -113,6 +117,15 @@ class BatchedGpuTokamakSimulator:
         self.g_pfc = torch.as_tensor(gp, dtype=self.dtype, device=self.device)
         self.g_sol = torch.as_tensor(gs, dtype=self.dtype, device=self.device)
         self.angles_t = torch.as_tensor(self.angles_rad, dtype=self.dtype, device=self.device)
+        self._boundary_gpu_geometry = prepare_fixed_angle_boundary_gpu_geometry(
+            grid=self.grid,
+            center=self.center,
+            angles_rad=self.angles_t,
+            limiter_shape=self.limiter_shape,
+            boundary_mode=self.boundary_mode,
+            gpu_device=str(self.device),
+            dtype=self.dtype,
+        )
         self.profile_enabled = str(os.environ.get("TOKAMAK_PROFILE", "")).lower() not in {"", "0", "false", "no"}
         self.last_profile: dict[str, float] = {}
         self._reset_boundary_tracking()
@@ -244,6 +257,7 @@ class BatchedGpuTokamakSimulator:
             continuity_weight_radii=self.boundary_continuity_weight_radii,
             continuity_weight_mean_radius=self.boundary_continuity_weight_mean_radius,
             continuity_weight_level=self.boundary_continuity_weight_level,
+            prepared_geometry=self._boundary_gpu_geometry,
         )
         if self.profile_enabled and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)

@@ -9,6 +9,12 @@ from tokamak_control.compute import require_gpu_available
 from tokamak_control.core.grid import Grid2D
 from tokamak_control.core.torch_sampling import bilinear_sample_torch_points
 from tokamak_control.geometry.boundary_common import BoundaryMode, BoundaryNotFoundError, BoundaryStatus
+from tokamak_control.geometry.boundary_suchkov import (
+    SuchkovSplineTorchPlan,
+    build_suchkov_spline_torch_plan,
+    interpolate_closed_curve_torch,
+    uniform_periodic_angles,
+)
 
 
 @dataclass(slots=True)
@@ -21,13 +27,78 @@ class FixedAngleBoundaryGpuResult:
     points: object
     radii: object
     axis_points: object
-    spline_coefficients: object = None
+
+
+@dataclass(frozen=True, slots=True, repr=True)
+class FixedAngleBoundaryGpuGeometry:
+    """Предвычисленная геометрия фиксированных лучей для GPU-поиска."""
+
+    angles: object
+    limiter: object
+    max_radii: object
+    suchkov_plan: SuchkovSplineTorchPlan | None
+    suchkov_control_max_radii: object | None
+    suchkov_limiter_samples: object | None
 
 
 def _torch(device: str):
     require_gpu_available(device)
     import torch
     return torch
+
+
+def prepare_fixed_angle_boundary_gpu_geometry(
+    *,
+    grid: Grid2D,
+    center: tuple[float, float],
+    angles_rad: object,
+    limiter_shape: object,
+    boundary_mode: BoundaryMode,
+    gpu_device: str,
+    dtype: object,
+) -> FixedAngleBoundaryGpuGeometry:
+    """Предвычислить неизменную геометрию лучей и сплайна на GPU."""
+    torch = _torch(gpu_device)
+    device = torch.device(gpu_device)
+    angles = torch.as_tensor(angles_rad, dtype=dtype, device=device).reshape(-1)
+    limiter = torch.as_tensor(limiter_shape, dtype=dtype, device=device).reshape(-1, 2)
+    if int(limiter.shape[0]) < 3:
+        raise BoundaryNotFoundError("fixed-angle GPU geometry requires limiter geometry")
+    max_radii = _ray_limit_radii(
+        grid=grid,
+        center=torch.as_tensor(center, dtype=dtype, device=device),
+        angles=angles,
+        limiter=limiter,
+    )
+    plan = None
+    control_limits = None
+    limiter_samples = None
+    if str(boundary_mode) == "suchkov_spline_contour":
+        dense_angles = torch.as_tensor(
+            uniform_periodic_angles(64),
+            dtype=dtype,
+            device=device,
+        )
+        plan = build_suchkov_spline_torch_plan(dense_angles, control_count=16)
+        control_limits = _ray_limit_radii(
+            grid=grid,
+            center=torch.as_tensor(center, dtype=dtype, device=device),
+            angles=torch.as_tensor(plan.control_angles, dtype=dtype, device=device),
+            limiter=limiter,
+        )
+        limiter_samples = torch.as_tensor(
+            _sample_closed_polyline_numpy(np.asarray(limiter_shape, dtype=np.float64), 128),
+            dtype=dtype,
+            device=device,
+        )
+    return FixedAngleBoundaryGpuGeometry(
+        angles=angles,
+        limiter=limiter,
+        max_radii=max_radii,
+        suchkov_plan=plan,
+        suchkov_control_max_radii=control_limits,
+        suchkov_limiter_samples=limiter_samples,
+    )
 
 
 def find_plasma_boundary_gpu_with_status(
@@ -80,6 +151,8 @@ def fixed_angle_boundary_gpu(
     continuity_weight_radii: float = 1.0,
     continuity_weight_mean_radius: float = 0.3,
     continuity_weight_level: float = 0.1,
+    suchkov_plan: SuchkovSplineTorchPlan | None = None,
+    prepared_geometry: FixedAngleBoundaryGpuGeometry | None = None,
 ) -> FixedAngleBoundaryGpuResult:
     """CUDA fixed-angle boundary samples for batched RL training.
 
@@ -96,19 +169,28 @@ def fixed_angle_boundary_gpu(
     dtype = field.dtype
     device = field.device
     mode = str(boundary_mode)
-    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "spline_contour"}:
+    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}:
         raise ValueError(f"unsupported boundary_mode for fixed_angle_boundary_gpu: {boundary_mode!r}")
 
-    angles = torch.as_tensor(angles_rad, dtype=dtype, device=device).reshape(-1)
     center_t = torch.tensor(center, dtype=dtype, device=device).reshape(1, 2).repeat(B, 1)
-    limiter_t = None
-    if limiter_shape is not None:
-        limiter_t = torch.as_tensor(np.asarray(limiter_shape, dtype=float), dtype=dtype, device=device).reshape(-1, 2)
-    use_limiter = mode in {"legacy_contour_limited", "tracked_flux_contour", "spline_contour"}
+    use_limiter = mode in {"legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}
+    if prepared_geometry is not None:
+        angles = torch.as_tensor(prepared_geometry.angles, dtype=dtype, device=device).reshape(-1)
+        limiter_t = torch.as_tensor(prepared_geometry.limiter, dtype=dtype, device=device).reshape(-1, 2)
+        max_radii = torch.as_tensor(prepared_geometry.max_radii, dtype=dtype, device=device).reshape(-1)
+    else:
+        angles = torch.as_tensor(angles_rad, dtype=dtype, device=device).reshape(-1)
+        limiter_t = None
+        if limiter_shape is not None:
+            limiter_t = torch.as_tensor(limiter_shape, dtype=dtype, device=device).reshape(-1, 2)
+        max_radii = _ray_limit_radii(
+            grid=grid,
+            center=center_t[0],
+            angles=angles,
+            limiter=limiter_t if use_limiter else None,
+        )
     if use_limiter and (limiter_t is None or int(limiter_t.shape[0]) < 3):
         raise BoundaryNotFoundError(f"{mode} requires limiter geometry")
-
-    max_radii = _ray_limit_radii(grid=grid, center=center_t[0], angles=angles, limiter=limiter_t if use_limiter else None)
     center_level = _sample_points(field, grid, center_t[:, None, :]).reshape(B)
 
     tracked = None
@@ -131,25 +213,41 @@ def fixed_angle_boundary_gpu(
             continuity_weight_level=float(continuity_weight_level),
         )
 
-    spline_result = None
-    if mode == "spline_contour":
-        reset = _spline_fixed_angle_search(
+    if mode == "suchkov_spline_contour":
+        active_plan = suchkov_plan
+        if active_plan is None and prepared_geometry is not None:
+            active_plan = prepared_geometry.suchkov_plan
+        if active_plan is None:
+            dense_angles = torch.as_tensor(
+                uniform_periodic_angles(64),
+                dtype=dtype,
+                device=device,
+            )
+            active_plan = build_suchkov_spline_torch_plan(dense_angles, control_count=16)
+        reset = _suchkov_fixed_angle_search(
             psi=field,
             grid=grid,
-            center=center,
             center_points=center_t,
             center_level=center_level,
-            angles=angles,
-            max_radii=max_radii,
+            measurement_angles=angles,
+            limiter=limiter_t,
             ray_samples=int(ray_samples),
-            precision_index2=float(legacy_precision_index2),
+            plan=active_plan,
+            precomputed_control_max_radii=(
+                prepared_geometry.suchkov_control_max_radii
+                if prepared_geometry is not None
+                else None
+            ),
+            precomputed_limiter_samples=(
+                prepared_geometry.suchkov_limiter_samples
+                if prepared_geometry is not None
+                else None
+            ),
         )
-        spline_result = _fit_spline_to_radii_torch(angles=angles, radii=reset[1], device=device, dtype=dtype)
     else:
         reset = _legacy_fixed_angle_search(
             psi=field,
             grid=grid,
-            center=center,
             center_points=center_t,
             center_level=center_level,
             angles=angles,
@@ -162,7 +260,7 @@ def fixed_angle_boundary_gpu(
         points, radii, found, level = reset
         status_code = torch.where(
             found,
-            torch.full((B,), 4 if mode == "tracked_flux_contour" else 2, dtype=torch.int64, device=device),
+            torch.full((B,), 7 if mode == "suchkov_spline_contour" else (4 if mode == "tracked_flux_contour" else 2), dtype=torch.int64, device=device),
             torch.zeros((B,), dtype=torch.int64, device=device),
         )
         if bool(soft_level_selection) and mode in {"legacy_contour", "legacy_contour_limited"}:
@@ -249,7 +347,6 @@ def fixed_angle_boundary_gpu(
         points=points,
         radii=radii,
         axis_points=center_t,
-        spline_coefficients=spline_result,
     )
 
 
@@ -699,114 +796,297 @@ def _ray_crossings(psi, grid: Grid2D, axis_points, level, axis_kind, angles, lim
     return points, radii, found
 
 
-def _spline_fixed_angle_search(
+
+def _suchkov_fixed_angle_search(
     *,
     psi,
     grid: Grid2D,
-    center,
     center_points,
     center_level,
-    angles,
-    max_radii,
+    measurement_angles,
+    limiter,
     ray_samples: int,
-    precision_index2: float,
+    plan: SuchkovSplineTorchPlan,
+    precomputed_control_max_radii=None,
+    precomputed_limiter_samples=None,
 ):
-    """Искать уровень psi с критерием максимальной ширины сплайна.
+    """Найти максимальную по ширине допустимую сплайновую линию уровня ``psi``.
 
-    Работает аналогично _legacy_fixed_angle_search, но использует spline_max_width
-    как score для выбора уровня вместо mean_radius.
+    Поиск выполняется в нормированной координате между значением потока в
+    центре плазмы и первым уровнем контакта с лимитером. Двоичный поиск
+    находит самую внешнюю допустимую поверхность. Для вложенных магнитных
+    поверхностей она одновременно имеет максимальную горизонтальную ширину.
     """
     torch = __import__("torch")
-    B = int(psi.shape[0])
-    A = int(angles.numel())
-    r0 = float(grid.r.coords()[0])
-    z0 = float(grid.z.coords()[0])
-    o = torch.tensor(
-        [
-            1.0 + (float(center[0]) - r0) / float(grid.r.step),
-            1.0 + (float(center[1]) - z0) / float(grid.z.step),
-        ],
+    if limiter is None or int(limiter.shape[0]) < 3:
+        raise BoundaryNotFoundError("suchkov_spline_contour requires limiter geometry")
+    batch_size = int(psi.shape[0])
+    control_angles = torch.as_tensor(
+        plan.control_angles,
+        dtype=psi.dtype,
+        device=psi.device,
+    ).reshape(-1)
+    if precomputed_control_max_radii is None:
+        control_limits = _ray_limit_radii(
+            grid=grid,
+            center=center_points[0],
+            angles=control_angles,
+            limiter=limiter,
+        )
+    else:
+        control_limits = torch.as_tensor(
+            precomputed_control_max_radii,
+            dtype=psi.dtype,
+            device=psi.device,
+        ).reshape(-1)
+    if precomputed_limiter_samples is None:
+        limiter_samples = torch.as_tensor(
+            _sample_closed_polyline_numpy(limiter.detach().cpu().numpy(), 128),
+            dtype=psi.dtype,
+            device=psi.device,
+        )
+    else:
+        limiter_samples = torch.as_tensor(
+            precomputed_limiter_samples,
+            dtype=psi.dtype,
+            device=psi.device,
+        ).reshape(-1, 2)
+
+    axis_kind = _center_extremum_kind(
+        psi=psi,
+        grid=grid,
+        center_points=center_points,
+        center_level=center_level,
+    )
+    limiter_values = _sample_points(
+        psi,
+        grid,
+        limiter_samples.reshape(1, -1, 2).expand(batch_size, -1, -1),
+    )
+    contact_level, contact_found = _suchkov_contact_levels(
+        limiter_values=limiter_values,
+        center_level=center_level,
+        axis_kind=axis_kind,
+    )
+
+    lower_fraction = torch.zeros((batch_size,), dtype=psi.dtype, device=psi.device)
+    upper_fraction = torch.ones((batch_size,), dtype=psi.dtype, device=psi.device)
+    best_level = torch.full(
+        (batch_size,),
+        float("nan"),
         dtype=psi.dtype,
         device=psi.device,
     )
-    p = o.reshape(1, 2).repeat(B, 1)
-    new_step = (-o / 2.0).reshape(1, 2).repeat(B, 1)
-    precision_value = float(precision_index2)
-    if not np.isfinite(precision_value) or precision_value <= 0.0:
-        raise ValueError(f"legacy_precision_index2 must be finite and > 0, got {precision_index2!r}")
-    precision = torch.as_tensor(precision_value, dtype=psi.dtype, device=psi.device)
-    best_level = torch.full((B,), float("nan"), dtype=psi.dtype, device=psi.device)
-    best_radii = torch.full((B, A), float("nan"), dtype=psi.dtype, device=psi.device)
-    best_points = torch.full((B, A, 2), float("nan"), dtype=psi.dtype, device=psi.device)
-    best_score = torch.full((B,), -float("inf"), dtype=psi.dtype, device=psi.device)
-    best_found = torch.zeros((B,), dtype=torch.bool, device=psi.device)
-    for _ in range(64):
-        active = (torch.sum(new_step * new_step, dim=1) >= precision) & (p[:, 0] >= 1.0) & (p[:, 1] >= 1.0)
-        p = torch.where(active[:, None], p + new_step, p)
-        level = _legacy_sample_center_level_gpu(psi, grid, p)
-        points, radii, found = _center_ray_crossings(
+    best_polyline = torch.full(
+        (batch_size, int(plan.output_angles.numel()), 2),
+        float("nan"),
+        dtype=psi.dtype,
+        device=psi.device,
+    )
+    best_width = torch.full(
+        (batch_size,),
+        -float("inf"),
+        dtype=psi.dtype,
+        device=psi.device,
+    )
+    best_found = torch.zeros((batch_size,), dtype=torch.bool, device=psi.device)
+
+    for _ in range(18):
+        fraction = 0.5 * (lower_fraction + upper_fraction)
+        level = center_level + fraction * (contact_level - center_level)
+        control_points, _control_radii, control_found = _center_ray_crossings(
             psi=psi,
             grid=grid,
             center_points=center_points,
             center_level=center_level,
             level=level,
-            angles=angles,
-            max_radii=max_radii,
+            angles=control_angles,
+            max_radii=control_limits,
             ray_samples=ray_samples,
         )
-        accepted = active & found & torch.isfinite(level)
-        score = _compute_spline_width_score(radii, angles)
-        improve = accepted & (score > best_score)
+        spline_polyline = interpolate_closed_curve_torch(
+            control_points,
+            plan.interpolation_matrix,
+        )
+        inside_limiter = torch.all(
+            _points_in_polygon_torch(spline_polyline, limiter),
+            dim=1,
+        )
+        width = torch.max(spline_polyline[:, :, 0], dim=1).values - torch.min(
+            spline_polyline[:, :, 0],
+            dim=1,
+        ).values
+        accepted = (
+            contact_found
+            & control_found
+            & inside_limiter
+            & torch.isfinite(level)
+            & torch.isfinite(width)
+        )
+        improve = accepted & (width > best_width)
         best_level = torch.where(improve, level, best_level)
-        best_radii = torch.where(improve[:, None], radii, best_radii)
-        best_points = torch.where(improve[:, None, None], points, best_points)
-        best_score = torch.where(improve, score, best_score)
+        best_polyline = torch.where(
+            improve[:, None, None],
+            spline_polyline,
+            best_polyline,
+        )
+        best_width = torch.where(improve, width, best_width)
         best_found = best_found | improve
-        new_step = torch.where(accepted[:, None], -torch.abs(new_step) / 2.0, torch.abs(new_step) / 2.0)
-    return best_points, best_radii, best_found, best_level
+        lower_fraction = torch.where(accepted, fraction, lower_fraction)
+        upper_fraction = torch.where(accepted, upper_fraction, fraction)
+
+    points, radii, measurement_found = _radii_from_closed_polylines_torch(
+        best_polyline,
+        center_points,
+        measurement_angles,
+    )
+    found = best_found & measurement_found
+    points = torch.where(
+        found[:, None, None],
+        points,
+        torch.full_like(points, float("nan")),
+    )
+    radii = torch.where(
+        found[:, None],
+        radii,
+        torch.full_like(radii, float("nan")),
+    )
+    level = torch.where(
+        found,
+        best_level,
+        torch.full_like(best_level, float("nan")),
+    )
+    return points, radii, found, level
 
 
-def _compute_spline_width_score(radii, angles) -> object:
-    """Вычислить score как spline_max_width для batched радиусов (векторизованно)."""
-    from tokamak_control.geometry.boundary_spline_batched import compute_spline_width_score_batched
-    return compute_spline_width_score_batched(radii, angles)
+def _center_extremum_kind(*, psi, grid: Grid2D, center_points, center_level):
+    """Определить знак экстремума потока около заданного центра плазмы."""
+    torch = __import__("torch")
+    offsets = torch.tensor(
+        [
+            [float(grid.r.step), 0.0],
+            [-float(grid.r.step), 0.0],
+            [0.0, float(grid.z.step)],
+            [0.0, -float(grid.z.step)],
+        ],
+        dtype=psi.dtype,
+        device=psi.device,
+    )
+    neighbours = center_points[:, None, :] + offsets[None, :, :]
+    values = _sample_points(psi, grid, neighbours)
+    neighbour_mean = torch.nanmean(values, dim=1)
+    return torch.where(
+        center_level >= neighbour_mean,
+        torch.ones_like(center_level, dtype=torch.int64),
+        -torch.ones_like(center_level, dtype=torch.int64),
+    )
 
 
-def _fit_spline_to_radii_torch(*, angles, radii, device, dtype):
-    """Фитируй сплайн по радиусам для batched данных.
-
-    Возвращает коэффициенты сплайна (B, 4, N) или None если не удалось.
-    """
-    import torch
-
-    B = int(radii.shape[0])
-    A = int(angles.numel())
-    coeffs = torch.zeros(B, 4, A, dtype=dtype, device=device)
-    for b in range(B):
-        radii_b = radii[b]
-        if not torch.all(torch.isfinite(radii_b)):
-            coeffs[b] = float("nan")
-            continue
-        try:
-            coeffs[b] = _fit_spline_to_radii_torch_single(angles, radii_b)
-        except (ValueError, RuntimeError):
-            coeffs[b] = float("nan")
-    return coeffs
-
-
-def _fit_spline_to_radii_torch_single(angles, radii):
-    """Фитируй сплайн по радиусам для одного элемента batch (torch)."""
-    from tokamak_control.geometry.boundary_spline import _fit_periodic_spline_torch_single
-
-    return _fit_periodic_spline_torch_single(angles, radii)
+def _suchkov_contact_levels(*, limiter_values, center_level, axis_kind):
+    """Найти первый достижимый уровень контакта поверхности с лимитером."""
+    torch = __import__("torch")
+    finite = torch.isfinite(limiter_values)
+    center = center_level[:, None]
+    below = finite & (limiter_values < center)
+    above = finite & (limiter_values > center)
+    max_below = torch.max(
+        torch.where(below, limiter_values, torch.full_like(limiter_values, -float("inf"))),
+        dim=1,
+    ).values
+    min_above = torch.min(
+        torch.where(above, limiter_values, torch.full_like(limiter_values, float("inf"))),
+        dim=1,
+    ).values
+    use_maximum = axis_kind > 0
+    contact = torch.where(use_maximum, max_below, min_above)
+    found = torch.where(
+        use_maximum,
+        torch.isfinite(max_below),
+        torch.isfinite(min_above),
+    )
+    return contact, found
 
 
-def _evaluate_spline_at_angle_torch(coefficients, angles, query_angle: float) -> float:
-    """Вычислить значение сплайна в заданном углу (torch)."""
-    import torch
+def _sample_closed_polyline_numpy(polyline: np.ndarray, count: int) -> np.ndarray:
+    """Равномерно дискретизировать замкнутую ломаную по длине дуги."""
+    points = np.asarray(polyline, dtype=np.float64).reshape(-1, 2)
+    if points.shape[0] < 3:
+        raise ValueError("polyline must contain at least three points")
+    if not np.allclose(points[0], points[-1], rtol=0.0, atol=1.0e-12):
+        points = np.vstack([points, points[0]])
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate([np.asarray([0.0]), np.cumsum(segment_lengths)])
+    total = float(cumulative[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("polyline must have positive finite length")
+    targets = np.linspace(0.0, total, max(int(count), 4), endpoint=False)
+    segment_indices = np.searchsorted(cumulative, targets, side="right") - 1
+    segment_indices = np.clip(segment_indices, 0, points.shape[0] - 2)
+    starts = cumulative[segment_indices]
+    lengths = segment_lengths[segment_indices]
+    local = (targets - starts) / np.where(lengths > 0.0, lengths, 1.0)
+    return points[segment_indices] + local[:, None] * (
+        points[segment_indices + 1] - points[segment_indices]
+    )
 
-    from tokamak_control.geometry.boundary_spline import _evaluate_spline_torch_single
+def _points_in_polygon_torch(points, polygon):
+    """Проверить принадлежность batch точек замкнутому многоугольнику."""
+    torch = __import__("torch")
+    poly = polygon
+    if not torch.allclose(poly[0], poly[-1]):
+        poly = torch.cat([poly, poly[:1]], dim=0)
+    x = points[..., 0, None]
+    y = points[..., 1, None]
+    x0 = poly[:-1, 0].reshape(1, 1, -1)
+    y0 = poly[:-1, 1].reshape(1, 1, -1)
+    x1 = poly[1:, 0].reshape(1, 1, -1)
+    y1 = poly[1:, 1].reshape(1, 1, -1)
+    crosses = (y0 > y) != (y1 > y)
+    denominator = y1 - y0
+    safe = torch.where(
+        torch.abs(denominator) > torch.finfo(points.dtype).eps,
+        denominator,
+        torch.ones_like(denominator),
+    )
+    x_cross = x0 + (y - y0) * (x1 - x0) / safe
+    crossing_count = torch.sum((crosses & (x_cross >= x)).to(torch.int64), dim=2)
+    return (crossing_count % 2) == 1
 
-    query = torch.tensor([query_angle], dtype=angles.dtype, device=angles.device)
-    result = _evaluate_spline_torch_single(coefficients, angles, query)
-    return float(result[0])
+
+def _radii_from_closed_polylines_torch(polylines, centers, angles):
+    """Пересечь фиксированные лучи с batch замкнутых сплайновых ломаных."""
+    torch = __import__("torch")
+    batch_size = int(polylines.shape[0])
+    angle_count = int(angles.numel())
+    closed = torch.cat([polylines, polylines[:, :1, :]], dim=1)
+    segment_starts = closed[:, :-1, :]
+    segment_vectors = closed[:, 1:, :] - closed[:, :-1, :]
+    directions = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
+    relative = segment_starts[:, None, :, :] - centers[:, None, None, :]
+    ray = directions[None, :, None, :]
+    segment = segment_vectors[:, None, :, :]
+    denominator = _cross2(ray, segment)
+    numerator_t = _cross2(relative, segment)
+    numerator_u = _cross2(relative, ray)
+    valid_denominator = torch.abs(denominator) > torch.finfo(polylines.dtype).eps * 128.0
+    safe = torch.where(valid_denominator, denominator, torch.ones_like(denominator))
+    t_ray = numerator_t / safe
+    u_segment = numerator_u / safe
+    valid = (
+        valid_denominator
+        & (t_ray >= 0.0)
+        & (u_segment >= -1.0e-9)
+        & (u_segment <= 1.0 + 1.0e-9)
+    )
+    hits = torch.where(valid, t_ray, torch.full_like(t_ray, -float("inf")))
+    radii = torch.max(hits, dim=2).values
+    found = torch.all(torch.isfinite(radii) & (radii >= 0.0), dim=1)
+    radii = torch.where(
+        torch.isfinite(radii),
+        radii,
+        torch.full_like(radii, float("nan")),
+    )
+    points = centers[:, None, :] + radii[..., None] * directions[None, :, :]
+    if tuple(points.shape) != (batch_size, angle_count, 2):
+        raise RuntimeError("unexpected fixed-angle spline intersection shape")
+    return points, radii, found
