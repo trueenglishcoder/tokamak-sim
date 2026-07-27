@@ -10,6 +10,9 @@ from tokamak_control.core.grid import Grid2D
 from tokamak_control.core.torch_sampling import bilinear_sample_torch_points
 from tokamak_control.geometry.boundary_common import BoundaryMode, BoundaryNotFoundError, BoundaryStatus
 from tokamak_control.geometry.boundary_suchkov import (
+    SUCHKOV_CONTROL_COUNT,
+    SUCHKOV_SEARCH_ITERATIONS,
+    SUCHKOV_VALIDATION_COUNT,
     SuchkovSplineTorchPlan,
     build_suchkov_spline_torch_plan,
     interpolate_closed_curve_torch,
@@ -75,11 +78,14 @@ def prepare_fixed_angle_boundary_gpu_geometry(
     limiter_samples = None
     if str(boundary_mode) == "suchkov_spline_contour":
         dense_angles = torch.as_tensor(
-            uniform_periodic_angles(64),
+            uniform_periodic_angles(SUCHKOV_VALIDATION_COUNT),
             dtype=dtype,
             device=device,
         )
-        plan = build_suchkov_spline_torch_plan(dense_angles, control_count=16)
+        plan = build_suchkov_spline_torch_plan(
+            dense_angles,
+            control_count=SUCHKOV_CONTROL_COUNT,
+        )
         control_limits = _ray_limit_radii(
             grid=grid,
             center=torch.as_tensor(center, dtype=dtype, device=device),
@@ -87,7 +93,10 @@ def prepare_fixed_angle_boundary_gpu_geometry(
             limiter=limiter,
         )
         limiter_samples = torch.as_tensor(
-            _sample_closed_polyline_numpy(np.asarray(limiter_shape, dtype=np.float64), 128),
+            _sample_closed_polyline_numpy(
+                np.asarray(limiter_shape, dtype=np.float64),
+                _suchkov_limiter_sample_count(np.asarray(limiter_shape, dtype=np.float64), grid),
+            ),
             dtype=dtype,
             device=device,
         )
@@ -219,11 +228,14 @@ def fixed_angle_boundary_gpu(
             active_plan = prepared_geometry.suchkov_plan
         if active_plan is None:
             dense_angles = torch.as_tensor(
-                uniform_periodic_angles(64),
+                uniform_periodic_angles(SUCHKOV_VALIDATION_COUNT),
                 dtype=dtype,
                 device=device,
             )
-            active_plan = build_suchkov_spline_torch_plan(dense_angles, control_count=16)
+            active_plan = build_suchkov_spline_torch_plan(
+                dense_angles,
+                control_count=SUCHKOV_CONTROL_COUNT,
+            )
         reset = _suchkov_fixed_angle_search(
             psi=field,
             grid=grid,
@@ -248,6 +260,7 @@ def fixed_angle_boundary_gpu(
         reset = _legacy_fixed_angle_search(
             psi=field,
             grid=grid,
+            center=center,
             center_points=center_t,
             center_level=center_level,
             angles=angles,
@@ -406,6 +419,36 @@ def _ray_limit_radii(*, grid: Grid2D, center, angles, limiter):
     return torch.min(torch.stack(candidates, dim=0), dim=0).values
 
 
+def _suchkov_limiter_sample_count(limiter_shape: np.ndarray, grid: Grid2D) -> int:
+    """Выбрать дискретизацию лимитера не грубее половины ячейки сетки."""
+    points = np.asarray(limiter_shape, dtype=np.float64).reshape(-1, 2)
+    if points.shape[0] < 3:
+        return 256
+    if not np.allclose(points[0], points[-1], rtol=0.0, atol=1.0e-12):
+        points = np.vstack([points, points[0]])
+    perimeter = float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+    grid_step = 0.5 * float(min(abs(float(grid.r.step)), abs(float(grid.z.step))))
+    if not np.isfinite(perimeter) or perimeter <= 0.0 or not np.isfinite(grid_step) or grid_step <= 0.0:
+        return 256
+    return int(np.clip(np.ceil(perimeter / grid_step), 256, 2048))
+
+
+def _suchkov_containment_tolerance(grid: Grid2D) -> float:
+    """Численный допуск для условия ``Gamma subset closure(Omega_limiter)``."""
+    cell = float(max(abs(float(grid.r.step)), abs(float(grid.z.step))))
+    if not np.isfinite(cell) or cell <= 0.0:
+        return 1.0e-7
+    return max(1.0e-7, 1.0e-5 * cell)
+
+
+def _suchkov_contact_tolerance(grid: Grid2D) -> float:
+    """Допуск первого контакта LCFS с лимитером для сеточного поля."""
+    cell = float(max(abs(float(grid.r.step)), abs(float(grid.z.step))))
+    if not np.isfinite(cell) or cell <= 0.0:
+        return 1.0e-4
+    return max(2.0 * cell, 1.0e-6)
+
+
 def _cross2(a, b):
     return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
@@ -415,7 +458,15 @@ def _center_ray_crossings(*, psi, grid: Grid2D, center_points, center_level, lev
     B = int(psi.shape[0])
     A = int(angles.numel())
     dirs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
-    max_r = max_radii.reshape(1, A).repeat(B, 1)
+    max_r_input = torch.as_tensor(max_radii, dtype=psi.dtype, device=psi.device)
+    if max_r_input.ndim == 1:
+        max_r = max_r_input.reshape(1, A).expand(B, A)
+    elif tuple(max_r_input.shape) == (B, A):
+        max_r = max_r_input
+    else:
+        raise ValueError(
+            f"max_radii must have shape ({A},) or ({B}, {A}), got {tuple(max_r_input.shape)}"
+        )
     valid_ray = torch.isfinite(max_r) & (max_r > 0.0)
     t = torch.linspace(0.0, 1.0, max(int(ray_samples), 4), dtype=psi.dtype, device=psi.device)
     radii_grid = max_r[:, :, None] * t[None, None, :]
@@ -841,7 +892,10 @@ def _suchkov_fixed_angle_search(
         ).reshape(-1)
     if precomputed_limiter_samples is None:
         limiter_samples = torch.as_tensor(
-            _sample_closed_polyline_numpy(limiter.detach().cpu().numpy(), 128),
+            _sample_closed_polyline_numpy(
+                limiter.detach().cpu().numpy(),
+                _suchkov_limiter_sample_count(limiter.detach().cpu().numpy(), grid),
+            ),
             dtype=psi.dtype,
             device=psi.device,
         )
@@ -891,7 +945,9 @@ def _suchkov_fixed_angle_search(
     )
     best_found = torch.zeros((batch_size,), dtype=torch.bool, device=psi.device)
 
-    for _ in range(18):
+    containment_tolerance = _suchkov_containment_tolerance(grid)
+
+    for _ in range(SUCHKOV_SEARCH_ITERATIONS):
         fraction = 0.5 * (lower_fraction + upper_fraction)
         level = center_level + fraction * (contact_level - center_level)
         control_points, _control_radii, control_found = _center_ray_crossings(
@@ -909,8 +965,16 @@ def _suchkov_fixed_angle_search(
             plan.interpolation_matrix,
         )
         inside_limiter = torch.all(
-            _points_in_polygon_torch(spline_polyline, limiter),
+            _points_in_or_on_polygon_torch(
+                spline_polyline,
+                limiter,
+                tolerance=containment_tolerance,
+            ),
             dim=1,
+        )
+        axis_inside = _points_in_batched_polygons_torch(
+            center_points,
+            spline_polyline,
         )
         width = torch.max(spline_polyline[:, :, 0], dim=1).values - torch.min(
             spline_polyline[:, :, 0],
@@ -920,6 +984,7 @@ def _suchkov_fixed_angle_search(
             contact_found
             & control_found
             & inside_limiter
+            & axis_inside
             & torch.isfinite(level)
             & torch.isfinite(width)
         )
@@ -940,7 +1005,13 @@ def _suchkov_fixed_angle_search(
         center_points,
         measurement_angles,
     )
-    found = best_found & measurement_found
+    contact_gap = _minimum_points_to_polygon_distance_torch(
+        best_polyline,
+        limiter,
+    )
+    contact_tolerance = _suchkov_contact_tolerance(grid)
+    touches_limiter = torch.isfinite(contact_gap) & (contact_gap <= contact_tolerance)
+    found = best_found & measurement_found & touches_limiter
     points = torch.where(
         found[:, None, None],
         points,
@@ -1050,6 +1121,66 @@ def _points_in_polygon_torch(points, polygon):
     )
     x_cross = x0 + (y - y0) * (x1 - x0) / safe
     crossing_count = torch.sum((crosses & (x_cross >= x)).to(torch.int64), dim=2)
+    return (crossing_count % 2) == 1
+
+
+def _point_to_polygon_distances_torch(points, polygon):
+    """Расстояния batch точек до ближайшего ребра статического полигона."""
+    torch = __import__("torch")
+    poly = polygon
+    if not torch.allclose(poly[0], poly[-1]):
+        poly = torch.cat([poly, poly[:1]], dim=0)
+    starts = poly[:-1]
+    vectors = poly[1:] - poly[:-1]
+    denom = torch.sum(vectors * vectors, dim=1)
+    relative = points[:, :, None, :] - starts[None, None, :, :]
+    safe_denom = torch.where(denom > 0.0, denom, torch.ones_like(denom))
+    fraction = torch.clamp(
+        torch.sum(relative * vectors[None, None, :, :], dim=3)
+        / safe_denom[None, None, :],
+        0.0,
+        1.0,
+    )
+    nearest = starts[None, None, :, :] + fraction[..., None] * vectors[None, None, :, :]
+    squared = torch.sum((points[:, :, None, :] - nearest) ** 2, dim=3)
+    return torch.sqrt(torch.clamp(torch.min(squared, dim=2).values, min=0.0))
+
+
+def _minimum_points_to_polygon_distance_torch(points, polygon):
+    """Минимальный зазор каждой batch кривой до границы лимитера."""
+    torch = __import__("torch")
+    distances = _point_to_polygon_distances_torch(points, polygon)
+    return torch.min(distances, dim=1).values
+
+
+def _points_in_or_on_polygon_torch(points, polygon, *, tolerance: float):
+    """Проверить ``point in closure(polygon)`` с метрическим допуском."""
+    inside = _points_in_polygon_torch(points, polygon)
+    if float(tolerance) <= 0.0:
+        return inside
+    distance = _point_to_polygon_distances_torch(points, polygon)
+    return inside | (distance <= float(tolerance))
+
+
+def _points_in_batched_polygons_torch(points, polygons):
+    """Проверить принадлежность одной точки каждому полигону batch."""
+    torch = __import__("torch")
+    closed = torch.cat([polygons, polygons[:, :1, :]], dim=1)
+    x = points[:, 0, None]
+    y = points[:, 1, None]
+    x0 = closed[:, :-1, 0]
+    y0 = closed[:, :-1, 1]
+    x1 = closed[:, 1:, 0]
+    y1 = closed[:, 1:, 1]
+    crosses = (y0 > y) != (y1 > y)
+    denominator = y1 - y0
+    safe = torch.where(
+        torch.abs(denominator) > torch.finfo(points.dtype).eps,
+        denominator,
+        torch.ones_like(denominator),
+    )
+    x_cross = x0 + (y - y0) * (x1 - x0) / safe
+    crossing_count = torch.sum((crosses & (x_cross > x)).to(torch.int64), dim=1)
     return (crossing_count % 2) == 1
 
 

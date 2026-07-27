@@ -15,6 +15,9 @@ from tokamak_control.geometry.boundary_common import (
     normalize_boundary_mode,
 )
 from tokamak_control.geometry.boundary_suchkov import (
+    SUCHKOV_CONTROL_COUNT,
+    SUCHKOV_SEARCH_ITERATIONS,
+    SUCHKOV_VALIDATION_COUNT,
     SuchkovSplinePlan,
     build_suchkov_spline_plan,
     interpolate_closed_curve_numpy,
@@ -1128,8 +1131,8 @@ def _suchkov_spline_contour_boundary(
     if contact_level is None:
         return None
 
-    control_count = 32
-    output_count = 128
+    control_count = SUCHKOV_CONTROL_COUNT
+    output_count = SUCHKOV_VALIDATION_COUNT
     control_angles = uniform_periodic_angles(control_count)
     output_angles = uniform_periodic_angles(output_count)
     plan = build_suchkov_spline_plan(output_angles, control_count=control_count)
@@ -1139,7 +1142,7 @@ def _suchkov_spline_contour_boundary(
     upper_fraction = 1.0
     best: tuple[np.ndarray, float, float] | None = None
 
-    for _ in range(18):
+    for _ in range(SUCHKOV_SEARCH_ITERATIONS):
         fraction = 0.5 * (lower_fraction + upper_fraction)
         level = float(axis.level + fraction * (contact_level - axis.level))
         candidate = _suchkov_spline_at_level_cpu(
@@ -1163,7 +1166,23 @@ def _suchkov_spline_contour_boundary(
 
     if best is None:
         return None
+
+    contact_tolerance = _suchkov_contact_tolerance(grid)
+    contact_gap = _polyline_to_points_distance(
+        limiter_poly,
+        np.asarray(best[0][:-1], dtype=np.float64),
+    )
+    if not np.isfinite(contact_gap) or contact_gap > contact_tolerance:
+        return None
     return best[0], best[1]
+
+
+def _suchkov_contact_tolerance(grid: Grid2D) -> float:
+    """Допуск касания LCFS с ограничителем для сеточного поля ``psi``."""
+    cell = float(max(abs(float(grid.r.step)), abs(float(grid.z.step))))
+    if not np.isfinite(cell) or cell <= 0.0:
+        return 1.0e-4
+    return max(2.0 * cell, 1.0e-6)
 
 
 def _suchkov_spline_at_level_cpu(
@@ -1202,6 +1221,8 @@ def _suchkov_spline_at_level_cpu(
         spline_points = interpolate_closed_curve_numpy(control_points, plan)
         closed = _close_poly(spline_points)
         if not _is_closed_poly(closed):
+            continue
+        if not _encloses_center(closed, axis.point):
             continue
         if not _poly_fits_limiter(
             closed,

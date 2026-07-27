@@ -16,6 +16,8 @@ from tokamak_control.geometry.boundary_gpu import (
     _suchkov_fixed_angle_search,
 )
 from tokamak_control.geometry.boundary_suchkov import (
+    SUCHKOV_CONTROL_COUNT,
+    SUCHKOV_VALIDATION_COUNT,
     build_suchkov_spline_plan,
     build_suchkov_spline_torch_plan,
     uniform_periodic_angles,
@@ -53,6 +55,22 @@ def _square_limiter() -> np.ndarray:
     )
 
 
+def _concave_limiter() -> np.ndarray:
+    """Создать вогнутый лимитер, чтобы проверять полигон, а не bounding box."""
+    return np.asarray(
+        [
+            [5.0, 5.0],
+            [34.0, 5.0],
+            [34.0, 34.0],
+            [22.0, 34.0],
+            [22.0, 22.0],
+            [5.0, 22.0],
+            [5.0, 5.0],
+        ],
+        dtype=np.float64,
+    )
+
+
 def test_periodic_interpolation_matrix_matches_scipy() -> None:
     """Матрица интерполяции должна совпадать с эталонным CubicSpline."""
     control_angles = uniform_periodic_angles(16)
@@ -81,12 +99,43 @@ def test_cpu_suchkov_boundary_returns_closed_spline() -> None:
 
     assert status == "suchkov_spline_contour_success"
     assert level == pytest.approx(210.31, abs=1.0)
-    assert poly.shape == (129, 2)
+    assert poly.shape == (SUCHKOV_VALIDATION_COUNT + 1, 2)
     assert np.allclose(poly[0], poly[-1], rtol=0.0, atol=1.0e-12)
     assert float(np.min(poly[:, 0])) >= 5.0 - 1.0e-9
     assert float(np.max(poly[:, 0])) <= 34.0 + 1.0e-9
     assert float(np.min(poly[:, 1])) >= 5.0 - 1.0e-9
     assert float(np.max(poly[:, 1])) <= 34.0 + 1.0e-9
+    limiter_gap = float(
+        np.min(
+            np.minimum.reduce(
+                [
+                    poly[:-1, 0] - 5.0,
+                    34.0 - poly[:-1, 0],
+                    poly[:-1, 1] - 5.0,
+                    34.0 - poly[:-1, 1],
+                ]
+            )
+        )
+    )
+    assert limiter_gap < 1.0e-2
+
+
+def test_cpu_suchkov_boundary_respects_concave_limiter() -> None:
+    """Допустимость должна определяться реальным полигоном ограничителя."""
+    grid = _test_grid()
+    poly, level, status = find_plasma_boundary_with_status(
+        _quadratic_psi(grid),
+        grid,
+        (19.5, 19.5),
+        limiter_shape=_concave_limiter(),
+        boundary_mode="suchkov_spline_contour",
+    )
+
+    assert status == "suchkov_spline_contour_success"
+    assert level == pytest.approx(6.25, abs=0.25)
+    assert float(np.max(poly[:, 0])) <= 22.0 + 1.0e-6
+    assert float(np.max(poly[:, 1])) <= 22.0 + 1.0e-6
+    assert min(22.0 - float(np.max(poly[:, 0])), 22.0 - float(np.max(poly[:, 1]))) < 1.0e-2
 
 
 def test_torch_suchkov_search_is_batched_and_finite() -> None:
@@ -105,8 +154,14 @@ def test_torch_suchkov_search_is_batched_and_finite() -> None:
         dtype=torch.float64,
     )
     limiter = torch.as_tensor(_square_limiter(), dtype=torch.float64)
-    dense_angles = torch.as_tensor(uniform_periodic_angles(64), dtype=torch.float64)
-    plan = build_suchkov_spline_torch_plan(dense_angles, control_count=16)
+    dense_angles = torch.as_tensor(
+        uniform_periodic_angles(SUCHKOV_VALIDATION_COUNT),
+        dtype=torch.float64,
+    )
+    plan = build_suchkov_spline_torch_plan(
+        dense_angles,
+        control_count=SUCHKOV_CONTROL_COUNT,
+    )
 
     points, radii, found, levels = _suchkov_fixed_angle_search(
         psi=psi,
@@ -125,6 +180,46 @@ def test_torch_suchkov_search_is_batched_and_finite() -> None:
     assert bool(torch.all(torch.isfinite(radii)))
     assert bool(torch.all(torch.isfinite(levels)))
     assert float(torch.max(torch.abs(radii - 14.5))) < 1.0e-2
+
+
+def test_torch_suchkov_respects_concave_limiter() -> None:
+    """GPU-путь должен ограничивать LCFS реальным полигоном лимитера."""
+    torch = pytest.importorskip("torch")
+    grid = _test_grid()
+    psi_numpy = _quadratic_psi(grid)
+    psi = torch.as_tensor(psi_numpy[None, ...], dtype=torch.float64)
+    centers = torch.tensor([[19.5, 19.5]], dtype=torch.float64)
+    center_level = _sample_points(psi, grid, centers[:, None, :]).reshape(1)
+    measurement_angles = torch.as_tensor(
+        uniform_periodic_angles(32),
+        dtype=torch.float64,
+    )
+    limiter = torch.as_tensor(_concave_limiter(), dtype=torch.float64)
+    dense_angles = torch.as_tensor(
+        uniform_periodic_angles(SUCHKOV_VALIDATION_COUNT),
+        dtype=torch.float64,
+    )
+    plan = build_suchkov_spline_torch_plan(
+        dense_angles,
+        control_count=SUCHKOV_CONTROL_COUNT,
+    )
+
+    points, radii, found, levels = _suchkov_fixed_angle_search(
+        psi=psi,
+        grid=grid,
+        center_points=centers,
+        center_level=center_level,
+        measurement_angles=measurement_angles,
+        limiter=limiter,
+        ray_samples=256,
+        plan=plan,
+    )
+
+    assert bool(found[0])
+    assert float(levels[0]) == pytest.approx(6.25, abs=0.35)
+    assert float(torch.max(points[0, :, 0])) <= 22.0 + 1.0e-6
+    assert float(torch.max(points[0, :, 1])) <= 22.0 + 1.0e-6
+    assert float(torch.max(radii[0])) < 2.6
 
 
 def test_t15_config_uses_new_suchkov_mode() -> None:

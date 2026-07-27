@@ -7,6 +7,11 @@ from dataclasses import dataclass
 import numpy as np
 
 
+SUCHKOV_CONTROL_COUNT = 32
+SUCHKOV_VALIDATION_COUNT = 256
+SUCHKOV_SEARCH_ITERATIONS = 18
+
+
 @dataclass(frozen=True, slots=True, repr=True)
 class SuchkovSplinePlan:
     """Линейный план интерполяции замкнутой кривой кубическим сплайном."""
