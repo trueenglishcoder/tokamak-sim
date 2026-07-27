@@ -104,7 +104,7 @@ def fixed_angle_boundary_gpu(
     limiter_t = None
     if limiter_shape is not None:
         limiter_t = torch.as_tensor(np.asarray(limiter_shape, dtype=float), dtype=dtype, device=device).reshape(-1, 2)
-    use_limiter = mode in {"legacy_contour_limited", "tracked_flux_contour"}
+    use_limiter = mode in {"legacy_contour_limited", "tracked_flux_contour", "spline_contour"}
     if use_limiter and (limiter_t is None or int(limiter_t.shape[0]) < 3):
         raise BoundaryNotFoundError(f"{mode} requires limiter geometry")
 

@@ -29,16 +29,7 @@ ip_coupling_sign = 1.0
 plasma_psi_sign = -1.0
 
 [boundary]
-mode = "tracked_flux_contour"
-base_mode = "legacy_contour_limited"
-legacy_precision_index2 = 0.001
-level_smoothing_alpha = 0.6
-level_search_span_fraction = 0.02
-continuity_weight_radii = 1.0
-continuity_weight_mean_radius = 0.3
-continuity_weight_center = 0.2
-continuity_weight_area = 0.2
-continuity_weight_level = 0.1
+mode = "spline_contour"
 
 [limiter]
 name = "T15MD"

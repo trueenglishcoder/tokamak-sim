@@ -79,8 +79,8 @@ class BatchedGpuTokamakSimulator:
         self.angles_rad = np.asarray(angles_rad, dtype=float).reshape(-1)
         self.limiter_shape = np.asarray(limiter_shape, dtype=float).reshape(-1, 2)
         self.boundary_mode = str(boundary_mode)
-        if self.boundary_mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour"}:
-            raise ValueError("BatchedGpuTokamakSimulator only supports legacy contour boundary modes")
+        if self.boundary_mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "spline_contour"}:
+            raise ValueError("BatchedGpuTokamakSimulator only supports legacy contour and spline_contour boundary modes")
         self.boundary_base_mode = str(boundary_base_mode)
         self.boundary_legacy_precision_index2 = float(boundary_legacy_precision_index2)
         if not np.isfinite(self.boundary_legacy_precision_index2) or self.boundary_legacy_precision_index2 <= 0.0:

@@ -1,7 +1,7 @@
 version = 1
 
 [plasma]
-Ip0 = 150214.16
+Ip0 = 172746.28
 
 [coils.pfc]
 currents = [
