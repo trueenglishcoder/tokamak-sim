@@ -767,27 +767,9 @@ def _spline_fixed_angle_search(
 
 
 def _compute_spline_width_score(radii, angles) -> object:
-    """Вычислить score как spline_max_width для batched радиусов.
-
-    Для каждого элемента batch фитирует сплайн и возвращает ширину.
-    """
-    torch = __import__("torch")
-    B = int(radii.shape[0])
-    A = int(angles.numel())
-    scores = torch.zeros(B, dtype=radii.dtype, device=radii.device)
-    for b in range(B):
-        radii_b = radii[b]
-        if not torch.all(torch.isfinite(radii_b)):
-            scores[b] = -float("inf")
-            continue
-        try:
-            coeffs = _fit_spline_to_radii_torch_single(angles, radii_b)
-            r_0 = _evaluate_spline_at_angle_torch(coeffs, angles, 0.0)
-            r_pi = _evaluate_spline_at_angle_torch(coeffs, angles, np.pi)
-            scores[b] = r_0 + r_pi
-        except (ValueError, RuntimeError):
-            scores[b] = -float("inf")
-    return scores
+    """Вычислить score как spline_max_width для batched радиусов (векторизованно)."""
+    from tokamak_control.geometry.boundary_spline_batched import compute_spline_width_score_batched
+    return compute_spline_width_score_batched(radii, angles)
 
 
 def _fit_spline_to_radii_torch(*, angles, radii, device, dtype):
