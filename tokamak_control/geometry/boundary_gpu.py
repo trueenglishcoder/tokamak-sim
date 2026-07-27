@@ -131,18 +131,6 @@ def fixed_angle_boundary_gpu(
             continuity_weight_level=float(continuity_weight_level),
         )
 
-    reset = _legacy_fixed_angle_search(
-        psi=field,
-        grid=grid,
-        center=center,
-        center_points=center_t,
-        center_level=center_level,
-        angles=angles,
-        max_radii=max_radii,
-        ray_samples=int(ray_samples),
-        precision_index2=float(legacy_precision_index2),
-    )
-
     spline_result = None
     if mode == "spline_contour":
         reset = _spline_fixed_angle_search(
@@ -157,6 +145,18 @@ def fixed_angle_boundary_gpu(
             precision_index2=float(legacy_precision_index2),
         )
         spline_result = _fit_spline_to_radii_torch(angles=angles, radii=reset[1], device=device, dtype=dtype)
+    else:
+        reset = _legacy_fixed_angle_search(
+            psi=field,
+            grid=grid,
+            center=center,
+            center_points=center_t,
+            center_level=center_level,
+            angles=angles,
+            max_radii=max_radii,
+            ray_samples=int(ray_samples),
+            precision_index2=float(legacy_precision_index2),
+        )
 
     if tracked is None:
         points, radii, found, level = reset
