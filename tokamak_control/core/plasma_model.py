@@ -11,6 +11,7 @@ from tokamak_control.core.green import (
     build_green_for_eind,
 )
 from tokamak_control.core.plasma_state import PlasmaState
+from tokamak_control.core.wall_model import WallModel
 from tokamak_control.config.settings import PhysicsSettings
 from tokamak_control.io.logger import get_logger
 from tokamak_control.io.profiling import Profiler
@@ -124,6 +125,8 @@ class PlasmaModel:
     ip_coupling_pfc: tuple[float, ...] | None = None
     ip_coupling_sol: tuple[float, ...] | None = None
 
+    wall: WallModel | None = None
+
     _G_pfc: np.ndarray | None = None
     _G_sol: np.ndarray | None = None
     _G_plasma: np.ndarray | None = None
@@ -142,8 +145,22 @@ class PlasmaModel:
         settings: PhysicsSettings,
         *,
         ip0: float,
+        wall: WallModel | None = None,
+        vacuum_chamber_shape: np.ndarray | None = None,
     ) -> "PlasmaModel":
         settings.validate()
+        
+        # Создаём WallModel автоматически, если R_wall > 0 и wall не передан
+        if wall is None and float(settings.R_wall) > 0.0 and vacuum_chamber_shape is not None:
+            R_mesh, Z_mesh = grid.mesh()
+            wall = WallModel.from_vacuum_chamber(
+                vacuum_chamber_shape,
+                R_mesh,
+                Z_mesh,
+                R_wall=float(settings.R_wall),
+                dt=float(settings.t_step),
+            )
+        
         return cls(
             grid=grid,
             pfc=pfc,
@@ -164,6 +181,7 @@ class PlasmaModel:
             sol_deriv_limit=settings.sol_deriv_limit,
             ip_coupling_pfc=settings.ip_coupling_pfc,
             ip_coupling_sol=settings.ip_coupling_sol,
+            wall=wall,
         )
 
     def __post_init__(self) -> None:
@@ -290,14 +308,40 @@ class PlasmaModel:
             with _time_block("step_derive_current_change"):
                 prev_pfc = np.asarray(s.pfc_currents, dtype=float)
                 prev_sol = np.asarray(s.sol_currents, dtype=float)
+                prev_deriv_pfc = np.asarray(s.pfc_current_derivs, dtype=float)
+                prev_deriv_sol = np.asarray(s.sol_current_derivs, dtype=float)
                 next_pfc = prev_pfc.copy() if pfc_currents_next is None else np.asarray(pfc_currents_next, dtype=float).reshape(self.pfc.n_coils)
                 next_sol = prev_sol.copy() if sol_currents_next is None else np.asarray(sol_currents_next, dtype=float).reshape(self.sol.n_coils)
-                applied_pfc = (next_pfc - prev_pfc) / dt
-                applied_sol = (next_sol - prev_sol) / dt
+                
+                # Вычисляем производные с учётом задержки актуатора
+                alpha = self._actuator_alpha()
+                if alpha > 0.0:
+                    # Low-pass фильтр первого порядка
+                    raw_deriv_pfc = (next_pfc - prev_pfc) / dt
+                    raw_deriv_sol = (next_sol - prev_sol) / dt
+                    applied_pfc = alpha * prev_deriv_pfc + (1.0 - alpha) * raw_deriv_pfc
+                    applied_sol = alpha * prev_deriv_sol + (1.0 - alpha) * raw_deriv_sol
+                else:
+                    # Мгновенное применение (как раньше)
+                    applied_pfc = (next_pfc - prev_pfc) / dt
+                    applied_sol = (next_sol - prev_sol) / dt
 
             with _time_block("step_ip_update"):
                 t_next = float(s.t) + dt
                 ip_next = self._advance_ip(float(s.Ip), applied_pfc, applied_sol)
+
+            # Обновляем токи в стенке, если wall модель есть
+            if self.wall is not None:
+                # Вычисляем psi без стенки на предыдущем шаге
+                psi_without_wall_prev = self._compose_psi_without_wall(s.Ip, prev_pfc, prev_sol)
+                psi_at_wall_prev = self._sample_psi_at_wall(psi_without_wall_prev)
+
+                # Вычисляем psi без стенки на текущем шаге
+                psi_without_wall_curr = self._compose_psi_without_wall(ip_next, next_pfc, next_sol)
+                psi_at_wall_curr = self._sample_psi_at_wall(psi_without_wall_curr)
+
+                # Обновляем токи в стенке методом трапеций
+                self.wall.step(psi_at_wall_prev, psi_at_wall_curr)
 
             with _time_block("step_compose_psi"):
                 psi_next = self._compose_psi(ip_next, next_pfc, next_sol)
@@ -331,7 +375,31 @@ class PlasmaModel:
                 psi += np.tensordot(np.asarray(pfc_currents, dtype=float), self._G_pfc, axes=(0, 0))
             if self._G_sol.shape[0]:
                 psi += np.tensordot(np.asarray(sol_currents, dtype=float), self._G_sol, axes=(0, 0))
+
+            # Добавляем вклад стенки, если wall модель есть и токи не нулевые
+            if self.wall is not None and np.any(self.wall.J_wall != 0.0):
+                psi += self.wall.compute_psi_wall_contribution()
+
             return self.mu0 * np.asarray(psi, dtype=float)
+
+    def _compose_psi_without_wall(self, Ip: float, pfc_currents: np.ndarray, sol_currents: np.ndarray) -> np.ndarray:
+        """Вычислить psi от плазмы и катушек без учёта стенки."""
+        if self._G_plasma is None or self._G_pfc is None or self._G_sol is None:
+            raise RuntimeError("Green arrays are not initialized")
+
+        psi = float(self.plasma_psi_sign) * float(Ip) * self._G_plasma.copy()
+        if self._G_pfc.shape[0]:
+            psi += np.tensordot(np.asarray(pfc_currents, dtype=float), self._G_pfc, axes=(0, 0))
+        if self._G_sol.shape[0]:
+            psi += np.tensordot(np.asarray(sol_currents, dtype=float), self._G_sol, axes=(0, 0))
+
+        return self.mu0 * np.asarray(psi, dtype=float)
+
+    def _sample_psi_at_wall(self, psi: np.ndarray) -> np.ndarray:
+        """Сэмплировать psi в точках стенки с помощью билинейной интерполяции."""
+        if self.wall is None:
+            raise RuntimeError("Wall model is not initialized")
+        return self._bilinear_sample_slice(psi, self.wall.wall_geometry.wall_points)
 
     def _require_state(self) -> PlasmaState:
         if self.state is None:

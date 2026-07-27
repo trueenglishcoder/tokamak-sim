@@ -83,4 +83,9 @@ def test_t15_split_sol_step_currents_keeps_three_runtime_sol_channels() -> None:
     assert state.sol_currents.shape == (3,)
     assert state.sol_current_derivs.shape == (3,)
     assert np.allclose(state.sol_currents, sol_next)
-    assert np.allclose(state.sol_current_derivs, (sol_next - sol0) / float(cfg.physics.t_step))
+    
+    # С учётом actuator_tau производные сглаживаются
+    # На первом шаге: applied = (1 - alpha) * raw_deriv, где alpha = exp(-dt/tau)
+    alpha = np.exp(-float(cfg.physics.t_step) / cfg.physics.actuator_tau)
+    expected_derivs = (1.0 - alpha) * (sol_next - sol0) / float(cfg.physics.t_step)
+    assert np.allclose(state.sol_current_derivs, expected_derivs)

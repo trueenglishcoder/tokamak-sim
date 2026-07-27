@@ -1,6 +1,6 @@
 # scripts/fit_sigma_L_grid.py
 """
-Fit effective sigma and inductance_L for the T15MD tokamak config from processed shot CSVs.
+Fit effective sigma, inductance_L, actuator_tau, and R_wall for the T15MD tokamak config.
 
 Expected inputs
 - Ip CSV files named t15md_<shot>_ip.csv
@@ -16,20 +16,32 @@ The input CSV time column is interpreted as seconds. This fitter is for already
 processed local shot windows and deliberately does not perform raw T15MD unit
 conversion.
 
+Search strategies
+- Default (full grid): search all combinations of (sigma, L, tau, R_wall)
+- Sequential (--sequential): 
+    Step A: search sigma, L (tau=0, R_wall=0)
+    Step B: fix best sigma, L → search tau
+    Step C: fix best sigma, L, tau → search R_wall
+
+Wall model integration
+- When R_wall > 0, a WallModel is created from the limiter geometry
+- WallModel uses trapezoidal ODE integration for resistive wall currents
+- At R_wall = 0, no wall model is created (ideal conductor limit)
+
 Core fitting loop
 - Load matching Ip and coil CSVs by shot number.
 - Merge near-duplicate timestamps caused by floating-point preprocessing noise.
 - Validate that cleaned times are finite and strictly increasing.
 - Resample Ip and coil currents onto the model dt over the overlap window.
-- For each (sigma, inductance_L) candidate:
-    * override model sigma and inductance_L
+- For each (sigma, inductance_L, actuator_tau, R_wall) candidate:
+    * override model parameters
+    * create WallModel if R_wall > 0
     * initialize the model from the first sample of each shot
     * replay measured coil currents through PlasmaModel.step_currents()
     * score mean RMSE and mean NRMSE across shots
 
 Fitting semantics
-- Coil tables contain applied currents, so actuator lag must not be applied.
-  The fitter forces actuator_tau = 0.0.
+- Coil tables contain applied currents, so actuator lag is a free parameter.
 - To avoid distorting replay, the fitter disables derivative and current clipping.
 - The optimization objective is mean NRMSE, where each shot RMSE is normalized by
   the Ip dynamic range in that fitted shot window.
@@ -129,6 +141,8 @@ class PairScore:
     sigma: float
     inductance_L: float
     tau: float
+    actuator_tau: float
+    R_wall: float
     mean_rmse: float
     mean_nrmse: float
     n_shots: int
@@ -455,7 +469,7 @@ def _init_model_for_shot(
     pfc0: np.ndarray,
     sol0: np.ndarray,
 ) -> None:
-    model.actuator_tau = 0.0
+    # Не сбрасываем actuator_tau, он устанавливается в _model_for_scored_shot
     model.pfc_deriv_limit = None
     model.sol_deriv_limit = None
     model.pfc_current_limit = None
@@ -517,18 +531,50 @@ def _simulate_shot_record(
     return ip_pred, pfc_used, sol_used
 
 
-def _model_for_scored_shot(shot: Shot, *, sigma: float, inductance_L: float) -> PlasmaModel:
+def _model_for_scored_shot(
+    shot: Shot,
+    *,
+    sigma: float,
+    inductance_L: float,
+    actuator_tau: float = 0.0,
+    R_wall: float = 0.0,
+) -> PlasmaModel:
     """Создать модель с активными катушками конкретного shot."""
+    from tokamak_control.core.wall_model import WallModel
+    from tokamak_control.geometry.vacuum_chamber import get_vacuum_chamber_shape
+    
     if shot.cfg is None:
         raise RuntimeError(f"Shot {shot.shot_id} has no loaded config")
-    model = PlasmaModel.from_settings(grid=shot.cfg.grid, pfc=shot.cfg.pfc, sol=shot.cfg.sol, settings=shot.cfg.physics, ip0=float(shot.ip[0]))
+    
+    model = PlasmaModel.from_settings(
+        grid=shot.cfg.grid,
+        pfc=shot.cfg.pfc,
+        sol=shot.cfg.sol,
+        settings=shot.cfg.physics,
+        ip0=float(shot.ip[0]),
+    )
     model.sigma = float(sigma)
     model.inductance_L = float(inductance_L)
-    model.actuator_tau = 0.0
+    model.actuator_tau = float(actuator_tau)
     model.pfc_deriv_limit = None
     model.sol_deriv_limit = None
     model.pfc_current_limit = None
     model.sol_current_limit = None
+    
+    # Создаём WallModel если R_wall > 0
+    if float(R_wall) > 0.0:
+        vacuum_chamber = get_vacuum_chamber_shape(shot.cfg.limiter_name)
+        if vacuum_chamber is not None:
+            R, Z = shot.cfg.grid.mesh()
+            wall = WallModel.from_vacuum_chamber(
+                vacuum_chamber,
+                R,
+                Z,
+                R_wall=float(R_wall),
+                dt=float(shot.cfg.physics.t_step),
+            )
+            model.wall = wall
+    
     return model
 
 
@@ -544,6 +590,8 @@ def _score_pair(
     *,
     sigma: float,
     inductance_L: float,
+    actuator_tau: float = 0.0,
+    R_wall: float = 0.0,
     collect_preds: bool,
 ) -> tuple[PairScore, dict[str, np.ndarray]]:
     _ = base_model
@@ -555,7 +603,13 @@ def _score_pair(
     preds: dict[str, np.ndarray] = {}
 
     for sh in shots:
-        model = _model_for_scored_shot(sh, sigma=float(sigma), inductance_L=float(inductance_L))
+        model = _model_for_scored_shot(
+            sh,
+            sigma=float(sigma),
+            inductance_L=float(inductance_L),
+            actuator_tau=float(actuator_tau),
+            R_wall=float(R_wall),
+        )
         _init_model_for_shot(
             model,
             ip0=float(sh.ip[0]),
@@ -569,9 +623,15 @@ def _score_pair(
         if collect_preds:
             preds[str(sh.shot_id)] = pred.copy()
 
-        err = pred - sh.ip
-        rmse = float(np.sqrt(np.mean(err ** 2)))
-        nrmse = float(rmse / _nrmse_scale(sh.ip))
+        # Проверка на NaN в предсказании
+        if not np.all(np.isfinite(pred)):
+            # Если pred содержит NaN, используем большие значения для RMSE
+            rmse = float("inf")
+            nrmse = float("inf")
+        else:
+            err = pred - sh.ip
+            rmse = float(np.sqrt(np.mean(err ** 2)))
+            nrmse = float(rmse / _nrmse_scale(sh.ip))
 
         rmses.append(rmse)
         nrmses.append(nrmse)
@@ -580,6 +640,8 @@ def _score_pair(
         sigma=float(sigma),
         inductance_L=float(inductance_L),
         tau=tau,
+        actuator_tau=float(actuator_tau),
+        R_wall=float(R_wall),
         mean_rmse=float(np.mean(rmses)),
         mean_nrmse=float(np.mean(nrmses)),
         n_shots=len(shots),
@@ -611,6 +673,8 @@ def _plot_ip_overlay(
     best_curve: np.ndarray,
     best_sigma: float,
     best_L: float,
+    best_actuator_tau: float,
+    best_R_wall: float,
     best_mean_nrmse: float,
     out_path: Path,
 ) -> None:
@@ -621,12 +685,12 @@ def _plot_ip_overlay(
         ax.plot(shot.t, curve, alpha=0.03, linewidth=0.8)
 
     ax.plot(shot.t, shot.ip, linewidth=2.8, label="True Ip")
-    ax.plot(
-        shot.t,
-        best_curve,
-        linewidth=2.4,
-        label=f"Best global fit (sigma={best_sigma:.3g}, L={best_L:.3g}, mean_nrmse={best_mean_nrmse:.4g})",
+    label = (
+        f"Best fit (sigma={best_sigma:.3g}, L={best_L:.3g}, "
+        f"tau={best_actuator_tau:.3g}, R_wall={best_R_wall:.3g}, "
+        f"nrmse={best_mean_nrmse:.4g})"
     )
+    ax.plot(shot.t, best_curve, linewidth=2.4, label=label)
 
     ax.set_title(f"Ip overlay for shot {shot.shot_id}")
     ax.set_xlabel("t (s)")
@@ -647,6 +711,8 @@ def _plot_ip_best_only(
     best_curve: np.ndarray,
     best_sigma: float,
     best_L: float,
+    best_actuator_tau: float,
+    best_R_wall: float,
     best_mean_nrmse: float,
     out_path: Path,
 ) -> None:
@@ -654,12 +720,12 @@ def _plot_ip_best_only(
     ax = fig.add_subplot(1, 1, 1)
 
     ax.plot(shot.t, shot.ip, linewidth=2.8, label="True Ip")
-    ax.plot(
-        shot.t,
-        best_curve,
-        linewidth=2.4,
-        label=f"Best global fit (sigma={best_sigma:.3g}, L={best_L:.3g}, mean_nrmse={best_mean_nrmse:.4g})",
+    label = (
+        f"Best fit (sigma={best_sigma:.3g}, L={best_L:.3g}, "
+        f"tau={best_actuator_tau:.3g}, R_wall={best_R_wall:.3g}, "
+        f"nrmse={best_mean_nrmse:.4g})"
     )
+    ax.plot(shot.t, best_curve, linewidth=2.4, label=label)
 
     ax.set_title(f"Ip best-only for shot {shot.shot_id}")
     ax.set_xlabel("t (s)")
@@ -791,13 +857,20 @@ def main() -> int:
     ap.add_argument("--t-max", type=float, default=None)
     ap.add_argument("--shot", type=str, default=None)
 
-    ap.add_argument("--sigma-min", type=float, default=1.0)
+    ap.add_argument("--sigma-min", type=float, default=0.1)
     ap.add_argument("--sigma-max", type=float, default=1e9)
     ap.add_argument("--sigma-points", type=int, default=25)
 
     ap.add_argument("--L-min", type=float, default=1e-8)
     ap.add_argument("--L-max", type=float, default=1e-2)
     ap.add_argument("--L-points", type=int, default=25)
+
+    ap.add_argument("--tau-values", type=float, nargs="+", default=None,
+                    help="Values of actuator_tau to search (default: 0.0 only)")
+    ap.add_argument("--rwall-values", type=float, nargs="+", default=None,
+                    help="Values of R_wall to search (default: 0.0 only)")
+    ap.add_argument("--sequential", action="store_true",
+                    help="Use sequential search: first sigma/L, then tau, then R_wall")
 
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--out", default=None, help="Output root for timestamped fit run folders. Defaults to ./output.")
@@ -855,22 +928,61 @@ def main() -> int:
     sigma_grid = _logspace(float(args.sigma_min), float(args.sigma_max), int(args.sigma_points))
     L_grid = _logspace(float(args.L_min), float(args.L_max), int(args.L_points))
 
+    # Обработка новых параметров
+    tau_values = [0.0] if args.tau_values is None else [float(t) for t in args.tau_values]
+    rwall_values = [0.0] if args.rwall_values is None else [float(r) for r in args.rwall_values]
+    sequential = bool(args.sequential)
+
     plot_enabled = bool(args.plot)
     shot_ids = [str(sh.shot_id) for sh in shots]
     candidate_ip: dict[str, list[np.ndarray]] = {sid: [] for sid in shot_ids} if plot_enabled else {}
 
     results: list[PairScore] = []
     best_seen = float("inf")
-    total = int(sigma_grid.size) * int(L_grid.size)
 
-    with tqdm(total=total, desc="Grid search", unit="pair") as pbar:
-        for sigma in sigma_grid:
-            for L in L_grid:
+    if sequential:
+        # Последовательный поиск
+        # Шаг A: sigma, L (tau=0, R_wall=0)
+        total_step_a = int(sigma_grid.size) * int(L_grid.size)
+        with tqdm(total=total_step_a, desc="Step A: sigma/L search", unit="pair") as pbar:
+            for sigma in sigma_grid:
+                for L in L_grid:
+                    sc, preds = _score_pair(
+                        base_model,
+                        shots,
+                        sigma=float(sigma),
+                        inductance_L=float(L),
+                        actuator_tau=0.0,
+                        R_wall=0.0,
+                        collect_preds=plot_enabled,
+                    )
+                    results.append(sc)
+
+                    if plot_enabled:
+                        for sid, pred in preds.items():
+                            candidate_ip[sid].append(pred)
+
+                    if sc.mean_nrmse < best_seen:
+                        best_seen = float(sc.mean_nrmse)
+
+                    pbar.update(1)
+                    pbar.set_postfix_str(f"best_nrmse={best_seen:.6g}")
+
+        # Находим лучшие sigma, L
+        results.sort(key=lambda r: (r.mean_nrmse, r.mean_rmse))
+        best_sigma_L = results[0]
+
+        # Шаг B: фиксируем лучшие sigma, L → перебираем tau
+        total_step_b = len(tau_values)
+        with tqdm(total=total_step_b, desc="Step B: tau search", unit="tau") as pbar:
+            for tau in tau_values:
                 sc, preds = _score_pair(
                     base_model,
                     shots,
-                    sigma=float(sigma),
-                    inductance_L=float(L),
+                    sigma=float(best_sigma_L.sigma),
+                    inductance_L=float(best_sigma_L.inductance_L),
+                    actuator_tau=float(tau),
+                    R_wall=0.0,
                     collect_preds=plot_enabled,
                 )
                 results.append(sc)
@@ -885,13 +997,117 @@ def main() -> int:
                 pbar.update(1)
                 pbar.set_postfix_str(f"best_nrmse={best_seen:.6g}")
 
+        # Находим лучшие sigma, L, tau
+        results.sort(key=lambda r: (r.mean_nrmse, r.mean_rmse))
+        best_sigma_L_tau = results[0]
+
+        # Шаг C: фиксируем sigma, L, tau → перебираем R_wall
+        total_step_c = len(rwall_values)
+        with tqdm(total=total_step_c, desc="Step C: R_wall search", unit="R_wall") as pbar:
+            for rwall in rwall_values:
+                sc, preds = _score_pair(
+                    base_model,
+                    shots,
+                    sigma=float(best_sigma_L_tau.sigma),
+                    inductance_L=float(best_sigma_L_tau.inductance_L),
+                    actuator_tau=float(best_sigma_L_tau.actuator_tau),
+                    R_wall=float(rwall),
+                    collect_preds=plot_enabled,
+                )
+                results.append(sc)
+
+                if plot_enabled:
+                    for sid, pred in preds.items():
+                        candidate_ip[sid].append(pred)
+
+                if sc.mean_nrmse < best_seen:
+                    best_seen = float(sc.mean_nrmse)
+
+                pbar.update(1)
+                pbar.set_postfix_str(f"best_nrmse={best_seen:.6g}")
+    else:
+        # Полный перебор всех комбинаций
+        total = int(sigma_grid.size) * int(L_grid.size) * len(tau_values) * len(rwall_values)
+        with tqdm(total=total, desc="Full grid search", unit="combo") as pbar:
+            for sigma in sigma_grid:
+                for L in L_grid:
+                    for tau in tau_values:
+                        for rwall in rwall_values:
+                            sc, preds = _score_pair(
+                                base_model,
+                                shots,
+                                sigma=float(sigma),
+                                inductance_L=float(L),
+                                actuator_tau=float(tau),
+                                R_wall=float(rwall),
+                                collect_preds=plot_enabled,
+                            )
+                            results.append(sc)
+
+                            if plot_enabled:
+                                for sid, pred in preds.items():
+                                    candidate_ip[sid].append(pred)
+
+                            if sc.mean_nrmse < best_seen:
+                                best_seen = float(sc.mean_nrmse)
+
+                            pbar.update(1)
+                            pbar.set_postfix_str(f"best_nrmse={best_seen:.6g}")
+
     results.sort(key=lambda r: (r.mean_nrmse, r.mean_rmse))
     top = results[: int(args.top_k)]
     best = top[0]
 
+    # Предупреждения если лучшие параметры на границе поиска
+    sigma_min = float(args.sigma_min)
+    sigma_max = float(args.sigma_max)
+    L_min = float(args.L_min)
+    L_max = float(args.L_max)
+    
+    if np.isclose(best.sigma, sigma_min, rtol=1e-6):
+        sys.stderr.write(
+            f"WARNING: best_sigma={best.sigma:.6g} is at search boundary (sigma_min={sigma_min:.6g}). "
+            f"Try --sigma-min < {sigma_min:.6g}\n"
+        )
+    if np.isclose(best.sigma, sigma_max, rtol=1e-6):
+        sys.stderr.write(
+            f"WARNING: best_sigma={best.sigma:.6g} is at search boundary (sigma_max={sigma_max:.6g}). "
+            f"Try --sigma-max > {sigma_max:.6g}\n"
+        )
+    if np.isclose(best.inductance_L, L_min, rtol=1e-6):
+        sys.stderr.write(
+            f"WARNING: best_inductance_L={best.inductance_L:.6g} is at search boundary (L_min={L_min:.6g}). "
+            f"Try --L-min < {L_min:.6g}\n"
+        )
+    if np.isclose(best.inductance_L, L_max, rtol=1e-6):
+        sys.stderr.write(
+            f"WARNING: best_inductance_L={best.inductance_L:.6g} is at search boundary (L_max={L_max:.6g}). "
+            f"Try --L-max > {L_max:.6g}\n"
+        )
+    if tau_values and np.isclose(best.actuator_tau, min(tau_values), rtol=1e-6):
+        sys.stderr.write(
+            f"WARNING: best_actuator_tau={best.actuator_tau:.6g} is at search boundary. "
+            f"Try adding smaller values to --tau-values\n"
+        )
+    if tau_values and np.isclose(best.actuator_tau, max(tau_values), rtol=1e-6):
+        sys.stderr.write(
+            f"WARNING: best_actuator_tau={best.actuator_tau:.6g} is at search boundary. "
+            f"Try adding larger values to --tau-values\n"
+        )
+    if rwall_values and np.isclose(best.R_wall, min(rwall_values), rtol=1e-6):
+        sys.stderr.write(
+            f"WARNING: best_R_wall={best.R_wall:.6g} is at search boundary. "
+            f"Try adding smaller values to --rwall-values\n"
+        )
+    if rwall_values and np.isclose(best.R_wall, max(rwall_values), rtol=1e-6):
+        sys.stderr.write(
+            f"WARNING: best_R_wall={best.R_wall:.6g} is at search boundary. "
+            f"Try adding larger values to --rwall-values\n"
+        )
+
     with out_csv.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["rank", "sigma", "inductance_L", "tau", "mean_rmse", "mean_nrmse", "n_shots"])
+        w.writerow(["rank", "sigma", "inductance_L", "tau", "actuator_tau", "R_wall", "mean_rmse", "mean_nrmse", "n_shots"])
         for i, r in enumerate(top, start=1):
             w.writerow(
                 [
@@ -899,6 +1115,8 @@ def main() -> int:
                     f"{r.sigma:.16g}",
                     f"{r.inductance_L:.16g}",
                     f"{r.tau:.16g}",
+                    f"{r.actuator_tau:.16g}",
+                    f"{r.R_wall:.16g}",
                     f"{r.mean_rmse:.16g}",
                     f"{r.mean_nrmse:.16g}",
                     r.n_shots,
@@ -917,7 +1135,13 @@ def main() -> int:
         coil_dir = plot_root / "coil_currents"
 
         for sh in shots:
-            model = _model_for_scored_shot(sh, sigma=float(best.sigma), inductance_L=float(best.inductance_L))
+            model = _model_for_scored_shot(
+                sh,
+                sigma=float(best.sigma),
+                inductance_L=float(best.inductance_L),
+                actuator_tau=float(best.actuator_tau),
+                R_wall=float(best.R_wall),
+            )
             _init_model_for_shot(
                 model,
                 ip0=float(sh.ip[0]),
@@ -935,6 +1159,8 @@ def main() -> int:
                 best_curve=ip_best,
                 best_sigma=float(best.sigma),
                 best_L=float(best.inductance_L),
+                best_actuator_tau=float(best.actuator_tau),
+                best_R_wall=float(best.R_wall),
                 best_mean_nrmse=float(best.mean_nrmse),
                 out_path=ip_overlay_dir / f"shot_{sid}.png",
             )
@@ -944,6 +1170,8 @@ def main() -> int:
                 best_curve=ip_best,
                 best_sigma=float(best.sigma),
                 best_L=float(best.inductance_L),
+                best_actuator_tau=float(best.actuator_tau),
+                best_R_wall=float(best.R_wall),
                 best_mean_nrmse=float(best.mean_nrmse),
                 out_path=ip_best_dir / f"shot_{sid}.png",
             )
@@ -958,12 +1186,17 @@ def main() -> int:
     sys.stdout.write(f"best_sigma={best.sigma:.16g}\n")
     sys.stdout.write(f"best_inductance_L={best.inductance_L:.16g}\n")
     sys.stdout.write(f"best_tau={best.tau:.16g}\n")
+    sys.stdout.write(f"best_actuator_tau={best.actuator_tau:.16g}\n")
+    sys.stdout.write(f"best_R_wall={best.R_wall:.16g}\n")
     sys.stdout.write(f"best_mean_rmse={best.mean_rmse:.16g}\n")
     sys.stdout.write(f"best_mean_nrmse={best.mean_nrmse:.16g}\n")
     sys.stdout.write(f"objective=mean_nrmse\n")
     sys.stdout.write(f"n_shots={best.n_shots}\n")
     sys.stdout.write(f"manifest_path={paths.manifest_path}\n")
     sys.stdout.write(f"top_k_csv={out_csv}\n")
+    sys.stdout.write(f"sequential={sequential}\n")
+    sys.stdout.write(f"tau_values={tau_values}\n")
+    sys.stdout.write(f"rwall_values={rwall_values}\n")
 
     if plot_root is not None:
         sys.stdout.write(f"plot_dir={plot_root}\n")
@@ -987,12 +1220,17 @@ def main() -> int:
             "L_min": float(args.L_min),
             "L_max": float(args.L_max),
             "L_points": int(args.L_points),
+            "tau_values": tau_values,
+            "rwall_values": rwall_values,
+            "sequential": sequential,
             "top_k": int(args.top_k),
             "objective": "mean_nrmse",
             "best": {
                 "sigma": float(best.sigma),
                 "inductance_L": float(best.inductance_L),
                 "tau": float(best.tau),
+                "actuator_tau": float(best.actuator_tau),
+                "R_wall": float(best.R_wall),
                 "mean_rmse": float(best.mean_rmse),
                 "mean_nrmse": float(best.mean_nrmse),
                 "n_shots": int(best.n_shots),

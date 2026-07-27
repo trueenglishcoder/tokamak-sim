@@ -142,3 +142,91 @@ def build_green_for_eind(
         Zp = group[:, 1]
         out[i] = float(np.sum(np.asarray(weights, dtype=float) * green_axisymmetric(R0, Z0, Rp, Zp)))
     return out
+
+
+def build_green_for_wall(
+    R_grid: np.ndarray,
+    Z_grid: np.ndarray,
+    wall_points: np.ndarray,
+) -> np.ndarray:
+    """Вычислить функции Грина от сегментов стенки ко всем точкам сетки.
+
+    Каждый сегмент стенки моделируется как токовый filament в центре сегмента.
+    Функция Грина от filament к точке (R, Z) — это стандартная axisymmetric
+    Green's function.
+
+    Parameters
+    ----------
+    R_grid : np.ndarray
+        Сетка радиальных координат, shape (nz, nr).
+    Z_grid : np.ndarray
+        Сетка вертикальных координат, shape (nz, nr).
+    wall_points : np.ndarray
+        Центры сегментов стенки, shape (N, 2), где N — количество сегментов.
+
+    Returns
+    -------
+    np.ndarray
+        Массив функций Грина, shape (N, nz, nr). Каждый срез [i, :, :] содержит
+        функцию Грина от i-го сегмента стенки ко всем точкам сетки.
+    """
+    wall_pts = np.asarray(wall_points, dtype=float)
+    if wall_pts.ndim != 2 or wall_pts.shape[1] != 2:
+        raise ValueError(f"wall_points must have shape (N, 2), got {wall_pts.shape}")
+
+    n_wall = wall_pts.shape[0]
+    nz, nr = R_grid.shape
+    out = np.zeros((n_wall, nz, nr), dtype=float)
+
+    for i in range(n_wall):
+        Rp = float(wall_pts[i, 0])
+        Zp = float(wall_pts[i, 1])
+        out[i] = green_axisymmetric(R_grid, Z_grid, Rp, Zp)
+
+    return out
+
+
+def build_green_wall_flux(
+    wall_points: np.ndarray,
+    regularization: float = 1.0e-3,
+) -> np.ndarray:
+    """Вычислить взаимную индуктивность между сегментами стенки.
+
+    G_wall_flux[i, j] = Green(R_i, Z_i; R_j, Z_j) — функция Грина от j-го
+    сегмента к i-му сегменту. Для самовлияния (i == j) используется
+    регуляризация для избежания сингулярности.
+
+    Parameters
+    ----------
+    wall_points : np.ndarray
+        Центры сегментов стенки, shape (N, 2).
+    regularization : float
+        Малое смещение для регуляризации самовлияния (по умолчанию 1e-3).
+
+    Returns
+    -------
+    np.ndarray
+        Матрица взаимной индуктивности, shape (N, N).
+    """
+    wall_pts = np.asarray(wall_points, dtype=float)
+    if wall_pts.ndim != 2 or wall_pts.shape[1] != 2:
+        raise ValueError(f"wall_points must have shape (N, 2), got {wall_pts.shape}")
+
+    n_wall = wall_pts.shape[0]
+    flux_matrix = np.zeros((n_wall, n_wall), dtype=float)
+
+    for i in range(n_wall):
+        Ri = float(wall_pts[i, 0])
+        Zi = float(wall_pts[i, 1])
+        for j in range(n_wall):
+            Rj = float(wall_pts[j, 0])
+            Zj = float(wall_pts[j, 1])
+            if i == j:
+                # Самовлияние: используем регуляризацию
+                # Смещаем точку на малое расстояние
+                Rj_reg = Rj + regularization
+                flux_matrix[i, j] = float(green_axisymmetric(Ri, Zi, Rj_reg, Zi))
+            else:
+                flux_matrix[i, j] = float(green_axisymmetric(Ri, Zi, Rj, Zj))
+
+    return flux_matrix

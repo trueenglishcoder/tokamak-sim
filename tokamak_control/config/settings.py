@@ -27,6 +27,7 @@ class PhysicsSettings:
     plasma_psi_sign: float = 1.0
     t_step: float = 1.0e-3
     actuator_tau: float = 0.0
+    R_wall: float = 0.0
     R0: float = 1.2
     Z0: float = 0.0
 
@@ -48,6 +49,7 @@ class PhysicsSettings:
             ("plasma_psi_sign", self.plasma_psi_sign),
             ("t_step", self.t_step),
             ("actuator_tau", self.actuator_tau),
+            ("R_wall", self.R_wall),
             ("R0", self.R0),
             ("Z0", self.Z0),
         ):
@@ -64,6 +66,8 @@ class PhysicsSettings:
             raise ValueError("t_step must be > 0")
         if self.actuator_tau < 0.0:
             raise ValueError(f"actuator_tau must be >= 0, got {self.actuator_tau!r}")
+        if self.R_wall < 0.0:
+            raise ValueError(f"R_wall must be >= 0, got {self.R_wall!r}")
         if self.R0 <= 0.0:
             raise ValueError("R0 must be > 0")
 

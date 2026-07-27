@@ -9,12 +9,13 @@ import numpy as np
 from tokamak_control.core.grid import Grid2D
 
 
-BoundaryMode = Literal["legacy_contour", "legacy_contour_limited", "tracked_flux_contour"]
+BoundaryMode = Literal["legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "spline_contour"]
 BoundaryStatus = Literal[
     "legacy_contour_success",
     "legacy_contour_limited_success",
     "tracked_flux_contour_success",
     "tracked_flux_contour_reset",
+    "spline_contour_success",
 ]
 
 
@@ -36,16 +37,17 @@ def boundary_status_is_real(status: BoundaryStatus) -> bool:
         "legacy_contour_limited_success",
         "tracked_flux_contour_success",
         "tracked_flux_contour_reset",
+        "spline_contour_success",
     }
 
 
 def normalize_boundary_mode(mode: BoundaryMode | str) -> BoundaryMode:
     """Normalize and validate the old-parity boundary extraction mode."""
     mode_text = str(mode).strip().lower()
-    if mode_text not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour"}:
+    if mode_text not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "spline_contour"}:
         raise ValueError(
             "boundary_mode must be 'legacy_contour', 'legacy_contour_limited', "
-            "or 'tracked_flux_contour', "
+            "'tracked_flux_contour', or 'spline_contour', "
             f"got {mode!r}"
         )
     return cast(BoundaryMode, mode_text)

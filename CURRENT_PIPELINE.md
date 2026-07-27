@@ -19,7 +19,7 @@ The active learned-policy pipeline uses:
 
 ```text
 data/t15_data_new_trim50/
-runs/t15md_trim50_plain_gpu_1e6_setup/
+runs/t15md_trim50_plain_gpu1e6_top5_replay/
 runs/t15md_limited_replay_dataset_trim50_gpu_plain_1e6/
 ```
 

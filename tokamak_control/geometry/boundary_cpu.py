@@ -136,9 +136,9 @@ def find_plasma_boundary_cpu_with_status(
         del local_bbox_pad_r, local_bbox_pad_z
         limiter_poly = None
         strict_mode = base_mode if mode == "tracked_flux_contour" else mode
-        if strict_mode == "legacy_contour_limited":
+        if strict_mode in {"legacy_contour_limited", "spline_contour"}:
             limiter_poly = _prepare_limiter_shape(limiter_shape)
-            if limiter_poly is None:
+            if strict_mode == "legacy_contour_limited" and limiter_poly is None:
                 raise BoundaryNotFoundError(f"{strict_mode} boundary mode requires limiter geometry")
         should_track = mode == "tracked_flux_contour" or bool(track_level)
         if should_track and prev_poly is not None and prev_level is not None and np.isfinite(float(prev_level)):
@@ -191,6 +191,20 @@ def find_plasma_boundary_cpu_with_status(
             poly, level = legacy_boundary
             if mode == "tracked_flux_contour":
                 status = "tracked_flux_contour_reset"
+            elif mode == "spline_contour":
+                spline_boundary = _spline_contour_boundary(
+                    psi=psi,
+                    grid=grid,
+                    center=center,
+                    precision_index2=legacy_precision_index2,
+                    limiter_poly=limiter_poly,
+                )
+                if spline_boundary is not None:
+                    poly, level = spline_boundary
+                    status = "spline_contour_success"
+                    _record_path(status)
+                    return _close_poly(poly), float(level), status
+                status = "legacy_contour_limited_success" if limiter_poly is not None else "legacy_contour_success"
             else:
                 status = "legacy_contour_limited_success" if limiter_poly is not None else "legacy_contour_success"
             _record_path(status)
@@ -206,6 +220,7 @@ def boundary_status_is_real(status: BoundaryStatus) -> bool:
         "legacy_contour_limited_success",
         "tracked_flux_contour_success",
         "tracked_flux_contour_reset",
+        "spline_contour_success",
     }
 
 
@@ -1068,3 +1083,98 @@ def _point_to_polyline_distance(point: np.ndarray, polyline: np.ndarray) -> floa
         if dist < best:
             best = dist
     return best
+
+
+def _spline_contour_boundary(
+    *,
+    psi: np.ndarray,
+    grid: Grid2D,
+    center: tuple[float, float],
+    precision_index2: float,
+    limiter_poly: np.ndarray | None = None,
+) -> tuple[np.ndarray, float] | None:
+    """Найти границу плазмы с использованием сплайнового восстановления.
+
+    Работает аналогично _legacy_contour_boundary, но использует spline_max_width
+    как критерий выбора уровня вместо длины контура.
+    """
+    from tokamak_control.geometry.boundary_spline import fit_periodic_cubic_spline, spline_max_width
+
+    psi_arr = np.asarray(psi, dtype=float)
+    if psi_arr.shape != grid.shape or not bool(np.any(np.isfinite(psi_arr))):
+        return None
+    precision = float(precision_index2)
+    if not np.isfinite(precision) or precision <= 0.0:
+        raise ValueError(f"legacy_precision_index2 must be finite and > 0, got {precision_index2!r}")
+
+    o = _physical_center_to_legacy_index(grid, center)
+    if not np.all(np.isfinite(o)):
+        return None
+
+    p = o.copy()
+    new_step = -o / 2.0
+    best_poly_index: np.ndarray | None = None
+    best_level: float | None = None
+    best_width = -float("inf")
+
+    def contour_fits_limiter(contour_index: np.ndarray) -> bool:
+        if limiter_poly is None:
+            return True
+        contour_physical = _legacy_index_poly_to_physical(grid, contour_index)
+        return _poly_fits_limiter(
+            _close_poly(contour_physical),
+            limiter_poly,
+            tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
+        )
+
+    with _time_block("legacy_contour_search"):
+        while float(np.dot(new_step, new_step)) >= precision and p[0] >= 1.0 and p[1] >= 1.0:
+            p = p + new_step
+            level = _legacy_sample_center_level(psi_arr, p)
+            if level is None:
+                break
+
+            accepted = _legacy_first_accepted_contour(psi_arr, level, o, accept_predicate=contour_fits_limiter)
+            if accepted is not None:
+                length, contour = accepted
+                contour_physical = _legacy_index_poly_to_physical(grid, contour)
+                angles = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=float)
+                radii = _radii_at_angles_from_contour(contour_physical, center, angles)
+                if np.all(np.isfinite(radii)):
+                    try:
+                        coeffs = fit_periodic_cubic_spline(angles, radii)
+                        width = spline_max_width(coeffs, angles, center[0])
+                        if width > best_width:
+                            best_width = width
+                            best_poly_index = np.asarray(contour, dtype=float)
+                            best_level = float(level)
+                    except (ValueError, np.linalg.LinAlgError):
+                        pass
+                new_step = -np.abs(new_step) / 2.0
+            else:
+                new_step = np.abs(new_step) / 2.0
+
+    if best_poly_index is None or best_level is None or best_poly_index.shape[0] < 3:
+        return None
+    return _legacy_index_poly_to_physical(grid, best_poly_index), float(best_level)
+
+
+def _radii_at_angles_from_contour(contour: np.ndarray, center: tuple[float, float], angles: np.ndarray) -> np.ndarray:
+    """Конвертировать контур в радиусы на заданных углах от центра.
+
+    Для каждого угла находит пересечение луча из центра с контуром.
+    """
+    pts = np.asarray(contour, dtype=float)
+    c = np.asarray(center, dtype=float).reshape(1, 2)
+    rel = pts - c
+    theta = np.arctan2(rel[:, 1], rel[:, 0])
+    radii_pts = np.sqrt(np.sum(rel * rel, axis=1))
+
+    order = np.argsort(theta)
+    theta_sorted = theta[order]
+    radii_sorted = radii_pts[order]
+
+    theta_ext = np.concatenate([theta_sorted - 2.0 * np.pi, theta_sorted, theta_sorted + 2.0 * np.pi])
+    radii_ext = np.concatenate([radii_sorted, radii_sorted, radii_sorted])
+
+    return np.interp(angles, theta_ext, radii_ext)

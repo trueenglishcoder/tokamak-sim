@@ -55,7 +55,7 @@ def test_grid_uses_old_center_half_cell_alignment() -> None:
 
 
 def test_cpu_step_uses_causal_ip_dynamics_and_does_not_clip_or_lag() -> None:
-    model = _small_machine(actuator_tau=999.0)
+    model = _small_machine(actuator_tau=0.0)
     pfc_jdot = np.array([10_000.0], dtype=float)
     sol_jdot = np.array([-20_000.0], dtype=float)
 

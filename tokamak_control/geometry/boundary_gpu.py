@@ -13,12 +13,15 @@ from tokamak_control.geometry.boundary_common import BoundaryMode, BoundaryNotFo
 
 @dataclass(slots=True)
 class FixedAngleBoundaryGpuResult:
+    """Результат поиска границы плазмы на GPU."""
+
     found: object
     status_code: object
     level: object
     points: object
     radii: object
     axis_points: object
+    spline_coefficients: object = None
 
 
 def _torch(device: str):
@@ -93,7 +96,7 @@ def fixed_angle_boundary_gpu(
     dtype = field.dtype
     device = field.device
     mode = str(boundary_mode)
-    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour"}:
+    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "spline_contour"}:
         raise ValueError(f"unsupported boundary_mode for fixed_angle_boundary_gpu: {boundary_mode!r}")
 
     angles = torch.as_tensor(angles_rad, dtype=dtype, device=device).reshape(-1)
@@ -139,6 +142,21 @@ def fixed_angle_boundary_gpu(
         ray_samples=int(ray_samples),
         precision_index2=float(legacy_precision_index2),
     )
+
+    spline_result = None
+    if mode == "spline_contour":
+        reset = _spline_fixed_angle_search(
+            psi=field,
+            grid=grid,
+            center=center,
+            center_points=center_t,
+            center_level=center_level,
+            angles=angles,
+            max_radii=max_radii,
+            ray_samples=int(ray_samples),
+            precision_index2=float(legacy_precision_index2),
+        )
+        spline_result = _fit_spline_to_radii_torch(angles=angles, radii=reset[1], device=device, dtype=dtype)
 
     if tracked is None:
         points, radii, found, level = reset
@@ -231,6 +249,7 @@ def fixed_angle_boundary_gpu(
         points=points,
         radii=radii,
         axis_points=center_t,
+        spline_coefficients=spline_result,
     )
 
 
@@ -678,3 +697,134 @@ def _ray_crossings(psi, grid: Grid2D, axis_points, level, axis_kind, angles, lim
     points = axis_points[:, None, :] + radii[..., None] * dirs[None, :, :]
     found = torch.all(has, dim=1)
     return points, radii, found
+
+
+def _spline_fixed_angle_search(
+    *,
+    psi,
+    grid: Grid2D,
+    center,
+    center_points,
+    center_level,
+    angles,
+    max_radii,
+    ray_samples: int,
+    precision_index2: float,
+):
+    """Искать уровень psi с критерием максимальной ширины сплайна.
+
+    Работает аналогично _legacy_fixed_angle_search, но использует spline_max_width
+    как score для выбора уровня вместо mean_radius.
+    """
+    torch = __import__("torch")
+    B = int(psi.shape[0])
+    A = int(angles.numel())
+    r0 = float(grid.r.coords()[0])
+    z0 = float(grid.z.coords()[0])
+    o = torch.tensor(
+        [
+            1.0 + (float(center[0]) - r0) / float(grid.r.step),
+            1.0 + (float(center[1]) - z0) / float(grid.z.step),
+        ],
+        dtype=psi.dtype,
+        device=psi.device,
+    )
+    p = o.reshape(1, 2).repeat(B, 1)
+    new_step = (-o / 2.0).reshape(1, 2).repeat(B, 1)
+    precision_value = float(precision_index2)
+    if not np.isfinite(precision_value) or precision_value <= 0.0:
+        raise ValueError(f"legacy_precision_index2 must be finite and > 0, got {precision_index2!r}")
+    precision = torch.as_tensor(precision_value, dtype=psi.dtype, device=psi.device)
+    best_level = torch.full((B,), float("nan"), dtype=psi.dtype, device=psi.device)
+    best_radii = torch.full((B, A), float("nan"), dtype=psi.dtype, device=psi.device)
+    best_points = torch.full((B, A, 2), float("nan"), dtype=psi.dtype, device=psi.device)
+    best_score = torch.full((B,), -float("inf"), dtype=psi.dtype, device=psi.device)
+    best_found = torch.zeros((B,), dtype=torch.bool, device=psi.device)
+    for _ in range(64):
+        active = (torch.sum(new_step * new_step, dim=1) >= precision) & (p[:, 0] >= 1.0) & (p[:, 1] >= 1.0)
+        p = torch.where(active[:, None], p + new_step, p)
+        level = _legacy_sample_center_level_gpu(psi, grid, p)
+        points, radii, found = _center_ray_crossings(
+            psi=psi,
+            grid=grid,
+            center_points=center_points,
+            center_level=center_level,
+            level=level,
+            angles=angles,
+            max_radii=max_radii,
+            ray_samples=ray_samples,
+        )
+        accepted = active & found & torch.isfinite(level)
+        score = _compute_spline_width_score(radii, angles)
+        improve = accepted & (score > best_score)
+        best_level = torch.where(improve, level, best_level)
+        best_radii = torch.where(improve[:, None], radii, best_radii)
+        best_points = torch.where(improve[:, None, None], points, best_points)
+        best_score = torch.where(improve, score, best_score)
+        best_found = best_found | improve
+        new_step = torch.where(accepted[:, None], -torch.abs(new_step) / 2.0, torch.abs(new_step) / 2.0)
+    return best_points, best_radii, best_found, best_level
+
+
+def _compute_spline_width_score(radii, angles) -> object:
+    """Вычислить score как spline_max_width для batched радиусов.
+
+    Для каждого элемента batch фитирует сплайн и возвращает ширину.
+    """
+    torch = __import__("torch")
+    B = int(radii.shape[0])
+    A = int(angles.numel())
+    scores = torch.zeros(B, dtype=radii.dtype, device=radii.device)
+    for b in range(B):
+        radii_b = radii[b]
+        if not torch.all(torch.isfinite(radii_b)):
+            scores[b] = -float("inf")
+            continue
+        try:
+            coeffs = _fit_spline_to_radii_torch_single(angles, radii_b)
+            r_0 = _evaluate_spline_at_angle_torch(coeffs, angles, 0.0)
+            r_pi = _evaluate_spline_at_angle_torch(coeffs, angles, np.pi)
+            scores[b] = r_0 + r_pi
+        except (ValueError, RuntimeError):
+            scores[b] = -float("inf")
+    return scores
+
+
+def _fit_spline_to_radii_torch(*, angles, radii, device, dtype):
+    """Фитируй сплайн по радиусам для batched данных.
+
+    Возвращает коэффициенты сплайна (B, 4, N) или None если не удалось.
+    """
+    import torch
+
+    B = int(radii.shape[0])
+    A = int(angles.numel())
+    coeffs = torch.zeros(B, 4, A, dtype=dtype, device=device)
+    for b in range(B):
+        radii_b = radii[b]
+        if not torch.all(torch.isfinite(radii_b)):
+            coeffs[b] = float("nan")
+            continue
+        try:
+            coeffs[b] = _fit_spline_to_radii_torch_single(angles, radii_b)
+        except (ValueError, RuntimeError):
+            coeffs[b] = float("nan")
+    return coeffs
+
+
+def _fit_spline_to_radii_torch_single(angles, radii):
+    """Фитируй сплайн по радиусам для одного элемента batch (torch)."""
+    from tokamak_control.geometry.boundary_spline import _fit_periodic_spline_torch_single
+
+    return _fit_periodic_spline_torch_single(angles, radii)
+
+
+def _evaluate_spline_at_angle_torch(coefficients, angles, query_angle: float) -> float:
+    """Вычислить значение сплайна в заданном углу (torch)."""
+    import torch
+
+    from tokamak_control.geometry.boundary_spline import _evaluate_spline_torch_single
+
+    query = torch.tensor([query_angle], dtype=angles.dtype, device=angles.device)
+    result = _evaluate_spline_torch_single(coefficients, angles, query)
+    return float(result[0])
