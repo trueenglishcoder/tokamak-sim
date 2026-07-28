@@ -76,6 +76,7 @@ def _fixed_angle_boundary(
         boundary_mode=boundary_mode,
         gpu_device=device,
         ray_samples=256,
+        return_dense_boundary=(boundary_mode == "equilibrium_lcfs"),
     )
     return (
         result.points.detach().cpu().numpy(),
@@ -83,6 +84,8 @@ def _fixed_angle_boundary(
         result.found.detach().cpu().numpy().astype(bool),
         result.level.detach().cpu().numpy(),
         result.topology_code.detach().cpu().numpy().astype(int),
+        result.core_boundary.detach().cpu().numpy(),
+        result.core_boundary_count.detach().cpu().numpy().astype(int),
     )
 
 
@@ -113,7 +116,15 @@ def main() -> int:
     chosen = _step_indices(int(psi_snaps.shape[0]), args.steps)
 
     psi_batch = psi_snaps[chosen]
-    gpu_points, gpu_radii, gpu_found, gpu_levels, gpu_topology = _fixed_angle_boundary(
+    (
+        gpu_points,
+        gpu_radii,
+        gpu_found,
+        gpu_levels,
+        gpu_topology,
+        gpu_core_boundary,
+        gpu_core_boundary_count,
+    ) = _fixed_angle_boundary(
         psi_batch=psi_batch,
         grid=grid,
         center=center,
@@ -183,9 +194,11 @@ def main() -> int:
             ax.scatter(cpu_points[row][:, 0], cpu_points[row][:, 1], s=14, color="#1f77b4", marker="o", label="CPU fixed-angle samples")
         if gpu_found[row]:
             pts = gpu_points[row]
-            closed = np.vstack([pts, pts[:1]])
-            ax.plot(closed[:, 0], closed[:, 1], color="#ff7f0e", lw=1.5, ls="--", label=f"{args.device} fixed-angle")
-            ax.scatter(pts[:, 0], pts[:, 1], s=18, color="#ff7f0e", marker="x")
+            count = int(gpu_core_boundary_count[row])
+            if count >= 4:
+                dense = gpu_core_boundary[row, :count]
+                ax.plot(dense[:, 0], dense[:, 1], color="#ff7f0e", lw=1.5, ls="--", label=f"{args.device} dense LCFS")
+            ax.scatter(pts[:, 0], pts[:, 1], s=18, color="#ff7f0e", marker="x", label=f"{args.device} fixed-angle samples")
         ax.scatter([center[0]], [center[1]], c="red", s=22, marker="+")
         ax.set_aspect("equal", adjustable="box")
         ax.set_title(f"step {int(snap_steps[idx])}, t={float(snap_t[idx]):.3f}s")
@@ -218,7 +231,7 @@ def main() -> int:
             ax2.legend(lines + lines_b, labels + labels_b, loc="upper right", fontsize=8)
 
     subtitle = "CPU emulation of GPU path" if str(args.device) == "cpu" else "CUDA GPU path"
-    fig.suptitle(f"Canonical CPU LCFS vs {subtitle}\n{npz_path}", fontsize=12)
+    fig.suptitle(f"CPU reference LCFS vs full {subtitle} LCFS\n{npz_path}", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=150)

@@ -101,14 +101,17 @@ shaped boundary valid.
 CPU and GPU roles
 -----------------
 
-The CPU implementation is canonical. It returns the dense LCFS, topology,
-critical points, contacts, branches, projection, and quality metrics.
+The CPU implementation is an independent reference used for development and
+parity tests. It is not executed inside a GPU replay or training step.
 
-The batched GPU path returns the derived fixed-angle signal, boundary level,
-topology code, axis, and selected X-points for RL throughput. Single-lane run
-artifacts and videos additionally execute the canonical CPU extractor against
-the same field so stored and plotted geometry is the dense physical LCFS rather
-than a polygon reconstructed from the GPU radii.
+The production GPU implementation performs the complete primary-core LCFS
+selection. It returns the boundary level, topology, axis, selected X-points,
+fixed-angle radii, contacts, quality metrics, and, when requested, a dense closed
+core contour. All of these outputs come from one selected GPU result.
+
+Large RL batches disable only dense-contour materialization because the policy
+does not consume that array. Single-lane replay enables it for artifacts and
+video. This avoids calculating the same boundary a second time on CPU.
 
 Stored artifact channels
 ------------------------
@@ -136,20 +139,21 @@ The six boundary_quality columns are, in order:
 Batched GPU execution
 ---------------------
 
-The canonical physical result is the CPU dense level-set graph. The batched GPU
-path computes the derived primary-core radial signal without constructing dense
-branch graphs for every lane. It uses the first outward exit from the configured
-projection center at the selected wall or X-point boundary level. It also returns
-the refined magnetic axis, selected X-point coordinates, topology code, boundary
-level, and per-angle radii.
+The batched GPU path orders limiter and X-point candidates outward from the
+magnetic axis, validates the primary-core first exit, selects one physical LCFS
+level, and derives every production output from that level. Configured-angle
+radii are always computed. A 256-angle closed core contour is additionally
+materialized only when artifact output requests it.
 
-This is a public representation contract, not a fallback boundary definition.
-Single-lane artifacts and video are generated from the canonical CPU dense LCFS
-computed from the same psi field. CPU/GPU parity tests require equal topology,
-boundary level within tolerance, and fixed-angle radii within grid-scale error.
-If the canonical dense LCFS is not single-valued on the configured rays, its
-fixed-angle projection is explicitly invalid even when a tensor first-exit signal
-can be evaluated.
+The GPU contour is not reconstructed from previously saved 32 radii and is not
+smoothed by a spline. It is evaluated independently at a denser angular grid
+from the same selected equilibrium level. Exact selected X-points and limiter
+contacts are snapped into their nearest dense contour nodes.
+
+CPU/GPU parity tests require equal topology, boundary level within tolerance,
+fixed-angle radii within grid-scale error, and bidirectional dense-contour error
+within approximately one grid cell. The CPU path is therefore a test oracle,
+not a second runtime boundary calculation.
 
 Failure behavior
 ----------------

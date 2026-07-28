@@ -68,7 +68,7 @@ It does not reconstruct an equilibrium from diagnostic measurements. The active
 `equilibrium_lcfs` mode automatically determines whether the connected primary
 core is limiter-limited or bounded by one or more X-point separatrices.
 
-The canonical CPU path is split into explicit components:
+The CPU reference implementation is split into explicit components:
 
 - `equilibrium_field.py`: bicubic field, gradient, Hessian, and level projection
 - `critical_points.py`: subgrid O/X refinement and Hessian classification
@@ -76,15 +76,18 @@ The canonical CPU path is split into explicit components:
 - `lcfs.py`: wall/saddle candidate ordering, core validation, and result object
 - `boundary_projection.py`: dense-boundary projection to fixed-angle RL radii
 
-The dense LCFS is the geometric source of truth. X-points are explicit graph
-nodes and no global smoothing spline is fitted through them. Fixed-angle radii
-are accepted as a valid representation only when every ray has exactly one
-forward boundary intersection.
+The production batched implementation in `boundary_gpu.py` evaluates the same
+physical wall-versus-X-point rule directly on tensors. It returns the selected
+boundary level, magnetic axis, X-points, topology, fixed-angle radii, and an
+optional dense closed core contour. The dense contour and the 32 RL radii are
+materializations of one selected GPU LCFS result. They are never mixed with a
+second CPU result.
 
-The batched GPU path computes the derived fixed-angle signal, topology code,
-boundary level, axis, and selected X-points. Single-lane artifact runs also use
-the canonical CPU extractor so stored boundaries and videos contain the dense
-physical contour.
+Training keeps dense-contour materialization disabled because the policy only
+consumes fixed-angle radii. Single-lane replay and artifact runs enable it, so
+stored boundaries and videos are produced on GPU without rerunning the CPU
+extractor at every step. The CPU implementation remains the independent
+reference used by parity tests.
 
 If no candidate forms a physical boundary of the connected primary core, the
 finder raises `BoundaryNotFoundError`. The runner records a physical boundary
@@ -158,11 +161,15 @@ Plotting helpers in `tokamak_control/viz/plotting.py` consume saved artifacts ra
 
 ## Batched GPU boundary contract
 
-`equilibrium_lcfs` has one physical definition. The CPU implementation owns the
-dense LCFS graph, explicit X-point nodes, separatrix branches, and limiter
-contacts. The batched GPU implementation computes the first-exit fixed-angle
-projection of that same primary-core boundary together with topology, boundary
-level, magnetic axis, and X-point tensors. It does not create a second smoothed
-or fixed-ray physical boundary. Single-lane artifacts are always populated from
-the canonical CPU dense extractor, and parity tests enforce agreement of the
-derived tensor signal.
+`equilibrium_lcfs` has one physical definition and one production GPU result.
+The GPU implementation selects wall- or X-point-limited topology, returns the
+magnetic axis and selected X-points, computes the configured fixed-angle
+projection, and can materialize a 256-sample closed core contour from the same
+selected level. No CPU boundary call occurs inside the batched GPU replay or
+training loop.
+
+Dense materialization is enabled for single-lane artifact runs and disabled for
+large training batches. This changes only which output is stored, not the
+selected LCFS level or the radii consumed by RL. CPU/GPU parity tests compare
+level, topology, fixed-angle radii, and the dense contour against the independent
+CPU reference on limited, single-null, and double-null equilibria.

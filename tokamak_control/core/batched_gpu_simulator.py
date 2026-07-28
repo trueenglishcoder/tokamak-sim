@@ -66,6 +66,7 @@ class BatchedGpuTokamakSimulator:
         boundary_continuity_weight_center: float = 0.2,
         boundary_continuity_weight_area: float = 0.2,
         boundary_continuity_weight_level: float = 0.1,
+        boundary_return_dense: bool = False,
         gpu_device: str = "cuda:0",
     ) -> None:
         if int(batch_size) <= 0:
@@ -103,6 +104,7 @@ class BatchedGpuTokamakSimulator:
         self.boundary_continuity_weight_center = float(boundary_continuity_weight_center)
         self.boundary_continuity_weight_area = float(boundary_continuity_weight_area)
         self.boundary_continuity_weight_level = float(boundary_continuity_weight_level)
+        self.boundary_return_dense = bool(boundary_return_dense)
         self.center = (float(settings.R0), float(settings.Z0))
         R, Z = grid.mesh()
         self.G_pfc = torch.as_tensor(build_green_for_coils(R, Z, pfc.element_positions, pfc.element_weights) if pfc.n_coils else np.zeros((0, *grid.shape)), dtype=self.dtype, device=self.device)
@@ -258,6 +260,7 @@ class BatchedGpuTokamakSimulator:
             continuity_weight_mean_radius=self.boundary_continuity_weight_mean_radius,
             continuity_weight_level=self.boundary_continuity_weight_level,
             prepared_geometry=self._boundary_gpu_geometry,
+            return_dense_boundary=self.boundary_return_dense,
         )
         if self.profile_enabled and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)

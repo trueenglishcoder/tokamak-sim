@@ -24,9 +24,14 @@ primary core. The extractor finds subgrid O- and X-points, evaluates limiter and
 saddle candidates outward from the primary axis, automatically classifies
 limited or diverted topology, and preserves separatrix branches at X-points.
 
-The 32 radii are derived from the dense LCFS for RL. They are not used to
-construct or smooth the physical boundary. Their single-valued validity and
-per-ray intersection counts are stored explicitly.
+The production GPU extractor selects one physical LCFS result. The 32 radii
+used by RL and the optional 256-sample artifact contour are derived from that
+same selected level. The CPU reference is used only in parity tests and is not
+called inside GPU replay or training steps.
+
+Dense contour materialization is enabled for single-lane replay artifacts and
+disabled for large RL batches. The configured radii are never used as input to a
+spline or as a fallback physical boundary.
 
 The full algorithm and artifact schema are documented in
 `docs/plasma_boundary_calculation.txt`.

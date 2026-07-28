@@ -122,6 +122,9 @@ _BOUNDARY_TOPOLOGY_CODE = {
     "double_null": 3,
     "multi_null": 4,
 }
+_BOUNDARY_TOPOLOGY_NAME = {
+    code: name for name, code in _BOUNDARY_TOPOLOGY_CODE.items()
+}
 
 
 def _boundary_detail_payload(equilibrium: EquilibriumBoundary | None) -> dict[str, object]:
@@ -269,6 +272,51 @@ def _fixed_angle_radii_from_result(result: BatchedGpuSimulatorResult) -> np.ndar
 def _fixed_angle_found_from_result(result: BatchedGpuSimulatorResult) -> bool:
     """Return whether the single-lane fixed-angle boundary was found."""
     return bool(_tensor_lane_scalar(result.boundary.found, cast=bool))
+
+
+def _gpu_dense_boundary_from_result(
+    result: BatchedGpuSimulatorResult,
+) -> np.ndarray | None:
+    """Извлечь замкнутый плотный LCFS-контур из single-lane GPU-результата."""
+    count = int(_tensor_lane_scalar(result.boundary.core_boundary_count, cast=int))
+    if count < 4:
+        return None
+    boundary = _tensor_lane_to_numpy(result.boundary.core_boundary, dtype=float).reshape(-1, 2)
+    boundary = boundary[:count]
+    if not bool(np.all(np.isfinite(boundary))):
+        return None
+    return boundary.copy()
+
+
+def _gpu_boundary_detail_payload(
+    result: BatchedGpuSimulatorResult,
+) -> dict[str, object]:
+    """Преобразовать полный GPU-результат LCFS в стабильные поля RunWriter."""
+    topology_code = int(_tensor_lane_scalar(result.boundary.topology_code, cast=int))
+    axis = _tensor_lane_to_numpy(result.boundary.axis_points, dtype=float).reshape(2)
+    x_points = _tensor_lane_to_numpy(result.boundary.x_points, dtype=float).reshape(-1, 2)
+    x_points = x_points[np.all(np.isfinite(x_points), axis=1)]
+    contact_count = int(_tensor_lane_scalar(result.boundary.limiter_contact_count, cast=int))
+    contacts = _tensor_lane_to_numpy(result.boundary.limiter_contacts, dtype=float).reshape(-1, 2)
+    contacts = contacts[:contact_count]
+    counts = _tensor_lane_to_numpy(result.boundary.intersection_counts, dtype=float).reshape(-1)
+    quality = _tensor_lane_to_numpy(result.boundary.quality, dtype=float).reshape(6)
+    return {
+        "boundary_topology_code": topology_code,
+        "boundary_axis": axis,
+        "boundary_x_points": x_points,
+        "boundary_limiter_contacts": contacts,
+        "boundary_separatrix_branches": tuple(),
+        "boundary_fixed_angle_valid": _fixed_angle_found_from_result(result),
+        "boundary_fixed_angle_counts": counts,
+        "boundary_quality": quality,
+    }
+
+
+def _gpu_boundary_topology_name(result: BatchedGpuSimulatorResult) -> str | None:
+    """Вернуть текстовое имя топологии single-lane GPU-границы."""
+    code = int(_tensor_lane_scalar(result.boundary.topology_code, cast=int))
+    return _BOUNDARY_TOPOLOGY_NAME.get(code)
 
 
 def _fixed_angle_polyline(
@@ -1630,6 +1678,7 @@ def _run_batched_gpu_fixed_angle_artifacts(
         boundary_continuity_weight_center=cfg.boundary_continuity_weight_center,
         boundary_continuity_weight_area=cfg.boundary_continuity_weight_area,
         boundary_continuity_weight_level=cfg.boundary_continuity_weight_level,
+        boundary_return_dense=(cfg.boundary_mode == "equilibrium_lcfs"),
         gpu_device=cfg.compute.gpu_device,
     )
     result = simulator.reset(
@@ -1639,20 +1688,9 @@ def _run_batched_gpu_fixed_angle_artifacts(
     )
     state = _state_from_batched_result(result, simulator)
     center = (float(cfg.physics.R0), float(cfg.physics.Z0))
-    canonical_boundary: EquilibriumBoundary | None = None
-    if cfg.boundary_mode == "equilibrium_lcfs":
-        canonical_boundary = find_equilibrium_boundary(
-            psi=np.asarray(state.psi, dtype=float),
-            grid=cfg.grid,
-            center=center,
-            limiter_shape=limiter_shape,
-            fixed_angles=angles,
-        )
-        base_radii = np.asarray(canonical_boundary.fixed_angle_projection.radii, dtype=float)
-    else:
-        base_radii = _fixed_angle_radii_from_result(result)
-        if not _fixed_angle_found_from_result(result):
-            base_radii = np.full((angles.shape[0],), np.nan, dtype=float)
+    base_radii = _fixed_angle_radii_from_result(result)
+    if not _fixed_angle_found_from_result(result):
+        base_radii = np.full((angles.shape[0],), np.nan, dtype=float)
     scenario = make_scenario(
         scenario_name,
         base_radii,
@@ -1691,9 +1729,7 @@ def _run_batched_gpu_fixed_angle_artifacts(
                 radii_pre = _fixed_angle_radii_from_result(result)
                 found_pre = _fixed_angle_found_from_result(result)
                 if cfg.boundary_mode == "equilibrium_lcfs":
-                    if canonical_boundary is None:
-                        raise RuntimeError("Canonical equilibrium boundary is unavailable")
-                    poly_pre = np.asarray(canonical_boundary.core_boundary, dtype=float)
+                    poly_pre = _gpu_dense_boundary_from_result(result)
                 else:
                     poly_pre = _fixed_angle_polyline(center=center, angles=angles, radii=radii_pre, found=found_pre)
                 refs = _scenario_refs(scenario, angles, float(state_pre.t))
@@ -1739,14 +1775,7 @@ def _run_batched_gpu_fixed_angle_artifacts(
                 radii_post = _fixed_angle_radii_from_result(result)
                 found_post = _fixed_angle_found_from_result(result)
                 if cfg.boundary_mode == "equilibrium_lcfs":
-                    canonical_boundary = find_equilibrium_boundary(
-                        psi=np.asarray(state_post.psi, dtype=float),
-                        grid=cfg.grid,
-                        center=center,
-                        limiter_shape=limiter_shape,
-                        fixed_angles=angles,
-                    )
-                    poly_post = np.asarray(canonical_boundary.core_boundary, dtype=float)
+                    poly_post = _gpu_dense_boundary_from_result(result)
                 else:
                     poly_post = _fixed_angle_polyline(center=center, angles=angles, radii=radii_post, found=found_post)
                 t_log = float(state_post.t)
@@ -1791,7 +1820,11 @@ def _run_batched_gpu_fixed_angle_artifacts(
                         radii_meas=np.asarray(radii_post, dtype=float).reshape(-1),
                         boundary_poly_true=poly_post,
                         boundary_poly_meas=poly_post,
-                        **_boundary_detail_payload(canonical_boundary),
+                        **(
+                            _gpu_boundary_detail_payload(result)
+                            if cfg.boundary_mode == "equilibrium_lcfs"
+                            else {}
+                        ),
                     )
                     event_payload = {
                         "type": "step",
@@ -1800,18 +1833,42 @@ def _run_batched_gpu_fixed_angle_artifacts(
                         "Ip": float(state_post.Ip),
                         "Ip_ref": ip_ref_log,
                         "target_mean_radius": float(np.nanmean(refs.ref_radii)),
-                        "boundary_status": "fixed_angle_gpu_found" if found_post else "fixed_angle_gpu_not_found",
+                        "boundary_status": (
+                            "equilibrium_lcfs_gpu_success"
+                            if cfg.boundary_mode == "equilibrium_lcfs" and found_post
+                            else "equilibrium_lcfs_gpu_not_found"
+                            if cfg.boundary_mode == "equilibrium_lcfs"
+                            else "fixed_angle_gpu_found"
+                            if found_post
+                            else "fixed_angle_gpu_not_found"
+                        ),
                         "boundary_mode": str(cfg.boundary_mode),
                         "boundary_base_mode": str(cfg.boundary_base_mode),
                         "boundary_gpu_status_code": int(np.asarray(result.boundary.status_code.detach().cpu())[0]),
                         "boundary_gpu_level": float(np.asarray(result.boundary.level.detach().cpu())[0]),
-                        "boundary_topology": None if canonical_boundary is None else canonical_boundary.topology,
-                        "boundary_psi_boundary": None if canonical_boundary is None else float(canonical_boundary.psi_boundary),
-                        "boundary_x_point_count": 0 if canonical_boundary is None else len(canonical_boundary.x_points),
-                        "boundary_limiter_contact_count": 0 if canonical_boundary is None else len(canonical_boundary.limiter_contacts),
-                        "boundary_fixed_angle_valid": bool(found_post) if canonical_boundary is None else bool(canonical_boundary.fixed_angle_projection.valid),
+                        "boundary_topology": (
+                            _gpu_boundary_topology_name(result)
+                            if cfg.boundary_mode == "equilibrium_lcfs"
+                            else None
+                        ),
+                        "boundary_psi_boundary": (
+                            float(_tensor_lane_scalar(result.boundary.level, cast=float))
+                            if cfg.boundary_mode == "equilibrium_lcfs" and found_post
+                            else None
+                        ),
+                        "boundary_x_point_count": (
+                            int(np.count_nonzero(np.all(np.isfinite(_tensor_lane_to_numpy(result.boundary.x_points, dtype=float).reshape(-1, 2)), axis=1)))
+                            if cfg.boundary_mode == "equilibrium_lcfs"
+                            else 0
+                        ),
+                        "boundary_limiter_contact_count": (
+                            int(_tensor_lane_scalar(result.boundary.limiter_contact_count, cast=int))
+                            if cfg.boundary_mode == "equilibrium_lcfs"
+                            else 0
+                        ),
+                        "boundary_fixed_angle_valid": bool(found_post),
                         "boundary_found": bool(found_post),
-                        "boundary_fail_reason": None if found_post else "fixed-angle GPU boundary was not fully found",
+                        "boundary_fail_reason": None if found_post else "GPU LCFS boundary was not fully found",
                         "norm_u_pfc": float(np.linalg.norm(commands.pfc_cmd)),
                         "norm_u_sol": float(np.linalg.norm(commands.sol_cmd)),
                         "disturbances_applied": [],

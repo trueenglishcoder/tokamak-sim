@@ -51,3 +51,85 @@ def test_boundary_topology_round_trip(tmp_path) -> None:
     assert bool(run["boundary_fixed_angle_valid"][0])
     assert np.array_equal(run["boundary_fixed_angle_counts"], np.ones((1, 4)))
     assert np.allclose(run["boundary_quality"][0], np.asarray([1e-9, 2e-8, 0.0, 0.1, 0.0, 12.0]))
+
+
+def test_gpu_artifact_payload_uses_single_gpu_boundary_result() -> None:
+    """Не смешивать плотный контур и радиусы из разных реализаций."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    import torch
+
+    try:
+        import tomli_w  # noqa: F401
+    except ModuleNotFoundError:
+        stub = ModuleType("tomli_w")
+        stub.dumps = lambda _value: ""  # type: ignore[attr-defined]
+        sys.modules["tomli_w"] = stub
+
+    from tokamak_control.cli.run_simulation import (
+        _gpu_boundary_detail_payload,
+        _gpu_dense_boundary_from_result,
+    )
+
+    dense = torch.as_tensor(
+        [[[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]]],
+        dtype=torch.float64,
+    )
+    result = SimpleNamespace(
+        boundary=SimpleNamespace(
+            found=torch.as_tensor([True]),
+            topology_code=torch.as_tensor([2]),
+            axis_points=torch.as_tensor([[0.5, 0.5]], dtype=torch.float64),
+            x_points=torch.as_tensor(
+                [[[0.5, 1.0], [float("nan"), float("nan")]]],
+                dtype=torch.float64,
+            ),
+            core_boundary=dense,
+            core_boundary_count=torch.as_tensor([4]),
+            limiter_contacts=torch.empty((1, 0, 2), dtype=torch.float64),
+            limiter_contact_count=torch.as_tensor([0]),
+            intersection_counts=torch.ones((1, 4), dtype=torch.int64),
+            quality=torch.as_tensor(
+                [[1.0e-9, 2.0e-8, 0.0, 0.1, 0.0, 12.0]],
+                dtype=torch.float64,
+            ),
+        )
+    )
+
+    poly = _gpu_dense_boundary_from_result(result)
+    payload = _gpu_boundary_detail_payload(result)
+
+    assert poly is not None
+    assert np.allclose(poly, np.asarray(dense[0]))
+    assert payload["boundary_topology_code"] == 2
+    assert np.array_equal(
+        payload["boundary_fixed_angle_counts"],
+        np.ones((4,), dtype=float),
+    )
+    assert bool(payload["boundary_fixed_angle_valid"])
+    assert np.allclose(
+        payload["boundary_quality"],
+        np.asarray([1.0e-9, 2.0e-8, 0.0, 0.1, 0.0, 12.0]),
+    )
+
+
+def test_batched_gpu_artifact_path_does_not_call_cpu_lcfs() -> None:
+    """GPU artifact path не должен повторно запускать CPU LCFS на каждом шаге."""
+    import inspect
+    import sys
+    from types import ModuleType
+
+    try:
+        import tomli_w  # noqa: F401
+    except ModuleNotFoundError:
+        stub = ModuleType("tomli_w")
+        stub.dumps = lambda _value: ""  # type: ignore[attr-defined]
+        sys.modules["tomli_w"] = stub
+
+    from tokamak_control.cli.run_simulation import _run_batched_gpu_fixed_angle_artifacts
+
+    source = inspect.getsource(_run_batched_gpu_fixed_angle_artifacts)
+
+    assert "find_equilibrium_boundary(" not in source
+    assert "_gpu_dense_boundary_from_result(result)" in source
