@@ -98,6 +98,27 @@ def _polyline_from_padded_row(row: np.ndarray) -> np.ndarray:
     return poly
 
 
+def _points_from_padded_row(row: np.ndarray) -> np.ndarray:
+    """Read a NaN-padded point row, allowing an empty result."""
+    arr = np.asarray(row, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError(f"Point row must have shape (N, 2), got {arr.shape}")
+    return arr[np.all(np.isfinite(arr), axis=1)]
+
+
+def _branches_from_padded_row(row: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Read a NaN-padded group of boundary branches."""
+    arr = np.asarray(row, dtype=float)
+    if arr.ndim != 3 or arr.shape[-1] != 2:
+        raise ValueError(f"Branch row must have shape (B, N, 2), got {arr.shape}")
+    branches: list[np.ndarray] = []
+    for branch in arr:
+        valid = branch[np.all(np.isfinite(branch), axis=1)]
+        if valid.shape[0] >= 2:
+            branches.append(valid)
+    return tuple(branches)
+
+
 def reference_polyline_from_radii(center: Tuple[float, float], radii: np.ndarray) -> np.ndarray:
     """Build the closed fixed-angle reference boundary polyline."""
     r = np.asarray(radii, dtype=float).reshape(-1)
@@ -115,7 +136,7 @@ def _boundary_mode_from_meta(meta: dict) -> BoundaryMode:
     if not isinstance(boundary_meta, dict):
         return "legacy_contour"
     mode = str(boundary_meta.get("mode", "legacy_contour")).strip().lower()
-    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}:
+    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "equilibrium_lcfs"}:
         raise ValueError(f"Invalid boundary mode in run metadata: {mode!r}")
     return cast(BoundaryMode, mode)
 
@@ -162,10 +183,13 @@ def _plot_limiter_shape(ax: plt.Axes, limiter_shape: Optional[np.ndarray]) -> No
     ax.plot(limiter[:, 0], limiter[:, 1], "-", lw=2.0, color="magenta", zorder=6)
 
 
-def _plot_x_points(ax: plt.Axes, psi: np.ndarray, grid: Grid2D) -> None:
-    """Deliberately do not draw magnetic X-point markers in saved figures/videos."""
-    del ax, psi, grid
-    return
+def _plot_x_points(ax: plt.Axes, x_points: np.ndarray | None) -> None:
+    """Draw explicitly selected LCFS X-points."""
+    if x_points is None:
+        return
+    points = np.asarray(x_points, dtype=float).reshape(-1, 2)
+    if points.size:
+        ax.scatter(points[:, 0], points[:, 1], marker="x", s=42, linewidths=1.1, color="black", zorder=9, label="X-point")
 
 
 def fig_psi_contours(
@@ -243,6 +267,9 @@ def _fig_boundary_from_poly(
     limiter_shape: Optional[np.ndarray] = None,
     boundary_mode: BoundaryMode = "legacy_contour",
     ref_poly: Optional[np.ndarray] = None,
+    x_points: Optional[np.ndarray] = None,
+    limiter_contacts: Optional[np.ndarray] = None,
+    separatrix_branches: tuple[np.ndarray, ...] = (),
     presentation_mode: bool = False,
 ) -> plt.Figure:
     if psi.shape != grid.shape:
@@ -283,6 +310,15 @@ def _fig_boundary_from_poly(
             zorder=7,
             label="Sim boundary" if ref_poly is not None else None,
         )
+    for branch in separatrix_branches:
+        branch_arr = np.asarray(branch, dtype=float).reshape(-1, 2)
+        if branch_arr.shape[0] >= 2:
+            ax.plot(branch_arr[:, 0], branch_arr[:, 1], "-", lw=1.2, color="tab:blue", alpha=0.9, zorder=6)
+    _plot_x_points(ax, x_points)
+    if limiter_contacts is not None:
+        contacts = np.asarray(limiter_contacts, dtype=float).reshape(-1, 2)
+        if contacts.size:
+            ax.scatter(contacts[:, 0], contacts[:, 1], marker="o", s=34, facecolors="none", edgecolors="tab:orange", linewidths=1.5, zorder=9, label="Limiter contact")
     ax.plot([center[0]], [center[1]], "x", ms=6, color="red", zorder=5)
 
     _plot_limiter_shape(ax, limiter_shape)
@@ -312,9 +348,12 @@ def fig_boundary_from_poly(
     coil_positions: Optional[np.ndarray | dict[str, np.ndarray]] = None,
     limiter_shape: Optional[np.ndarray] = None,
     ref_poly: Optional[np.ndarray] = None,
+    x_points: Optional[np.ndarray] = None,
+    limiter_contacts: Optional[np.ndarray] = None,
+    separatrix_branches: tuple[np.ndarray, ...] = (),
     presentation_mode: bool = False,
 ) -> plt.Figure:
-    """Построить psi и уже найденный в расчете физический контур плазмы."""
+    """Plot the stored dense physical boundary and its topology markers."""
     return _fig_boundary_from_poly(
         psi=psi,
         grid=grid,
@@ -327,6 +366,9 @@ def fig_boundary_from_poly(
         coil_positions=coil_positions,
         limiter_shape=limiter_shape,
         ref_poly=ref_poly,
+        x_points=x_points,
+        limiter_contacts=limiter_contacts,
+        separatrix_branches=separatrix_branches,
         presentation_mode=presentation_mode,
     )
 
@@ -345,6 +387,9 @@ def _draw_boundary_panel(
     coil_positions: Optional[np.ndarray | dict[str, np.ndarray]],
     limiter_shape: Optional[np.ndarray],
     ref_poly: Optional[np.ndarray] = None,
+    x_points: Optional[np.ndarray] = None,
+    limiter_contacts: Optional[np.ndarray] = None,
+    separatrix_branches: tuple[np.ndarray, ...] = (),
     presentation_mode: bool = False,
 ) -> object:
     """Нарисовать панель поля ψ и границы на существующей оси."""
@@ -375,6 +420,15 @@ def _draw_boundary_panel(
             zorder=7,
             label="Sim boundary" if ref_poly is not None else None,
         )
+    for branch in separatrix_branches:
+        branch_arr = np.asarray(branch, dtype=float).reshape(-1, 2)
+        if branch_arr.shape[0] >= 2:
+            ax.plot(branch_arr[:, 0], branch_arr[:, 1], "-", lw=1.2, color="tab:blue", alpha=0.9, zorder=6)
+    _plot_x_points(ax, x_points)
+    if limiter_contacts is not None:
+        contacts = np.asarray(limiter_contacts, dtype=float).reshape(-1, 2)
+        if contacts.size:
+            ax.scatter(contacts[:, 0], contacts[:, 1], marker="o", s=34, facecolors="none", edgecolors="tab:orange", linewidths=1.5, zorder=9, label="Limiter contact")
     ax.plot([center[0]], [center[1]], "x", ms=7, color="red", zorder=5)
     _plot_limiter_shape(ax, limiter_shape)
     _plot_coil_markers(ax, coil_positions)
@@ -503,6 +557,9 @@ def _fig_boundary_with_live_timeseries(
     pfc_ylim: tuple[float, float] | None = None,
     sol_ylim: tuple[float, float] | None = None,
     ref_poly: Optional[np.ndarray] = None,
+    x_points: Optional[np.ndarray] = None,
+    limiter_contacts: Optional[np.ndarray] = None,
+    separatrix_branches: tuple[np.ndarray, ...] = (),
     presentation_mode: bool = False,
 ) -> plt.Figure:
     """Собрать широкий кадр: сечение токамака слева, live-графики справа."""
@@ -523,6 +580,9 @@ def _fig_boundary_with_live_timeseries(
         coil_positions=coil_positions,
         limiter_shape=limiter_shape,
         ref_poly=ref_poly,
+        x_points=x_points,
+        limiter_contacts=limiter_contacts,
+        separatrix_branches=separatrix_branches,
         presentation_mode=presentation_mode,
     )
     fig.colorbar(pcm, ax=ax_boundary, label="ψ", shrink=0.88)
@@ -648,7 +708,7 @@ def fig_boundary_vs_reference(
     ax.plot(np.r_[R_ref, R_ref[0]], np.r_[Z_ref, Z_ref[0]], "--", lw=2, label="reference")
     ax.plot([R0], [Z0], "x", ms=6, color="red", label="center")
     _plot_limiter_shape(ax, limiter_shape)
-    _plot_x_points(ax, psi, grid)
+    _plot_x_points(ax, None)
 
     ax.set_xlabel("R [m]")
     ax.set_ylabel("Z [m]")
@@ -812,6 +872,9 @@ def save_run_frames(
     boundary_polys = np.asarray(run.get("boundary_poly_true"), dtype=float) if "boundary_poly_true" in run else None
     if boundary_polys is not None and boundary_polys.ndim != 3:
         raise RuntimeError(f"boundary_poly_true must have shape (T, N, 2), got {boundary_polys.shape}")
+    boundary_x_points = np.asarray(run["boundary_x_points"], dtype=float) if "boundary_x_points" in run else None
+    boundary_contacts = np.asarray(run["boundary_limiter_contacts"], dtype=float) if "boundary_limiter_contacts" in run else None
+    boundary_branches = np.asarray(run["boundary_separatrix_branches"], dtype=float) if "boundary_separatrix_branches" in run else None
     steps = np.asarray(run["step"], dtype=int)
     step_to_index = {int(step): step_idx for step_idx, step in enumerate(steps)}
 
@@ -824,16 +887,19 @@ def save_run_frames(
         step_label = int(snap_steps[idx]) if idx < snap_steps.shape[0] else idx
         if step_label not in step_to_index:
             raise RuntimeError(f"No stored time-series row for snapshot step {step_label}")
+        row_idx = step_to_index[step_label]
         if boundary_polys is None:
             poly = None
         else:
             try:
-                poly = _polyline_from_padded_row(boundary_polys[step_to_index[step_label]])
+                poly = _polyline_from_padded_row(boundary_polys[row_idx])
             except RuntimeError:
                 poly = None
+        x_points = None if boundary_x_points is None else _points_from_padded_row(boundary_x_points[row_idx])
+        limiter_contacts = None if boundary_contacts is None else _points_from_padded_row(boundary_contacts[row_idx])
+        separatrix_branches = () if boundary_branches is None else _branches_from_padded_row(boundary_branches[row_idx])
         ref_poly = None
         if presentation_mode and radii_ref is not None:
-            row_idx = step_to_index[step_label]
             if 0 <= row_idx < radii_ref.shape[0]:
                 try:
                     ref_poly = reference_polyline_from_radii(center, radii_ref[row_idx])
@@ -852,6 +918,9 @@ def save_run_frames(
             coil_positions=coil_positions,
             limiter_shape=limiter_shape,
             ref_poly=ref_poly,
+            x_points=x_points,
+            limiter_contacts=limiter_contacts,
+            separatrix_branches=separatrix_branches,
             presentation_mode=presentation_mode,
             t=t,
             frame_index=step_label,

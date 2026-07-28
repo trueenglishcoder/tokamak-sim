@@ -41,7 +41,9 @@ from tokamak_control.experiments.disturbances import (
 from tokamak_control.geometry.boundary import (
     BoundaryMode,
     BoundaryNotFoundError,
+    EquilibriumBoundary,
     configure_boundary_profiling,
+    find_equilibrium_boundary,
     find_plasma_boundary_with_status,
     log_boundary_profiling_summary,
     boundary_profiling_snapshot,
@@ -93,13 +95,57 @@ class RunResult:
 
 @dataclass(slots=True)
 class _BoundaryTracker:
-    """Хранит текущий физически найденный контур плазмы во время расчета."""
+    """Current canonical boundary and its derived control representation."""
 
     poly: np.ndarray | None
     level: float
     status: str
     fail_reason: str | None
     found: bool = True
+    equilibrium: EquilibriumBoundary | None = None
+
+    def radii(self, *, center: tuple[float, float], angles: np.ndarray) -> np.ndarray:
+        """Return explicit fixed-angle projection or the legacy derived radii."""
+        if self.equilibrium is not None:
+            projection = self.equilibrium.fixed_angle_projection
+            if projection.radii.shape != np.asarray(angles).shape:
+                raise RuntimeError(
+                    "Equilibrium boundary fixed-angle projection does not match runtime angles"
+                )
+            return np.asarray(projection.radii, dtype=float).copy()
+        return _legacy_radii(self.poly, center, angles)
+
+
+_BOUNDARY_TOPOLOGY_CODE = {
+    "limited": 1,
+    "single_null": 2,
+    "double_null": 3,
+    "multi_null": 4,
+}
+
+
+def _boundary_detail_payload(equilibrium: EquilibriumBoundary | None) -> dict[str, object]:
+    """Convert the canonical LCFS object to stable RunWriter arrays."""
+    if equilibrium is None:
+        return {}
+    quality = equilibrium.quality
+    return {
+        "boundary_topology_code": _BOUNDARY_TOPOLOGY_CODE[equilibrium.topology],
+        "boundary_axis": np.asarray(equilibrium.magnetic_axis.point, dtype=float),
+        "boundary_x_points": np.asarray([point.point for point in equilibrium.x_points], dtype=float).reshape(-1, 2),
+        "boundary_limiter_contacts": np.asarray([contact.point for contact in equilibrium.limiter_contacts], dtype=float).reshape(-1, 2),
+        "boundary_separatrix_branches": tuple(np.asarray(branch, dtype=float) for branch in equilibrium.separatrix_branches),
+        "boundary_fixed_angle_valid": bool(equilibrium.fixed_angle_projection.valid),
+        "boundary_fixed_angle_counts": np.asarray(equilibrium.fixed_angle_projection.intersection_counts, dtype=float),
+        "boundary_quality": np.asarray([
+            quality.max_flux_residual,
+            quality.normalized_flux_residual,
+            quality.closure_error,
+            quality.minimum_regular_gradient,
+            float(quality.limiter_violation_count),
+            float(quality.core_component_size),
+        ], dtype=float),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -840,6 +886,7 @@ def _initial_boundary_tracker(
     model: PlasmaModel | GpuPlasmaModel,
     psi_true: object,
     center: tuple[float, float],
+    angles: np.ndarray,
     target_mean_radius: float | None,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
@@ -862,6 +909,23 @@ def _initial_boundary_tracker(
     with run_profiler.time_block("initial_boundary"):
         _ = logger
         try:
+            if boundary_mode == "equilibrium_lcfs":
+                if limiter_shape is None:
+                    raise BoundaryNotFoundError("equilibrium_lcfs requires limiter geometry")
+                equilibrium = find_equilibrium_boundary(
+                    psi=np.asarray(_as_numpy_psi(psi_true), dtype=float),
+                    grid=model.grid,
+                    center=center,
+                    limiter_shape=np.asarray(limiter_shape, dtype=float),
+                    fixed_angles=np.asarray(angles, dtype=float),
+                )
+                return _BoundaryTracker(
+                    poly=np.asarray(equilibrium.core_boundary, dtype=float),
+                    level=float(equilibrium.psi_boundary),
+                    status=f"equilibrium_lcfs_{equilibrium.topology}_success",
+                    fail_reason=None,
+                    equilibrium=equilibrium,
+                )
             poly, level, status = find_plasma_boundary_with_status(
                 psi_true,
                 model.grid,
@@ -889,7 +953,7 @@ def _initial_boundary_tracker(
                 status=status,
                 fail_reason=None,
             )
-        except BoundaryNotFoundError as exc:
+        except (BoundaryNotFoundError, RuntimeError) as exc:
             return _BoundaryTracker(
                 poly=None,
                 level=float("nan"),
@@ -1081,6 +1145,7 @@ def _update_boundary_tracker(
     model: PlasmaModel | GpuPlasmaModel,
     psi_true: object,
     center: tuple[float, float],
+    angles: np.ndarray,
     refs: _StepRefs,
     limiter_shape: np.ndarray | None,
     boundary_mode: BoundaryMode,
@@ -1105,6 +1170,23 @@ def _update_boundary_tracker(
     with run_profiler.time_block("step_boundary_post"):
         _ = (logger, verbose, step_index)
         try:
+            if boundary_mode == "equilibrium_lcfs":
+                if limiter_shape is None:
+                    raise BoundaryNotFoundError("equilibrium_lcfs requires limiter geometry")
+                equilibrium = find_equilibrium_boundary(
+                    psi=np.asarray(_as_numpy_psi(psi_true), dtype=float),
+                    grid=model.grid,
+                    center=center,
+                    limiter_shape=np.asarray(limiter_shape, dtype=float),
+                    fixed_angles=np.asarray(angles, dtype=float),
+                )
+                tracker.poly = np.asarray(equilibrium.core_boundary, dtype=float)
+                tracker.level = float(equilibrium.psi_boundary)
+                tracker.status = f"equilibrium_lcfs_{equilibrium.topology}_success"
+                tracker.fail_reason = None
+                tracker.found = True
+                tracker.equilibrium = equilibrium
+                return
             poly, level, status = find_plasma_boundary_with_status(
                 psi_true,
                 model.grid,
@@ -1134,12 +1216,14 @@ def _update_boundary_tracker(
             tracker.status = status
             tracker.fail_reason = None
             tracker.found = True
-        except BoundaryNotFoundError as exc:
+            tracker.equilibrium = None
+        except (BoundaryNotFoundError, RuntimeError) as exc:
             tracker.poly = None
             tracker.level = float("nan")
             tracker.status = "not_found"
             tracker.fail_reason = str(exc)
             tracker.found = False
+            tracker.equilibrium = None
 
 
 def _build_step_record(
@@ -1158,7 +1242,7 @@ def _build_step_record(
 ) -> _StepRecord:
     """Собрать данные шага перед записью в RunWriter."""
     with run_profiler.time_block("step_radii_true"):
-        radii_true = _legacy_radii(tracker.poly, center, angles)
+        radii_true = tracker.radii(center=center, angles=angles)
     if sensors.true_radii is None or not np.allclose(np.asarray(sensors.true_radii, dtype=float), radii_true, equal_nan=True):
         sensors = SensorRealismResult(
             true_ip=sensors.true_ip,
@@ -1228,6 +1312,7 @@ def _write_step_record(
             radii_meas=sensors.measured_radii,
             boundary_poly_true=tracker.poly,
             boundary_poly_meas=sensors.measured_boundary_poly,
+            **_boundary_detail_payload(tracker.equilibrium),
         )
         event_payload = {
             "type": "step",
@@ -1243,6 +1328,18 @@ def _write_step_record(
             "norm_u_sol": float(np.linalg.norm(commands.sol_cmd)),
             "disturbances_applied": record.disturbances_applied,
         }
+        if tracker.equilibrium is not None:
+            equilibrium = tracker.equilibrium
+            event_payload.update({
+                "boundary_topology": equilibrium.topology,
+                "boundary_psi_axis": float(equilibrium.psi_axis),
+                "boundary_psi_boundary": float(equilibrium.psi_boundary),
+                "boundary_x_point_count": len(equilibrium.x_points),
+                "boundary_limiter_contact_count": len(equilibrium.limiter_contacts),
+                "boundary_fixed_angle_valid": bool(equilibrium.fixed_angle_projection.valid),
+                "boundary_fixed_angle_reason": equilibrium.fixed_angle_projection.reason,
+                "boundary_max_flux_residual": float(equilibrium.quality.max_flux_residual),
+            })
         event_payload.update(record.controller_diagnostics)
         writer.log_event(
             event_payload
@@ -1287,7 +1384,7 @@ def _run_single_step(
     """Выполнить один полный шаг замкнутой симуляции."""
     with run_profiler.time_block("step_scenario"):
         refs = _scenario_refs(scenario, angles, float(model.state.t))
-    radii_pre = _legacy_radii(tracker.poly, center, angles)
+    radii_pre = tracker.radii(center=center, angles=angles)
     sensors_pre = _sensor_measurements(
         realism=realism,
         model=model,
@@ -1351,6 +1448,7 @@ def _run_single_step(
         model=model,
         psi_true=psi_next,
         center=center,
+        angles=angles,
         refs=refs,
         limiter_shape=limiter_shape,
         boundary_mode=boundary_mode,
@@ -1371,7 +1469,7 @@ def _run_single_step(
         step_index=step_index,
         run_profiler=run_profiler,
     )
-    radii_post = _legacy_radii(tracker.poly, center, angles)
+    radii_post = tracker.radii(center=center, angles=angles)
     sensors_post = _sensor_measurements(
         realism=realism,
         model=model,
@@ -1541,9 +1639,20 @@ def _run_batched_gpu_fixed_angle_artifacts(
     )
     state = _state_from_batched_result(result, simulator)
     center = (float(cfg.physics.R0), float(cfg.physics.Z0))
-    base_radii = _fixed_angle_radii_from_result(result)
-    if not _fixed_angle_found_from_result(result):
-        base_radii = np.full((angles.shape[0],), np.nan, dtype=float)
+    canonical_boundary: EquilibriumBoundary | None = None
+    if cfg.boundary_mode == "equilibrium_lcfs":
+        canonical_boundary = find_equilibrium_boundary(
+            psi=np.asarray(state.psi, dtype=float),
+            grid=cfg.grid,
+            center=center,
+            limiter_shape=limiter_shape,
+            fixed_angles=angles,
+        )
+        base_radii = np.asarray(canonical_boundary.fixed_angle_projection.radii, dtype=float)
+    else:
+        base_radii = _fixed_angle_radii_from_result(result)
+        if not _fixed_angle_found_from_result(result):
+            base_radii = np.full((angles.shape[0],), np.nan, dtype=float)
     scenario = make_scenario(
         scenario_name,
         base_radii,
@@ -1581,7 +1690,12 @@ def _run_batched_gpu_fixed_angle_artifacts(
                 model_view.state = state_pre
                 radii_pre = _fixed_angle_radii_from_result(result)
                 found_pre = _fixed_angle_found_from_result(result)
-                poly_pre = _fixed_angle_polyline(center=center, angles=angles, radii=radii_pre, found=found_pre)
+                if cfg.boundary_mode == "equilibrium_lcfs":
+                    if canonical_boundary is None:
+                        raise RuntimeError("Canonical equilibrium boundary is unavailable")
+                    poly_pre = np.asarray(canonical_boundary.core_boundary, dtype=float)
+                else:
+                    poly_pre = _fixed_angle_polyline(center=center, angles=angles, radii=radii_pre, found=found_pre)
                 refs = _scenario_refs(scenario, angles, float(state_pre.t))
                 measured_currents_pre = np.concatenate([
                     np.asarray(state_pre.pfc_currents, dtype=float).reshape(-1),
@@ -1624,7 +1738,17 @@ def _run_batched_gpu_fixed_angle_artifacts(
                 model_view.state = state_post
                 radii_post = _fixed_angle_radii_from_result(result)
                 found_post = _fixed_angle_found_from_result(result)
-                poly_post = _fixed_angle_polyline(center=center, angles=angles, radii=radii_post, found=found_post)
+                if cfg.boundary_mode == "equilibrium_lcfs":
+                    canonical_boundary = find_equilibrium_boundary(
+                        psi=np.asarray(state_post.psi, dtype=float),
+                        grid=cfg.grid,
+                        center=center,
+                        limiter_shape=limiter_shape,
+                        fixed_angles=angles,
+                    )
+                    poly_post = np.asarray(canonical_boundary.core_boundary, dtype=float)
+                else:
+                    poly_post = _fixed_angle_polyline(center=center, angles=angles, radii=radii_post, found=found_post)
                 t_log = float(state_post.t)
                 ref_radii_log = np.asarray(scenario.ref_radii(angles, t_log), dtype=float)
                 ip_ref_log = float(scenario.Ip_ref(t_log))
@@ -1667,6 +1791,7 @@ def _run_batched_gpu_fixed_angle_artifacts(
                         radii_meas=np.asarray(radii_post, dtype=float).reshape(-1),
                         boundary_poly_true=poly_post,
                         boundary_poly_meas=poly_post,
+                        **_boundary_detail_payload(canonical_boundary),
                     )
                     event_payload = {
                         "type": "step",
@@ -1680,6 +1805,11 @@ def _run_batched_gpu_fixed_angle_artifacts(
                         "boundary_base_mode": str(cfg.boundary_base_mode),
                         "boundary_gpu_status_code": int(np.asarray(result.boundary.status_code.detach().cpu())[0]),
                         "boundary_gpu_level": float(np.asarray(result.boundary.level.detach().cpu())[0]),
+                        "boundary_topology": None if canonical_boundary is None else canonical_boundary.topology,
+                        "boundary_psi_boundary": None if canonical_boundary is None else float(canonical_boundary.psi_boundary),
+                        "boundary_x_point_count": 0 if canonical_boundary is None else len(canonical_boundary.x_points),
+                        "boundary_limiter_contact_count": 0 if canonical_boundary is None else len(canonical_boundary.limiter_contacts),
+                        "boundary_fixed_angle_valid": bool(found_post) if canonical_boundary is None else bool(canonical_boundary.fixed_angle_projection.valid),
                         "boundary_found": bool(found_post),
                         "boundary_fail_reason": None if found_post else "fixed-angle GPU boundary was not fully found",
                         "norm_u_pfc": float(np.linalg.norm(commands.pfc_cmd)),
@@ -1920,6 +2050,7 @@ def run(
         model=model,
         psi_true=psi_true,
         center=center,
+        angles=angles,
         target_mean_radius=initial_refs.target_mean_radius,
         limiter_shape=cfg_runtime.limiter_shape,
         boundary_mode=cfg_runtime.boundary_mode,

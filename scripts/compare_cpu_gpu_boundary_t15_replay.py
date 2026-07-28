@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from tokamak_control.core.grid import Grid1D, Grid2D
-from tokamak_control.geometry.boundary import find_plasma_boundary_with_status
+from tokamak_control.geometry.boundary import find_equilibrium_boundary, find_plasma_boundary_with_status
 from tokamak_control.geometry.legacy_metrics import legacy_radii_at_angles
 
 
@@ -82,6 +82,7 @@ def _fixed_angle_boundary(
         result.radii.detach().cpu().numpy(),
         result.found.detach().cpu().numpy().astype(bool),
         result.level.detach().cpu().numpy(),
+        result.topology_code.detach().cpu().numpy().astype(int),
     )
 
 
@@ -105,14 +106,14 @@ def main() -> int:
     center = (float(meta["center"]["R0"]), float(meta["center"]["Z0"]))
     limiter = np.asarray(meta["limiter"]["shape"], dtype=float).reshape(-1, 2)
     boundary_meta = meta.get("boundary", {})
-    boundary_mode = str(boundary_meta.get("mode", "legacy_contour_limited"))
+    boundary_mode = str(boundary_meta.get("mode", "equilibrium_lcfs"))
     if boundary_mode == "tracked_flux_contour":
         boundary_mode = str(boundary_meta.get("base_mode", "legacy_contour_limited"))
     angles = np.linspace(-np.pi, np.pi, 32, endpoint=False)
     chosen = _step_indices(int(psi_snaps.shape[0]), args.steps)
 
     psi_batch = psi_snaps[chosen]
-    gpu_points, gpu_radii, gpu_found, gpu_levels = _fixed_angle_boundary(
+    gpu_points, gpu_radii, gpu_found, gpu_levels, gpu_topology = _fixed_angle_boundary(
         psi_batch=psi_batch,
         grid=grid,
         center=center,
@@ -125,28 +126,45 @@ def main() -> int:
 
     cpu_polys: list[np.ndarray | None] = []
     cpu_levels: list[float] = []
+    cpu_topology: list[str] = []
     cpu_points: list[np.ndarray] = []
     cpu_radii: list[np.ndarray] = []
     dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1)
     for psi in psi_batch:
         try:
-            poly, level, _status = find_plasma_boundary_with_status(
-                psi,
-                grid,
-                center,
-                limiter_shape=limiter,
-                boundary_mode=boundary_mode,
-                boundary_base_mode="legacy_contour_limited",
-            )
-            radii = legacy_radii_at_angles(poly, center, angles)
+            if boundary_mode == "equilibrium_lcfs":
+                equilibrium = find_equilibrium_boundary(
+                    psi,
+                    grid,
+                    center,
+                    limiter_shape=limiter,
+                    fixed_angles=angles,
+                )
+                poly = equilibrium.core_boundary
+                level = equilibrium.psi_boundary
+                radii = equilibrium.fixed_angle_projection.radii
+                topology = equilibrium.topology
+            else:
+                poly, level, _status = find_plasma_boundary_with_status(
+                    psi,
+                    grid,
+                    center,
+                    limiter_shape=limiter,
+                    boundary_mode=boundary_mode,
+                    boundary_base_mode="legacy_contour_limited",
+                )
+                radii = legacy_radii_at_angles(poly, center, angles)
+                topology = "legacy"
             points = np.asarray(center, dtype=float).reshape(1, 2) + radii.reshape(-1, 1) * dirs
         except Exception:
             poly = None
             level = float("nan")
+            topology = "not_found"
             radii = np.full((angles.size,), np.nan, dtype=float)
             points = np.full((angles.size, 2), np.nan, dtype=float)
         cpu_polys.append(poly)
         cpu_levels.append(float(level))
+        cpu_topology.append(topology)
         cpu_radii.append(radii)
         cpu_points.append(points)
 
@@ -187,6 +205,7 @@ def main() -> int:
         max_mm = float(np.nanmax(np.abs(diff)) * 1000.0) if np.any(finite) else float("nan")
         rms_mm = float(np.sqrt(np.nanmean(diff * diff)) * 1000.0) if np.any(finite) else float("nan")
         ax2.set_title(
+            f"topology CPU={cpu_topology[row]}, GPU={int(gpu_topology[row])}; "
             f"level CPU={cpu_levels[row]:.4g}, GPU={gpu_levels[row]:.4g}; "
             f"|diff|max={max_mm:.2f} mm, rms={rms_mm:.2f} mm"
         )
@@ -199,7 +218,7 @@ def main() -> int:
             ax2.legend(lines + lines_b, labels + labels_b, loc="upper right", fontsize=8)
 
     subtitle = "CPU emulation of GPU path" if str(args.device) == "cpu" else "CUDA GPU path"
-    fig.suptitle(f"CPU contour vs {subtitle}\n{npz_path}", fontsize=12)
+    fig.suptitle(f"Canonical CPU LCFS vs {subtitle}\n{npz_path}", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=150)

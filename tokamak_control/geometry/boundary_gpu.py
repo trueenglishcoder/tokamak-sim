@@ -9,39 +9,30 @@ from tokamak_control.compute import require_gpu_available
 from tokamak_control.core.grid import Grid2D
 from tokamak_control.core.torch_sampling import bilinear_sample_torch_points
 from tokamak_control.geometry.boundary_common import BoundaryMode, BoundaryNotFoundError, BoundaryStatus
-from tokamak_control.geometry.boundary_suchkov import (
-    SUCHKOV_CONTROL_COUNT,
-    SUCHKOV_SEARCH_ITERATIONS,
-    SUCHKOV_VALIDATION_COUNT,
-    SuchkovSplineTorchPlan,
-    build_suchkov_spline_torch_plan,
-    interpolate_closed_curve_torch,
-    uniform_periodic_angles,
-)
 
 
 @dataclass(slots=True)
 class FixedAngleBoundaryGpuResult:
-    """Результат поиска границы плазмы на GPU."""
+    """Fixed-angle projection and topology of the physical GPU LCFS."""
 
     found: object
     status_code: object
+    topology_code: object
     level: object
     points: object
     radii: object
     axis_points: object
+    x_points: object
 
 
 @dataclass(frozen=True, slots=True, repr=True)
 class FixedAngleBoundaryGpuGeometry:
-    """Предвычисленная геометрия фиксированных лучей для GPU-поиска."""
+    """Precomputed limiter geometry used by batched GPU LCFS extraction."""
 
     angles: object
     limiter: object
     max_radii: object
-    suchkov_plan: SuchkovSplineTorchPlan | None
-    suchkov_control_max_radii: object | None
-    suchkov_limiter_samples: object | None
+    limiter_samples: object
 
 
 def _torch(device: str):
@@ -60,11 +51,12 @@ def prepare_fixed_angle_boundary_gpu_geometry(
     gpu_device: str,
     dtype: object,
 ) -> FixedAngleBoundaryGpuGeometry:
-    """Предвычислить неизменную геометрию лучей и сплайна на GPU."""
+    """Precompute fixed limiter samples and configured-angle ray limits."""
     torch = _torch(gpu_device)
     device = torch.device(gpu_device)
     angles = torch.as_tensor(angles_rad, dtype=dtype, device=device).reshape(-1)
-    limiter = torch.as_tensor(limiter_shape, dtype=dtype, device=device).reshape(-1, 2)
+    limiter_np = np.asarray(limiter_shape, dtype=np.float64).reshape(-1, 2)
+    limiter = torch.as_tensor(limiter_np, dtype=dtype, device=device).reshape(-1, 2)
     if int(limiter.shape[0]) < 3:
         raise BoundaryNotFoundError("fixed-angle GPU geometry requires limiter geometry")
     max_radii = _ray_limit_radii(
@@ -73,40 +65,17 @@ def prepare_fixed_angle_boundary_gpu_geometry(
         angles=angles,
         limiter=limiter,
     )
-    plan = None
-    control_limits = None
-    limiter_samples = None
-    if str(boundary_mode) == "suchkov_spline_contour":
-        dense_angles = torch.as_tensor(
-            uniform_periodic_angles(SUCHKOV_VALIDATION_COUNT),
-            dtype=dtype,
-            device=device,
-        )
-        plan = build_suchkov_spline_torch_plan(
-            dense_angles,
-            control_count=SUCHKOV_CONTROL_COUNT,
-        )
-        control_limits = _ray_limit_radii(
-            grid=grid,
-            center=torch.as_tensor(center, dtype=dtype, device=device),
-            angles=torch.as_tensor(plan.control_angles, dtype=dtype, device=device),
-            limiter=limiter,
-        )
-        limiter_samples = torch.as_tensor(
-            _sample_closed_polyline_numpy(
-                np.asarray(limiter_shape, dtype=np.float64),
-                _suchkov_limiter_sample_count(np.asarray(limiter_shape, dtype=np.float64), grid),
-            ),
-            dtype=dtype,
-            device=device,
-        )
+    sample_count = max(_limiter_sample_count(limiter_np, grid), 256)
+    limiter_samples = torch.as_tensor(
+        _sample_closed_polyline_numpy(limiter_np, sample_count),
+        dtype=dtype,
+        device=device,
+    )
     return FixedAngleBoundaryGpuGeometry(
         angles=angles,
         limiter=limiter,
         max_radii=max_radii,
-        suchkov_plan=plan,
-        suchkov_control_max_radii=control_limits,
-        suchkov_limiter_samples=limiter_samples,
+        limiter_samples=limiter_samples,
     )
 
 
@@ -160,15 +129,13 @@ def fixed_angle_boundary_gpu(
     continuity_weight_radii: float = 1.0,
     continuity_weight_mean_radius: float = 0.3,
     continuity_weight_level: float = 0.1,
-    suchkov_plan: SuchkovSplineTorchPlan | None = None,
     prepared_geometry: FixedAngleBoundaryGpuGeometry | None = None,
 ) -> FixedAngleBoundaryGpuResult:
-    """CUDA fixed-angle boundary samples for batched RL training.
+    """Compute the batched fixed-angle projection used by RL.
 
-    This mirrors the active legacy boundary *signal* used by RL: center-origin
-    radii at configured angles. It does not try to build full contour polygons.
-    ``legacy_contour_limited`` means "legacy contour that fits inside the
-    limiter", not "limiter-touching contour".
+    ``equilibrium_lcfs`` selects the wall- or saddle-limited flux level and
+    returns topology and subgrid critical-point data. The canonical dense LCFS
+    is produced by the CPU extractor for artifacts and validation.
     """
     torch = _torch(gpu_device)
     field = torch.as_tensor(psi, device=gpu_device)
@@ -178,11 +145,11 @@ def fixed_angle_boundary_gpu(
     dtype = field.dtype
     device = field.device
     mode = str(boundary_mode)
-    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}:
+    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "equilibrium_lcfs"}:
         raise ValueError(f"unsupported boundary_mode for fixed_angle_boundary_gpu: {boundary_mode!r}")
 
     center_t = torch.tensor(center, dtype=dtype, device=device).reshape(1, 2).repeat(B, 1)
-    use_limiter = mode in {"legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}
+    use_limiter = mode in {"legacy_contour_limited", "tracked_flux_contour", "equilibrium_lcfs"}
     if prepared_geometry is not None:
         angles = torch.as_tensor(prepared_geometry.angles, dtype=dtype, device=device).reshape(-1)
         limiter_t = torch.as_tensor(prepared_geometry.limiter, dtype=dtype, device=device).reshape(-1, 2)
@@ -201,6 +168,12 @@ def fixed_angle_boundary_gpu(
     if use_limiter and (limiter_t is None or int(limiter_t.shape[0]) < 3):
         raise BoundaryNotFoundError(f"{mode} requires limiter geometry")
     center_level = _sample_points(field, grid, center_t[:, None, :]).reshape(B)
+    axis_points = center_t
+    axis_level = center_level
+    axis_kind = torch.zeros((B,), dtype=torch.int64, device=device)
+    axis_valid = torch.ones((B,), dtype=torch.bool, device=device)
+    if mode == "equilibrium_lcfs":
+        axis_points, axis_level, axis_kind, axis_valid = _axis_search(field, grid, center, limiter_t)
 
     tracked = None
     if mode == "tracked_flux_contour" and prev_level is not None and prev_points is not None and prev_radii is not None:
@@ -222,39 +195,30 @@ def fixed_angle_boundary_gpu(
             continuity_weight_level=float(continuity_weight_level),
         )
 
-    if mode == "suchkov_spline_contour":
-        active_plan = suchkov_plan
-        if active_plan is None and prepared_geometry is not None:
-            active_plan = prepared_geometry.suchkov_plan
-        if active_plan is None:
-            dense_angles = torch.as_tensor(
-                uniform_periodic_angles(SUCHKOV_VALIDATION_COUNT),
+    topology_code = torch.zeros((B,), dtype=torch.int64, device=device)
+    selected_x_points = torch.full((B, 8, 2), float("nan"), dtype=dtype, device=device)
+    if mode == "equilibrium_lcfs":
+        limiter_samples = (
+            torch.as_tensor(prepared_geometry.limiter_samples, dtype=dtype, device=device)
+            if prepared_geometry is not None
+            else torch.as_tensor(
+                _sample_closed_polyline_numpy(np.asarray(limiter_shape, dtype=np.float64), 256),
                 dtype=dtype,
                 device=device,
             )
-            active_plan = build_suchkov_spline_torch_plan(
-                dense_angles,
-                control_count=SUCHKOV_CONTROL_COUNT,
-            )
-        reset = _suchkov_fixed_angle_search(
+        )
+        reset, topology_code, selected_x_points = _equilibrium_lcfs_fixed_angle_search(
             psi=field,
             grid=grid,
-            center_points=center_t,
-            center_level=center_level,
+            axis_points=axis_points,
+            projection_center=center_t,
+            axis_level=axis_level,
+            axis_kind=axis_kind,
+            axis_valid=axis_valid,
             measurement_angles=angles,
             limiter=limiter_t,
+            limiter_samples=limiter_samples,
             ray_samples=int(ray_samples),
-            plan=active_plan,
-            precomputed_control_max_radii=(
-                prepared_geometry.suchkov_control_max_radii
-                if prepared_geometry is not None
-                else None
-            ),
-            precomputed_limiter_samples=(
-                prepared_geometry.suchkov_limiter_samples
-                if prepared_geometry is not None
-                else None
-            ),
         )
     else:
         reset = _legacy_fixed_angle_search(
@@ -271,9 +235,14 @@ def fixed_angle_boundary_gpu(
 
     if tracked is None:
         points, radii, found, level = reset
+        success_code = (
+            topology_code + 7
+            if mode == "equilibrium_lcfs"
+            else torch.full((B,), 4 if mode == "tracked_flux_contour" else 2, dtype=torch.int64, device=device)
+        )
         status_code = torch.where(
             found,
-            torch.full((B,), 7 if mode == "suchkov_spline_contour" else (4 if mode == "tracked_flux_contour" else 2), dtype=torch.int64, device=device),
+            success_code,
             torch.zeros((B,), dtype=torch.int64, device=device),
         )
         if bool(soft_level_selection) and mode in {"legacy_contour", "legacy_contour_limited"}:
@@ -356,10 +325,12 @@ def fixed_angle_boundary_gpu(
     return FixedAngleBoundaryGpuResult(
         found=found,
         status_code=status_code,
+        topology_code=topology_code,
         level=level,
         points=points,
         radii=radii,
-        axis_points=center_t,
+        axis_points=axis_points,
+        x_points=selected_x_points,
     )
 
 
@@ -419,7 +390,7 @@ def _ray_limit_radii(*, grid: Grid2D, center, angles, limiter):
     return torch.min(torch.stack(candidates, dim=0), dim=0).values
 
 
-def _suchkov_limiter_sample_count(limiter_shape: np.ndarray, grid: Grid2D) -> int:
+def _limiter_sample_count(limiter_shape: np.ndarray, grid: Grid2D) -> int:
     """Выбрать дискретизацию лимитера не грубее половины ячейки сетки."""
     points = np.asarray(limiter_shape, dtype=np.float64).reshape(-1, 2)
     if points.shape[0] < 3:
@@ -431,14 +402,6 @@ def _suchkov_limiter_sample_count(limiter_shape: np.ndarray, grid: Grid2D) -> in
     if not np.isfinite(perimeter) or perimeter <= 0.0 or not np.isfinite(grid_step) or grid_step <= 0.0:
         return 256
     return int(np.clip(np.ceil(perimeter / grid_step), 256, 2048))
-
-
-def _suchkov_containment_tolerance(grid: Grid2D) -> float:
-    """Численный допуск для условия ``Gamma subset closure(Omega_limiter)``."""
-    cell = float(max(abs(float(grid.r.step)), abs(float(grid.z.step))))
-    if not np.isfinite(cell) or cell <= 0.0:
-        return 1.0e-7
-    return max(1.0e-7, 1.0e-5 * cell)
 
 
 def _cross2(a, b):
@@ -752,321 +715,391 @@ def _tracked_fixed_angle_boundary(
     return best_points, best_radii, best_found, best_level
 
 
-def _axis_search(psi, grid: Grid2D, center: tuple[float, float], limiter):
+def _equilibrium_lcfs_fixed_angle_search(
+    *,
+    psi,
+    grid: Grid2D,
+    axis_points,
+    projection_center,
+    axis_level,
+    axis_kind,
+    axis_valid,
+    measurement_angles,
+    limiter,
+    limiter_samples,
+    ray_samples: int,
+):
+    """Vectorized LCFS topology and fixed-angle projection for RL batches.
+
+    The canonical dense boundary is produced by the CPU extractor. This path
+    evaluates the same wall-versus-saddle flux rule directly on batched tensors
+    and returns only the derived fixed-angle signal required by training.
+    """
     torch = __import__("torch")
+    B = int(psi.shape[0])
+    dtype = psi.dtype
+    device = psi.device
+    orientation = -axis_kind.to(dtype=dtype)
+    flux_scale = torch.amax(psi, dim=(1, 2)) - torch.amin(psi, dim=(1, 2))
+    flux_floor = torch.clamp(flux_scale * 1.0e-9, min=torch.finfo(dtype).eps)
+
+    limiter_batch = limiter_samples.reshape(1, -1, 2).expand(B, -1, -1)
+    limiter_values = _sample_points(psi, grid, limiter_batch)
+    wall_chi_raw = orientation[:, None] * (limiter_values - axis_level[:, None])
+    positive_wall = torch.isfinite(wall_chi_raw) & (wall_chi_raw > flux_floor[:, None])
+    local_wall_minimum = (
+        positive_wall
+        & (wall_chi_raw <= torch.roll(wall_chi_raw, shifts=1, dims=1))
+        & (wall_chi_raw <= torch.roll(wall_chi_raw, shifts=-1, dims=1))
+    )
+    wall_score = torch.where(local_wall_minimum, wall_chi_raw, torch.full_like(wall_chi_raw, float("inf")))
+    wall_candidate_count = min(16, int(wall_score.shape[1]))
+    wall_chi_candidates, wall_indices = torch.topk(
+        wall_score, k=wall_candidate_count, dim=1, largest=False
+    )
+    wall_candidate_valid = torch.zeros((B, wall_candidate_count), dtype=torch.bool, device=device)
+    wall_candidate_levels = axis_level[:, None] + orientation[:, None] * wall_chi_candidates
+    wall_points = limiter_samples[wall_indices]
+    validation_t = torch.linspace(0.0, 1.0, max(int(ray_samples), 128), dtype=dtype, device=device)
+    for candidate_index in range(wall_candidate_count):
+        candidate_level = wall_candidate_levels[:, candidate_index]
+        points, _radii, crossing_found, counts = _ray_crossings_with_counts(
+            psi=psi,
+            grid=grid,
+            axis_points=projection_center,
+            level=candidate_level,
+            axis_kind=axis_kind,
+            angles=measurement_angles,
+            limiter=limiter,
+            ray_samples=ray_samples,
+        )
+        inside = torch.all(
+            _points_in_or_on_polygon_torch(
+                points,
+                limiter,
+                tolerance=1.5 * max(float(grid.r.step), float(grid.z.step)),
+            ),
+            dim=1,
+        )
+        single_valued = torch.all(counts == 1, dim=1)
+
+        contact_point = wall_points[:, candidate_index, :]
+        contact_line = projection_center[:, None, :] + validation_t[None, :, None] * (
+            contact_point - projection_center
+        )[:, None, :]
+        contact_values = _sample_points(psi, grid, contact_line)
+        contact_condition = torch.where(
+            axis_kind[:, None] > 0,
+            contact_values <= candidate_level[:, None],
+            contact_values >= candidate_level[:, None],
+        ) & torch.isfinite(contact_values)
+        transitions = (~contact_condition[:, :-1]) & contact_condition[:, 1:]
+        transition_count = torch.sum(transitions.to(torch.int64), dim=1)
+        first_index = torch.argmax(transitions.to(torch.int64), dim=1)
+        first_fraction = validation_t[torch.clamp(first_index + 1, max=int(validation_t.numel()) - 1)]
+        contact_tolerance = 3.0 / float(max(int(validation_t.numel()) - 1, 1))
+        reaches_contact = (transition_count == 1) & (first_fraction >= 1.0 - contact_tolerance)
+        wall_candidate_valid[:, candidate_index] = (
+            torch.isfinite(wall_chi_candidates[:, candidate_index])
+            & crossing_found
+            & inside
+            & single_valued
+            & reaches_contact
+        )
+
+    valid_wall_chi = torch.where(
+        wall_candidate_valid, wall_chi_candidates, torch.full_like(wall_chi_candidates, float("inf"))
+    )
+    wall_chi, best_wall_index = torch.min(valid_wall_chi, dim=1)
+    wall_level = wall_candidate_levels[torch.arange(B, device=device), best_wall_index]
+
+    x_points, x_levels, x_valid = _xpoint_candidates_gpu(
+        psi,
+        grid,
+        axis_points=axis_points,
+        axis_level=axis_level,
+        orientation=orientation,
+        max_points=8,
+    )
+    K = int(x_levels.shape[1])
+    x_chi = orientation[:, None] * (x_levels - axis_level[:, None])
+    x_chi = torch.where(
+        x_valid & torch.isfinite(x_chi) & (x_chi > flux_floor[:, None]),
+        x_chi,
+        torch.full_like(x_chi, float("inf")),
+    )
+
+    candidate_valid = torch.zeros((B, K), dtype=torch.bool, device=device)
+    for candidate_index in range(K):
+        candidate_level = x_levels[:, candidate_index]
+        points, _radii, found, counts = _ray_crossings_with_counts(
+            psi=psi,
+            grid=grid,
+            axis_points=projection_center,
+            level=candidate_level,
+            axis_kind=axis_kind,
+            angles=measurement_angles,
+            limiter=limiter,
+            ray_samples=ray_samples,
+        )
+        inside = torch.all(
+            _points_in_or_on_polygon_torch(points, limiter, tolerance=1.5 * max(float(grid.r.step), float(grid.z.step))),
+            dim=1,
+        )
+        candidate_valid[:, candidate_index] = x_valid[:, candidate_index] & found & inside
+
+    valid_x_chi = torch.where(candidate_valid, x_chi, torch.full_like(x_chi, float("inf")))
+    best_x_chi, best_x_index = torch.min(valid_x_chi, dim=1)
+    has_x = torch.isfinite(best_x_chi)
+    has_wall = torch.isfinite(wall_chi)
+    use_x = has_x & ((best_x_chi < wall_chi) | ~has_wall)
+    selected_chi = torch.where(use_x, best_x_chi, wall_chi)
+    selected_level = axis_level + orientation * selected_chi
+
+    points, radii, crossing_found, counts = _ray_crossings_with_counts(
+        psi=psi,
+        grid=grid,
+        axis_points=projection_center,
+        level=selected_level,
+        axis_kind=axis_kind,
+        angles=measurement_angles,
+        limiter=limiter,
+        ray_samples=ray_samples,
+    )
+    inside = torch.all(
+        _points_in_or_on_polygon_torch(points, limiter, tolerance=1.5 * max(float(grid.r.step), float(grid.z.step))),
+        dim=1,
+    )
+    found = axis_valid & torch.isfinite(selected_chi) & crossing_found & inside
+
+    topology_code = torch.where(
+        found & ~use_x,
+        torch.ones((B,), dtype=torch.int64, device=device),
+        torch.zeros((B,), dtype=torch.int64, device=device),
+    )
+    selected_x = torch.full((B, K, 2), float("nan"), dtype=dtype, device=device)
+    if K > 0:
+        relative_tolerance = torch.maximum(2.0e-4 * selected_chi, 1.0e-10 * flux_scale)
+        same_level = candidate_valid & (torch.abs(x_chi - selected_chi[:, None]) <= relative_tolerance[:, None])
+        same_level_count = torch.sum(same_level.to(torch.int64), dim=1)
+        topology_code = torch.where(
+            found & use_x,
+            torch.where(
+                same_level_count >= 3,
+                torch.full((B,), 4, dtype=torch.int64, device=device),
+                torch.where(
+                    same_level_count == 2,
+                    torch.full((B,), 3, dtype=torch.int64, device=device),
+                    torch.full((B,), 2, dtype=torch.int64, device=device),
+                ),
+            ),
+            topology_code,
+        )
+        for batch_index in range(B):
+            if not bool(use_x[batch_index]):
+                continue
+            indices = torch.nonzero(same_level[batch_index], as_tuple=False).reshape(-1)
+            count = min(int(indices.numel()), K)
+            if count:
+                selected_x[batch_index, :count, :] = x_points[batch_index, indices[:count], :]
+
+    points = torch.where(found[:, None, None], points, torch.full_like(points, float("nan")))
+    radii = torch.where(found[:, None], radii, torch.full_like(radii, float("nan")))
+    selected_level = torch.where(found, selected_level, torch.full_like(selected_level, float("nan")))
+    return (points, radii, found, selected_level), topology_code, selected_x
+
+
+def _xpoint_candidates_gpu(
+    psi,
+    grid: Grid2D,
+    *,
+    axis_points,
+    axis_level,
+    orientation,
+    max_points: int,
+):
+    torch = __import__("torch")
+    import torch.nn.functional as F
+
     B, nz, nr = psi.shape
+    dz = float(grid.z.step)
+    dr = float(grid.r.step)
+    grad_z, grad_r = torch.gradient(psi, spacing=(dz, dr), dim=(1, 2))
+    dzz, dzr = torch.gradient(grad_z, spacing=(dz, dr), dim=(1, 2))
+    drz, drr = torch.gradient(grad_r, spacing=(dz, dr), dim=(1, 2))
+    drz = 0.5 * (drz + dzr)
+    grad2 = grad_r * grad_r + grad_z * grad_z
+    det = drr * dzz - drz * drz
+    pooled = -F.max_pool2d((-grad2).unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1)
+    local_min = grad2 <= pooled + torch.finfo(psi.dtype).eps * 16.0
+    interior = torch.zeros_like(local_min)
+    interior[:, 1:-1, 1:-1] = True
+    saddle = local_min & interior & (det < 0.0) & torch.isfinite(grad2)
+    score = torch.where(saddle, grad2, torch.full_like(grad2, float("inf")))
+    K = min(max(int(max_points), 1), int(nz * nr))
+    values, flat = torch.topk(score.reshape(B, -1), k=K, dim=1, largest=False)
+    jj = flat // nr
+    ii = flat % nr
+    batch = torch.arange(B, device=psi.device)[:, None]
     r0 = float(grid.r.coords()[0])
     z0 = float(grid.z.coords()[0])
-    r = torch.linspace(r0, r0 + float(grid.r.step) * (int(grid.r.size) - 1), int(grid.r.size), dtype=psi.dtype, device=psi.device)
-    z = torch.linspace(z0, z0 + float(grid.z.step) * (int(grid.z.size) - 1), int(grid.z.size), dtype=psi.dtype, device=psi.device)
-    Z, R = torch.meshgrid(z, r, indexing="ij")
-    c = torch.tensor(center, dtype=psi.dtype, device=psi.device)
-    dist = (R - c[0]) ** 2 + (Z - c[1]) ** 2
-    finite = torch.isfinite(psi)
-    # Select the nearer of the strongest max/min around the configured center.
-    max_val = torch.where(finite, psi, torch.full_like(psi, -torch.inf))
-    min_val = torch.where(finite, psi, torch.full_like(psi, torch.inf))
-    max_flat = torch.argmax(max_val.reshape(B, -1), dim=1)
-    min_flat = torch.argmin(min_val.reshape(B, -1), dim=1)
-    max_j = max_flat // nr; max_i = max_flat % nr
-    min_j = min_flat // nr; min_i = min_flat % nr
-    b = torch.arange(B, device=psi.device)
-    max_d = dist[max_j, max_i]
-    min_d = dist[min_j, min_i]
-    use_max = max_d <= min_d
-    i = torch.where(use_max, max_i, min_i)
-    j = torch.where(use_max, max_j, min_j)
-    points = torch.stack([r[i], z[j]], dim=1)
-    levels = psi[b, j, i]
-    kind = torch.where(use_max, torch.ones((B,), dtype=torch.int64, device=psi.device), -torch.ones((B,), dtype=torch.int64, device=psi.device))
-    return points, levels, kind
+    points = torch.stack((r0 + ii.to(psi.dtype) * dr, z0 + jj.to(psi.dtype) * dz), dim=2)
 
+    g_r = grad_r[batch, jj, ii]
+    g_z = grad_z[batch, jj, ii]
+    h_rr = drr[batch, jj, ii]
+    h_rz = drz[batch, jj, ii]
+    h_zz = dzz[batch, jj, ii]
+    determinant = h_rr * h_zz - h_rz * h_rz
+    safe_det = torch.where(torch.abs(determinant) > torch.finfo(psi.dtype).eps, determinant, torch.ones_like(determinant))
+    delta_r = (h_zz * g_r - h_rz * g_z) / safe_det
+    delta_z = (-h_rz * g_r + h_rr * g_z) / safe_det
+    delta_r = torch.clamp(delta_r, -dr, dr)
+    delta_z = torch.clamp(delta_z, -dz, dz)
+    points[:, :, 0] -= delta_r
+    points[:, :, 1] -= delta_z
+    levels = _sample_points(psi, grid, points)
+    finite = torch.isfinite(values) & torch.isfinite(levels) & (determinant < 0.0)
+
+    samples = torch.linspace(0.0, 1.0, 64, dtype=psi.dtype, device=psi.device)
+    line = axis_points[:, None, None, :] + samples[None, None, :, None] * (points[:, :, None, :] - axis_points[:, None, None, :])
+    line_values = _sample_points(psi, grid, line.reshape(B, K * 64, 2)).reshape(B, K, 64)
+    delta = levels - axis_level[:, None]
+    safe_delta = torch.where(torch.abs(delta) > torch.finfo(psi.dtype).eps, delta, torch.ones_like(delta))
+    normalized = (line_values - axis_level[:, None, None]) / safe_delta[:, :, None]
+    monotonic = (
+        torch.all(torch.isfinite(normalized), dim=2)
+        & (torch.amin(normalized, dim=2) >= -0.02)
+        & (torch.amax(normalized, dim=2) <= 1.02)
+        & (torch.sum((torch.diff(normalized, dim=2) < -0.02).to(torch.int64), dim=2) <= 2)
+    )
+    positive = orientation[:, None] * delta > torch.finfo(psi.dtype).eps
+    valid = finite & monotonic & positive
+    dedup_distance = 0.75 * max(float(grid.r.step), float(grid.z.step))
+    for index in range(K):
+        if index == 0:
+            continue
+        distances = torch.linalg.norm(points[:, index : index + 1, :] - points[:, :index, :], dim=2)
+        duplicate = torch.any(valid[:, :index] & (distances <= dedup_distance), dim=1)
+        valid[:, index] = valid[:, index] & ~duplicate
+    return points, levels, valid
+
+
+def _ray_crossings_with_counts(
+    *,
+    psi,
+    grid: Grid2D,
+    axis_points,
+    level,
+    axis_kind,
+    angles,
+    limiter,
+    ray_samples: int,
+):
+    torch = __import__("torch")
+    B = int(psi.shape[0])
+    A = int(angles.numel())
+    sample_count = max(int(ray_samples), 64)
+    directions = torch.stack((torch.cos(angles), torch.sin(angles)), dim=1)
+    max_radius = torch.max(torch.linalg.norm(limiter[None, :, :] - axis_points[:, None, :], dim=2), dim=1).values
+    t = torch.linspace(0.0, 1.0, sample_count, dtype=psi.dtype, device=psi.device)
+    radius_grid = max_radius[:, None, None] * t[None, None, :]
+    points = axis_points[:, None, None, :] + radius_grid[..., None] * directions[None, :, None, :]
+    values = _sample_points(psi, grid, points.reshape(B, A * sample_count, 2)).reshape(B, A, sample_count)
+    condition = torch.where(
+        axis_kind[:, None, None] > 0,
+        values <= level[:, None, None],
+        values >= level[:, None, None],
+    ) & torch.isfinite(values)
+    transitions = (~condition[:, :, :-1]) & condition[:, :, 1:]
+    counts = torch.sum(transitions.to(torch.int64), dim=2)
+    first_transition = torch.argmax(transitions.to(torch.int64), dim=2)
+    has = counts > 0
+    idx0 = first_transition
+    idx1 = torch.clamp(first_transition + 1, max=sample_count - 1)
+    batch = torch.arange(B, device=psi.device)[:, None]
+    angle_index = torch.arange(A, device=psi.device)[None, :]
+    v0 = values[batch, angle_index, idx0]
+    v1 = values[batch, angle_index, idx1]
+    r0 = radius_grid[batch, 0, idx0]
+    r1 = radius_grid[batch, 0, idx1]
+    denominator = torch.where(torch.abs(v1 - v0) > 1.0e-30, v1 - v0, torch.ones_like(v1))
+    fraction = torch.clamp((level[:, None] - v0) / denominator, 0.0, 1.0)
+    radii = r0 + fraction * (r1 - r0)
+    radii = torch.where(has, radii, torch.full_like(radii, float("nan")))
+    boundary_points = axis_points[:, None, :] + radii[..., None] * directions[None, :, :]
+    found = torch.all(has, dim=1)
+    return boundary_points, radii, found, counts
+
+def _axis_search(psi, grid: Grid2D, center: tuple[float, float], limiter):
+    """Locate the nearest subgrid magnetic O-point in every batch lane."""
+    torch = __import__("torch")
+    import torch.nn.functional as F
+
+    B, nz, nr = psi.shape
+    dr = float(grid.r.step)
+    dz = float(grid.z.step)
+    r0 = float(grid.r.coords()[0])
+    z0 = float(grid.z.coords()[0])
+    r = torch.arange(nr, dtype=psi.dtype, device=psi.device) * dr + r0
+    z = torch.arange(nz, dtype=psi.dtype, device=psi.device) * dz + z0
+    Z, R = torch.meshgrid(z, r, indexing="ij")
+    grid_points = torch.stack((R.reshape(-1), Z.reshape(-1)), dim=1)
+    if limiter is not None:
+        inside = _points_in_polygon_torch(
+            grid_points.reshape(1, -1, 2).expand(B, -1, -1), limiter
+        ).reshape(B, nz, nr)
+    else:
+        inside = torch.ones((B, nz, nr), dtype=torch.bool, device=psi.device)
+
+    finite = torch.isfinite(psi) & inside
+    local_max = psi >= F.max_pool2d(psi.unsqueeze(1), 3, stride=1, padding=1).squeeze(1)
+    local_min = psi <= -F.max_pool2d((-psi).unsqueeze(1), 3, stride=1, padding=1).squeeze(1)
+    interior = torch.zeros_like(finite)
+    interior[:, 1:-1, 1:-1] = True
+
+    grad_z, grad_r = torch.gradient(psi, spacing=(dz, dr), dim=(1, 2))
+    dzz, dzr = torch.gradient(grad_z, spacing=(dz, dr), dim=(1, 2))
+    drz, drr = torch.gradient(grad_r, spacing=(dz, dr), dim=(1, 2))
+    drz = 0.5 * (drz + dzr)
+    determinant = drr * dzz - drz * drz
+    maximum = local_max & (determinant > 0.0) & (drr < 0.0) & (dzz < 0.0)
+    minimum = local_min & (determinant > 0.0) & (drr > 0.0) & (dzz > 0.0)
+    candidates = finite & interior & (maximum | minimum)
+
+    center_t = torch.tensor(center, dtype=psi.dtype, device=psi.device)
+    distance2 = (R - center_t[0]) ** 2 + (Z - center_t[1]) ** 2
+    score = torch.where(candidates, distance2.unsqueeze(0), torch.full_like(psi, float("inf")))
+    flat = torch.argmin(score.reshape(B, -1), dim=1)
+    valid = torch.isfinite(torch.min(score.reshape(B, -1), dim=1).values)
+    jj = flat // nr
+    ii = flat % nr
+    batch = torch.arange(B, device=psi.device)
+    kind = torch.where(
+        maximum[batch, jj, ii],
+        torch.ones((B,), dtype=torch.int64, device=psi.device),
+        -torch.ones((B,), dtype=torch.int64, device=psi.device),
+    )
+
+    g_r = grad_r[batch, jj, ii]
+    g_z = grad_z[batch, jj, ii]
+    h_rr = drr[batch, jj, ii]
+    h_rz = drz[batch, jj, ii]
+    h_zz = dzz[batch, jj, ii]
+    det = h_rr * h_zz - h_rz * h_rz
+    safe = torch.where(torch.abs(det) > torch.finfo(psi.dtype).eps, det, torch.ones_like(det))
+    delta_r = torch.clamp((h_zz * g_r - h_rz * g_z) / safe, -dr, dr)
+    delta_z = torch.clamp((-h_rz * g_r + h_rr * g_z) / safe, -dz, dz)
+    points = torch.stack((r[ii] - delta_r, z[jj] - delta_z), dim=1)
+    levels = _sample_points(psi, grid, points[:, None, :]).reshape(B)
+    valid = valid & torch.isfinite(levels) & (det > 0.0)
+    points = torch.where(valid[:, None], points, torch.full_like(points, float("nan")))
+    levels = torch.where(valid, levels, torch.full_like(levels, float("nan")))
+    return points, levels, kind, valid
 
 def _sample_limiter_psi(psi, grid, limiter):
     from tokamak_control.core.torch_sampling import bilinear_sample_torch
     return bilinear_sample_torch(psi, grid, limiter)
-
-
-def _xpoint_level(psi, grid: Grid2D, axis_points):
-    torch = __import__("torch")
-    B, nz, nr = psi.shape
-    dz = float(grid.z.step); dr = float(grid.r.step)
-    grad_z, grad_r = torch.gradient(psi, spacing=(dz, dr), dim=(1, 2))
-    score = grad_z[:, 1:-1, 1:-1] ** 2 + grad_r[:, 1:-1, 1:-1] ** 2
-    flat = torch.argmin(score.reshape(B, -1), dim=1)
-    jj = flat // (nr - 2) + 1
-    ii = flat % (nr - 2) + 1
-    b = torch.arange(B, device=psi.device)
-    level = psi[b, jj, ii]
-    has = torch.isfinite(level)
-    return level, has
-
-
-def _ray_crossings(psi, grid: Grid2D, axis_points, level, axis_kind, angles, limiter, *, ray_samples: int):
-    torch = __import__("torch")
-    B = int(psi.shape[0]); A = int(angles.numel())
-    dirs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
-    max_radius = torch.max(torch.linalg.norm(limiter[None, :, :] - axis_points[:, None, :], dim=2), dim=1).values
-    t = torch.linspace(0.0, 1.0, int(ray_samples), dtype=psi.dtype, device=psi.device)
-    radii_grid = max_radius[:, None, None] * t[None, None, :]
-    pts = axis_points[:, None, None, :] + radii_grid[..., None] * dirs[None, :, None, :]
-    pts_flat = pts.reshape(B, A * int(ray_samples), 2)
-    vals = bilinear_sample_torch_points(psi, grid, pts_flat).reshape(B, A, int(ray_samples))
-    lv = level[:, None, None]
-    if torch.any(axis_kind > 0):
-        cond_max = vals <= lv
-        cond_min = vals >= lv
-        cond = torch.where((axis_kind[:, None, None] > 0), cond_max, cond_min)
-    else:
-        cond = vals >= lv
-    cond = cond & torch.isfinite(vals)
-    first_idx = torch.argmax(cond.to(torch.int64), dim=2)
-    has = torch.any(cond, dim=2)
-    idx0 = torch.clamp(first_idx - 1, 0, int(ray_samples) - 1)
-    idx1 = first_idx
-    b = torch.arange(B, device=psi.device)[:, None]
-    a = torch.arange(A, device=psi.device)[None, :]
-    v0 = vals[b, a, idx0]
-    v1 = vals[b, a, idx1]
-    r0 = radii_grid[b, 0, idx0]
-    r1 = radii_grid[b, 0, idx1]
-    denom = torch.where(torch.abs(v1 - v0) > 1e-30, v1 - v0, torch.ones_like(v1))
-    frac = torch.clamp((level[:, None] - v0) / denom, 0.0, 1.0)
-    radii = r0 + frac * (r1 - r0)
-    radii = torch.where(has, radii, torch.full_like(radii, float("nan")))
-    points = axis_points[:, None, :] + radii[..., None] * dirs[None, :, :]
-    found = torch.all(has, dim=1)
-    return points, radii, found
-
-
-
-def _suchkov_fixed_angle_search(
-    *,
-    psi,
-    grid: Grid2D,
-    center_points,
-    center_level,
-    measurement_angles,
-    limiter,
-    ray_samples: int,
-    plan: SuchkovSplineTorchPlan,
-    precomputed_control_max_radii=None,
-    precomputed_limiter_samples=None,
-):
-    """Найти максимальную по ширине допустимую сплайновую линию уровня ``psi``.
-
-    Поиск выполняется в нормированной координате между значением потока в
-    центре плазмы и внешним численным пределом диапазона ``psi`` на лимитере.
-    Двоичный поиск находит самую внешнюю допустимую поверхность. Для вложенных
-    магнитных поверхностей она одновременно имеет максимальную горизонтальную
-    ширину. Касание лимитера не является условием допустимости.
-    """
-    torch = __import__("torch")
-    if limiter is None or int(limiter.shape[0]) < 3:
-        raise BoundaryNotFoundError("suchkov_spline_contour requires limiter geometry")
-    batch_size = int(psi.shape[0])
-    control_angles = torch.as_tensor(
-        plan.control_angles,
-        dtype=psi.dtype,
-        device=psi.device,
-    ).reshape(-1)
-    if precomputed_control_max_radii is None:
-        control_limits = _ray_limit_radii(
-            grid=grid,
-            center=center_points[0],
-            angles=control_angles,
-            limiter=limiter,
-        )
-    else:
-        control_limits = torch.as_tensor(
-            precomputed_control_max_radii,
-            dtype=psi.dtype,
-            device=psi.device,
-        ).reshape(-1)
-    if precomputed_limiter_samples is None:
-        limiter_samples = torch.as_tensor(
-            _sample_closed_polyline_numpy(
-                limiter.detach().cpu().numpy(),
-                _suchkov_limiter_sample_count(limiter.detach().cpu().numpy(), grid),
-            ),
-            dtype=psi.dtype,
-            device=psi.device,
-        )
-    else:
-        limiter_samples = torch.as_tensor(
-            precomputed_limiter_samples,
-            dtype=psi.dtype,
-            device=psi.device,
-        ).reshape(-1, 2)
-
-    axis_kind = _center_extremum_kind(
-        psi=psi,
-        grid=grid,
-        center_points=center_points,
-        center_level=center_level,
-    )
-    limiter_values = _sample_points(
-        psi,
-        grid,
-        limiter_samples.reshape(1, -1, 2).expand(batch_size, -1, -1),
-    )
-    search_limit, search_limit_found = _suchkov_search_limits(
-        limiter_values=limiter_values,
-        center_level=center_level,
-        axis_kind=axis_kind,
-    )
-
-    lower_fraction = torch.zeros((batch_size,), dtype=psi.dtype, device=psi.device)
-    upper_fraction = torch.ones((batch_size,), dtype=psi.dtype, device=psi.device)
-    best_level = torch.full(
-        (batch_size,),
-        float("nan"),
-        dtype=psi.dtype,
-        device=psi.device,
-    )
-    best_polyline = torch.full(
-        (batch_size, int(plan.output_angles.numel()), 2),
-        float("nan"),
-        dtype=psi.dtype,
-        device=psi.device,
-    )
-    best_width = torch.full(
-        (batch_size,),
-        -float("inf"),
-        dtype=psi.dtype,
-        device=psi.device,
-    )
-    best_found = torch.zeros((batch_size,), dtype=torch.bool, device=psi.device)
-
-    containment_tolerance = _suchkov_containment_tolerance(grid)
-
-    for _ in range(SUCHKOV_SEARCH_ITERATIONS):
-        fraction = 0.5 * (lower_fraction + upper_fraction)
-        level = center_level + fraction * (search_limit - center_level)
-        control_points, _control_radii, control_found = _center_ray_crossings(
-            psi=psi,
-            grid=grid,
-            center_points=center_points,
-            center_level=center_level,
-            level=level,
-            angles=control_angles,
-            max_radii=control_limits,
-            ray_samples=ray_samples,
-        )
-        spline_polyline = interpolate_closed_curve_torch(
-            control_points,
-            plan.interpolation_matrix,
-        )
-        inside_limiter = torch.all(
-            _points_in_or_on_polygon_torch(
-                spline_polyline,
-                limiter,
-                tolerance=containment_tolerance,
-            ),
-            dim=1,
-        )
-        axis_inside = _points_in_batched_polygons_torch(
-            center_points,
-            spline_polyline,
-        )
-        width = torch.max(spline_polyline[:, :, 0], dim=1).values - torch.min(
-            spline_polyline[:, :, 0],
-            dim=1,
-        ).values
-        accepted = (
-            search_limit_found
-            & control_found
-            & inside_limiter
-            & axis_inside
-            & torch.isfinite(level)
-            & torch.isfinite(width)
-        )
-        improve = accepted & (width > best_width)
-        best_level = torch.where(improve, level, best_level)
-        best_polyline = torch.where(
-            improve[:, None, None],
-            spline_polyline,
-            best_polyline,
-        )
-        best_width = torch.where(improve, width, best_width)
-        best_found = best_found | improve
-        lower_fraction = torch.where(accepted, fraction, lower_fraction)
-        upper_fraction = torch.where(accepted, upper_fraction, fraction)
-
-    points, radii, measurement_found = _radii_from_closed_polylines_torch(
-        best_polyline,
-        center_points,
-        measurement_angles,
-    )
-    found = best_found & measurement_found
-    points = torch.where(
-        found[:, None, None],
-        points,
-        torch.full_like(points, float("nan")),
-    )
-    radii = torch.where(
-        found[:, None],
-        radii,
-        torch.full_like(radii, float("nan")),
-    )
-    level = torch.where(
-        found,
-        best_level,
-        torch.full_like(best_level, float("nan")),
-    )
-    return points, radii, found, level
-
-
-def _center_extremum_kind(*, psi, grid: Grid2D, center_points, center_level):
-    """Определить знак экстремума потока около заданного центра плазмы."""
-    torch = __import__("torch")
-    offsets = torch.tensor(
-        [
-            [float(grid.r.step), 0.0],
-            [-float(grid.r.step), 0.0],
-            [0.0, float(grid.z.step)],
-            [0.0, -float(grid.z.step)],
-        ],
-        dtype=psi.dtype,
-        device=psi.device,
-    )
-    neighbours = center_points[:, None, :] + offsets[None, :, :]
-    values = _sample_points(psi, grid, neighbours)
-    neighbour_mean = torch.nanmean(values, dim=1)
-    return torch.where(
-        center_level >= neighbour_mean,
-        torch.ones_like(center_level, dtype=torch.int64),
-        -torch.ones_like(center_level, dtype=torch.int64),
-    )
-
-
-def _suchkov_search_limits(*, limiter_values, center_level, axis_kind):
-    """Вернуть внешний численный предел поиска уровней ``psi``.
-
-    Значения на ограничителе используются только как диапазон поиска. Они не
-    задают обязательный уровень контакта и не участвуют в приёмке кандидата.
-    """
-    torch = __import__("torch")
-    finite = torch.isfinite(limiter_values)
-    center = center_level[:, None]
-    below = finite & (limiter_values < center)
-    above = finite & (limiter_values > center)
-    min_below = torch.min(
-        torch.where(below, limiter_values, torch.full_like(limiter_values, float("inf"))),
-        dim=1,
-    ).values
-    max_above = torch.max(
-        torch.where(above, limiter_values, torch.full_like(limiter_values, -float("inf"))),
-        dim=1,
-    ).values
-    use_maximum = axis_kind > 0
-    search_limit = torch.where(use_maximum, min_below, max_above)
-    found = torch.where(
-        use_maximum,
-        torch.isfinite(min_below),
-        torch.isfinite(max_above),
-    )
-    return search_limit, found
 
 
 def _sample_closed_polyline_numpy(polyline: np.ndarray, count: int) -> np.ndarray:
@@ -1144,64 +1177,3 @@ def _points_in_or_on_polygon_torch(points, polygon, *, tolerance: float):
         return inside
     distance = _point_to_polygon_distances_torch(points, polygon)
     return inside | (distance <= float(tolerance))
-
-
-def _points_in_batched_polygons_torch(points, polygons):
-    """Проверить принадлежность одной точки каждому полигону batch."""
-    torch = __import__("torch")
-    closed = torch.cat([polygons, polygons[:, :1, :]], dim=1)
-    x = points[:, 0, None]
-    y = points[:, 1, None]
-    x0 = closed[:, :-1, 0]
-    y0 = closed[:, :-1, 1]
-    x1 = closed[:, 1:, 0]
-    y1 = closed[:, 1:, 1]
-    crosses = (y0 > y) != (y1 > y)
-    denominator = y1 - y0
-    safe = torch.where(
-        torch.abs(denominator) > torch.finfo(points.dtype).eps,
-        denominator,
-        torch.ones_like(denominator),
-    )
-    x_cross = x0 + (y - y0) * (x1 - x0) / safe
-    crossing_count = torch.sum((crosses & (x_cross > x)).to(torch.int64), dim=1)
-    return (crossing_count % 2) == 1
-
-
-def _radii_from_closed_polylines_torch(polylines, centers, angles):
-    """Пересечь фиксированные лучи с batch замкнутых сплайновых ломаных."""
-    torch = __import__("torch")
-    batch_size = int(polylines.shape[0])
-    angle_count = int(angles.numel())
-    closed = torch.cat([polylines, polylines[:, :1, :]], dim=1)
-    segment_starts = closed[:, :-1, :]
-    segment_vectors = closed[:, 1:, :] - closed[:, :-1, :]
-    directions = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
-    relative = segment_starts[:, None, :, :] - centers[:, None, None, :]
-    ray = directions[None, :, None, :]
-    segment = segment_vectors[:, None, :, :]
-    denominator = _cross2(ray, segment)
-    numerator_t = _cross2(relative, segment)
-    numerator_u = _cross2(relative, ray)
-    valid_denominator = torch.abs(denominator) > torch.finfo(polylines.dtype).eps * 128.0
-    safe = torch.where(valid_denominator, denominator, torch.ones_like(denominator))
-    t_ray = numerator_t / safe
-    u_segment = numerator_u / safe
-    valid = (
-        valid_denominator
-        & (t_ray >= 0.0)
-        & (u_segment >= -1.0e-9)
-        & (u_segment <= 1.0 + 1.0e-9)
-    )
-    hits = torch.where(valid, t_ray, torch.full_like(t_ray, -float("inf")))
-    radii = torch.max(hits, dim=2).values
-    found = torch.all(torch.isfinite(radii) & (radii >= 0.0), dim=1)
-    radii = torch.where(
-        torch.isfinite(radii),
-        radii,
-        torch.full_like(radii, float("nan")),
-    )
-    points = centers[:, None, :] + radii[..., None] * directions[None, :, :]
-    if tuple(points.shape) != (batch_size, angle_count, 2):
-        raise RuntimeError("unexpected fixed-angle spline intersection shape")
-    return points, radii, found

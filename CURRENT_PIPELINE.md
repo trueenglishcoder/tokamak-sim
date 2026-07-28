@@ -4,39 +4,36 @@
 
 ## Plant Contract
 
-- Public simulator/control input is absolute next-step coil current:
-  `step_currents(J_next)`.
+- Public simulator/control input is absolute next-step coil current: `step_currents(J_next)`.
 - The simulator derives `Jdot = (J_next - J_now) / t_step` internally.
-- `Ip` is advanced step by step. `psi` is composed from the updated `Ip` and
-  coil contributions.
+- `Ip` is advanced step by step and `psi` is composed from updated plasma and coil contributions.
 - Exact replay does not apply hidden plant-side current clipping.
 
-## Active Boundary Experiment
+## Active Boundary Contract
 
-The active experiment uses:
+The active T15 machine config uses:
 
 ```text
-data/t15_data_new_trim50_ip_calibrated/
-boundary mode = suchkov_spline_contour
+boundary mode = equilibrium_lcfs
 angles = 32
 ```
 
-The new mode selects the outermost admissible closed `psi` surface and
-represents its coordinates as periodic cubic splines `R(xi)` and `Z(xi)`.
-The implementation is described in `docs/suchkov-spline-boundary.md`.
+`psi(R,Z)` is treated as the known equilibrium supplied by the simulator. The
+canonical boundary is the dense last closed flux surface of the connected
+primary core. The extractor finds subgrid O- and X-points, evaluates limiter and
+saddle candidates outward from the primary axis, automatically classifies
+limited or diverted topology, and preserves separatrix branches at X-points.
 
-The old successful 100M run remains the baseline. It used
-`legacy_contour_limited` with `legacy_precision_index2 = 1e-6` and must not be
-rewritten or mixed with the new replay and oracle artifacts.
+The 32 radii are derived from the dense LCFS for RL. They are not used to
+construct or smooth the physical boundary. Their single-valued validity and
+per-ray intersection counts are stored explicitly.
 
-## Experiment Flow
+The full algorithm and artifact schema are documented in
+`docs/plasma_boundary_calculation.txt`.
 
-1. Rebuild T15 replays for shots `3856`, `3857`, `3858`, `3863`, and `3864`
-   from the calibrated `Ip +15%` data.
-2. Build replay-window oracle targets using shots `3856`, `3857`, `3858`, and
-   `3863` for training and shot `3864` as holdout.
-3. Train the same 8-GPU MPO configuration and reward weights as the successful
-   baseline for 50M environment steps.
+## Historical Artifact Separation
 
-All new replay, oracle, configuration, output, and W&B names use a distinct
-`ip15_suchkov` prefix.
+Existing directories and run names containing `ip15_suchkov` are historical
+identifiers. They were generated with the removed `suchkov_spline_contour`
+geometry and must not be mixed with new `equilibrium_lcfs` replay, oracle, or
+training artifacts.

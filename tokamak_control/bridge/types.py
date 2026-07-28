@@ -105,6 +105,14 @@ class StepSnapshot:
     psi_boundary_value: float | None
     boundary_found: bool
     boundary_reason: str | None
+    boundary_topology: str | None
+    magnetic_axis: np.ndarray | None
+    x_points: np.ndarray
+    limiter_contacts: np.ndarray
+    separatrix_branches: tuple[np.ndarray, ...]
+    fixed_angle_valid: bool | None
+    fixed_angle_reason: str | None
+    boundary_quality: Mapping[str, float | int] | None
     current_limit_margin: np.ndarray | None
     derivative_limit_margin: np.ndarray | None
 

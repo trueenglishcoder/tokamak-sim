@@ -34,7 +34,7 @@ finalize RunWriter artifacts
 
 `tokamak_control/bridge/` exposes a small reset/step session for external tools that need simulator state without invoking the artifact CLI. `SimulationSession` loads the same TOML configs, builds the same `PlasmaModel`, uses the same scenario system, accepts physical active-coil current derivatives, advances the model, and updates the physical boundary through `tokamak_control/geometry/boundary.py`.
 
-The bridge returns frozen dataclass snapshots with active-coil order, references, true and measured `Ip`, true and measured active currents, commanded/applied derivatives, true and measured boundary polylines, true and measured sampled radii, and boundary-failure status. It does not own training algorithms, neural-network dependencies, policy loaders, plotting, or run-directory management.
+The bridge returns frozen dataclass snapshots with active-coil order, references, true and measured `Ip`, true and measured active currents, commanded/applied derivatives, dense boundary polylines, topology, axis, X-points, limiter contacts, separatrix branches, fixed-angle validity, sampled radii, quality metrics, and boundary-failure status. It does not own training algorithms, neural-network dependencies, policy loaders, plotting, or run-directory management.
 
 `tokamak_control/metrics/` contains pure numerical diagnostics such as plasma-current error, sampled-radii RMSE, and actuator limit margins. These metrics are intentionally separate from rewards or controller objectives.
 
@@ -63,15 +63,40 @@ The current state is represented by `tokamak_control/core/plasma_state.py`.
 
 ## Boundary And Geometry
 
-`tokamak_control/geometry/boundary.py` extracts a physical plasma boundary contour from `psi`. The default `limited` mode finds the magnetic axis, samples the configured limiter, and returns the flux surface that first contacts that limiter. The `diverted` mode finds an X-point and returns the closed separatrix contour at the X-point flux level.
+`tokamak_control/geometry/boundary.py` consumes a fully known `psi(R,Z)` field.
+It does not reconstruct an equilibrium from diagnostic measurements. The active
+`equilibrium_lcfs` mode automatically determines whether the connected primary
+core is limiter-limited or bounded by one or more X-point separatrices.
 
-If the selected rule cannot find a valid boundary, the finder raises `BoundaryNotFoundError`. During a simulation run this is treated as a clean physical stop: the runner records a `boundary_missing` event, finalizes partial artifacts, and reports the step/reason. The old largest-contour heuristic is not considered a plasma boundary.
+The canonical CPU path is split into explicit components:
 
-`tokamak_control/geometry/limiters.py` stores named limiter polygons. T15MD configs use `[limiter] name = "T15MD"` so the limiter geometry is part of simulation behavior, not just a drawing overlay.
+- `equilibrium_field.py`: bicubic field, gradient, Hessian, and level projection
+- `critical_points.py`: subgrid O/X refinement and Hessian classification
+- `level_set_graph.py`: topology-preserving level-set graph and branch cycles
+- `lcfs.py`: wall/saddle candidate ordering, core validation, and result object
+- `boundary_projection.py`: dense-boundary projection to fixed-angle RL radii
 
-`tokamak_control/geometry/coordinates.py` converts boundary polylines into radii sampled at measurement angles. Controllers and metrics use these sampled radii, while artifacts also store the found boundary polylines.
+The dense LCFS is the geometric source of truth. X-points are explicit graph
+nodes and no global smoothing spline is fitted through them. Fixed-angle radii
+are accepted as a valid representation only when every ray has exactly one
+forward boundary intersection.
 
-`tokamak_control/geometry/parametric_boundary.py` contains the analytic reference-boundary primitive for `(R0, Z0, A0, kappa, delta)`. It validates generated boundaries, checks self-intersections and limiter containment, stores the robust replay-derived T15 value/rate limits, and generates deterministic rate-limited parameter trajectories for synthetic references. `tokamak_control/config/ip_trajectories.py` is the equivalent primitive for Ip references: real table loading, seeded template perturbation, table writing, and clamped interpolation.
+The batched GPU path computes the derived fixed-angle signal, topology code,
+boundary level, axis, and selected X-points. Single-lane artifact runs also use
+the canonical CPU extractor so stored boundaries and videos contain the dense
+physical contour.
+
+If no candidate forms a physical boundary of the connected primary core, the
+finder raises `BoundaryNotFoundError`. The runner records a physical boundary
+loss and finalizes partial artifacts. It does not substitute a circle, cached
+contour, largest polygon, or smoothed sparse-radius curve.
+
+`tokamak_control/geometry/limiters.py` stores named material limiter polygons.
+T15MD configs use `[limiter] name = "T15MD"`.
+
+`tokamak_control/geometry/parametric_boundary.py` remains the analytic reference
+boundary primitive for `(R0, Z0, A0, kappa, delta)`. It is separate from the
+physical LCFS extractor.
 
 ## Scenarios
 
@@ -123,5 +148,21 @@ Important NPZ channels include:
 - `Ip`, `Ip_meas`: true and measured plasma current when measured channels are recorded
 - `pfc_currents`, `pfc_currents_meas`, `sol_currents`, `sol_currents_meas`: true and measured active currents when measured channels are recorded
 - `radii_true`, `radii_meas`, `radii_ref`: sampled boundary radii
+- `boundary_topology_code`, `boundary_axis`, `boundary_x_points`: topology and critical-point state
+- `boundary_limiter_contacts`, `boundary_separatrix_branches`: material contacts and diverted branches
+- `boundary_fixed_angle_valid`, `boundary_fixed_angle_counts`: explicit radial-representation contract
+- `boundary_quality`: flux, closure, gradient, containment, and core-connectivity diagnostics
 
 Plotting helpers in `tokamak_control/viz/plotting.py` consume saved artifacts rather than reconstructing state from live Python objects or recomputing a separate plotting boundary.
+
+
+## Batched GPU boundary contract
+
+`equilibrium_lcfs` has one physical definition. The CPU implementation owns the
+dense LCFS graph, explicit X-point nodes, separatrix branches, and limiter
+contacts. The batched GPU implementation computes the first-exit fixed-angle
+projection of that same primary-core boundary together with topology, boundary
+level, magnetic axis, and X-point tensors. It does not create a second smoothed
+or fixed-ray physical boundary. Single-lane artifacts are always populated from
+the canonical CPU dense extractor, and parity tests enforce agreement of the
+derived tensor signal.

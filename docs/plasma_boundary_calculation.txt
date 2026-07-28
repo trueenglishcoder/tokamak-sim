@@ -1,122 +1,170 @@
-Plasma Boundary Calculation In This Project
-===========================================
+Plasma Boundary Extraction From A Known Equilibrium
+====================================================
 
-This document describes the current plasma-boundary calculation rule.
+Scope
+-----
 
-The main code paths are:
+This subsystem does not reconstruct an equilibrium from magnetic diagnostics.
+It receives a fully known poloidal-flux field psi(R, Z) from the simulator or an
+upstream equilibrium system and extracts the physical boundary of the connected
+primary plasma core.
 
+The active mode is:
+
+    boundary.mode = "equilibrium_lcfs"
+
+The caller does not select limited or diverted topology. The extractor
+classifies it from the field and limiter geometry on every call.
+
+Canonical modules
+-----------------
+
+- tokamak_control/geometry/equilibrium_field.py
+- tokamak_control/geometry/critical_points.py
+- tokamak_control/geometry/level_set_graph.py
+- tokamak_control/geometry/lcfs.py
+- tokamak_control/geometry/boundary_projection.py
 - tokamak_control/geometry/boundary.py
-- tokamak_control/geometry/xpoints.py
-- tokamak_control/cli/run_simulation.py
-- tokamak_control/viz/plotting.py
-- scripts/run_simulation_artifacts.py
 
-
-1. Boundary definition
-----------------------
-
-The project supports two physical boundary modes:
-
-- limited
-- diverted
-
-The default mode is limited.
-
-In limited mode, the boundary is the closed flux surface that first contacts the configured limiter. The limiter is the magenta machine contour shown on T15MD output plots.
-
-In diverted mode, the boundary is the separatrix:
-
-    psi(R, Z) = psi_X
-
-where psi_X is the flux value at an X-point, and the returned contour is the closed contour at that level that encloses the magnetic axis.
-
-The boundary finder does not use a largest-contour drawing heuristic as a valid plasma boundary.
-
-
-2. Algorithm
-------------
-
-The public entry point is:
-
-- find_plasma_boundary_with_status(...)
-
-The common setup is:
-
-1. Validate that the psi array shape matches the grid.
-2. Prepare the optional limiter polygon.
-3. Find the magnetic axis as the nearest local psi extremum to the configured center.
-
-In limited mode:
-
-1. Sample psi along the limiter.
-2. Order the limiter psi levels from the magnetic axis outward:
-   - for a maximum-axis equilibrium, higher limiter psi levels are tested first
-   - for a minimum-axis equilibrium, lower limiter psi levels are tested first
-3. Extract contours at each candidate contact level in that physical order.
-4. Keep only contours that:
-   - are closed
-   - enclose the magnetic axis
-   - touch the limiter
-   - stay inside or on the limiter polygon
-5. Return the first valid limiter-contact contour.
-
-In diverted mode:
-
-1. Find candidate X-points in the sampled psi field.
-2. For each X-point, extract contours at that X-point's nearest-grid psi value.
-3. Keep only contours that:
-   - are closed
-   - enclose the magnetic axis
-   - pass near the X-point
-   - fit inside the limiter polygon when a limiter is configured
-4. Return the valid separatrix candidate.
-
-Success statuses are:
-
-- limited_success
-- separatrix_success
-
-If the selected physical rule cannot find a valid candidate, the finder raises `BoundaryNotFoundError`.
-
-
-3. No runtime substitute
------------------------
-
-The simulation does not invent a boundary when the selected physical rule cannot find one. It does not create a circle, reuse a cached contour, or draw any other non-physical contour.
-
-When boundary loss happens during a run, `run_simulation` stops the loop cleanly, records a `boundary_missing` event, finalizes partial artifacts, and reports the step/reason. This is a physical stop condition, not a Python crash.
-
-
-4. Limiter role
----------------
-
-The magenta geometry in T15MD plots is the limiter. Configurations should use:
-
-    [limiter]
-    name = "T15MD"
-
-The limiter is a physical input to limited mode and an admissibility constraint for diverted mode.
-
-
-5. Stored boundaries
---------------------
-
-Run artifacts store the physical boundary polylines found during simulation:
-
-- boundary_poly_true
-- boundary_poly_meas
-
-These are NaN-padded numeric arrays in `run*.npz`. Plotting and frame rendering consume these stored boundaries instead of recomputing a separate plotting boundary.
-
-
-6. What is not used
+Physical definition
 -------------------
 
-The boundary finder does not use:
+The plasma core is the connected family of closed flux surfaces containing the
+primary magnetic O-point. Its last closed flux surface is limited by whichever
+outward event occurs first:
 
-- largest closed contour inside the limiter
-- longest closed contour on the grid
-- previous boundary continuity as a success criterion
-- target reference radius as an optimization target
+1. a flux surface contacts the material limiter, or
+2. a relevant magnetic saddle produces a separatrix through an X-point.
 
-Previous boundary information may still be passed through existing call sites, but it does not define a successful boundary.
+This yields one of the following topology values:
+
+- limited
+- single_null
+- double_null
+- multi_null
+
+Algorithm
+---------
+
+1. Build a bicubic continuous representation of the known grid field. The
+   interpolant supplies psi, its gradient, and its Hessian.
+2. Generate stationary-point seeds from grid-local gradient minima and cells
+   where both gradient components change sign.
+3. Refine each seed by damped Newton iterations on grad(psi) = 0.
+4. Classify subgrid stationary points by Hessian eigenvalues:
+   equal-sign eigenvalues give O-points and opposite-sign eigenvalues give
+   X-points.
+5. Select the primary O-point from the configured center hint and reject
+   unrelated X-points whose axis-to-saddle path leaves the same flux interval.
+6. Continuously minimize oriented flux along every limiter segment to generate
+   wall-contact candidates.
+7. Group relevant X-points by flux level to generate single-, double-, or
+   multi-null candidates.
+8. Order wall and X-point candidate levels outward from the primary axis.
+9. At each candidate level, extract the complete level-set graph with
+   contourpy. Project regular points back onto psi = psi_boundary using the
+   continuous field.
+10. Resolve the connected cycle enclosing the primary O-point and lying inside
+    the limiter. X-points are explicit graph nodes. Branches are split at those
+    nodes and are not passed through a global smoothing spline.
+11. Validate the connected core region, limiter containment, flux residual,
+    closure, and critical-point topology.
+12. Return the first valid outward candidate as the LCFS.
+
+Limited topology
+----------------
+
+A limited boundary is the first core flux surface that contacts the limiter.
+Limiter extrema are refined continuously along each limiter segment. The result
+stores the contact coordinates and source segment index.
+
+Diverted topology
+-----------------
+
+A diverted boundary is the separatrix at a relevant X-point flux. The X-point
+is retained as a non-regular node. The core cycle and remaining separatrix
+branches are stored independently, so a single smooth tangent is never imposed
+through a saddle.
+
+Fixed-angle RL representation
+-----------------------------
+
+The dense physical boundary is the source of truth. Fixed-angle radii are a
+derived control representation computed only after the dense LCFS exists.
+
+Each center-origin ray is intersected with the dense boundary. A radial
+representation is valid only when every ray has exactly one forward
+intersection. Missing and multiple intersections are counted and stored.
+The implementation never silently chooses one branch and declares a non-star-
+shaped boundary valid.
+
+CPU and GPU roles
+-----------------
+
+The CPU implementation is canonical. It returns the dense LCFS, topology,
+critical points, contacts, branches, projection, and quality metrics.
+
+The batched GPU path returns the derived fixed-angle signal, boundary level,
+topology code, axis, and selected X-points for RL throughput. Single-lane run
+artifacts and videos additionally execute the canonical CPU extractor against
+the same field so stored and plotted geometry is the dense physical LCFS rather
+than a polygon reconstructed from the GPU radii.
+
+Stored artifact channels
+------------------------
+
+- boundary_poly_true
+- boundary_topology_code
+- boundary_axis
+- boundary_x_points
+- boundary_limiter_contacts
+- boundary_separatrix_branches
+- boundary_fixed_angle_valid
+- boundary_fixed_angle_counts
+- boundary_quality
+- radii_true
+
+The six boundary_quality columns are, in order:
+
+1. maximum flux residual
+2. normalized flux residual
+3. closure error
+4. minimum regular gradient magnitude
+5. limiter violation count
+6. connected core component size
+
+Batched GPU execution
+---------------------
+
+The canonical physical result is the CPU dense level-set graph. The batched GPU
+path computes the derived primary-core radial signal without constructing dense
+branch graphs for every lane. It uses the first outward exit from the configured
+projection center at the selected wall or X-point boundary level. It also returns
+the refined magnetic axis, selected X-point coordinates, topology code, boundary
+level, and per-angle radii.
+
+This is a public representation contract, not a fallback boundary definition.
+Single-lane artifacts and video are generated from the canonical CPU dense LCFS
+computed from the same psi field. CPU/GPU parity tests require equal topology,
+boundary level within tolerance, and fixed-angle radii within grid-scale error.
+If the canonical dense LCFS is not single-valued on the configured rays, its
+fixed-angle projection is explicitly invalid even when a tensor first-exit signal
+can be evaluated.
+
+Failure behavior
+----------------
+
+The extractor does not invent a circle, reuse a previous contour, smooth sparse
+radii into a replacement boundary, or accept the largest available polygon as
+a fallback. If no candidate forms a physical boundary of the primary core, the
+call fails with an explicit reason and the run handles boundary loss as a
+physical stop condition.
+
+Removed mode
+------------
+
+suchkov_spline_contour was removed. It sampled a known level set on fixed rays
+and replaced it with a periodic cubic spline. That curve was not guaranteed to
+remain on the chosen psi level and could smooth away X-point topology. Configs
+using that name fail with a migration message instead of silently selecting a
+new algorithm.

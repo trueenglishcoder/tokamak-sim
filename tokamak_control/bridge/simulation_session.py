@@ -12,7 +12,13 @@ from tokamak_control.core.coils import CoilGroup
 from tokamak_control.config.scenarios import Scenario, ScenarioName, make_scenario
 from tokamak_control.core.gpu_plasma_model import GpuPlasmaModel
 from tokamak_control.core.plasma_model import PlasmaModel
-from tokamak_control.geometry.boundary import BoundaryMode, BoundaryNotFoundError, find_plasma_boundary_with_status
+from tokamak_control.geometry.boundary import (
+    BoundaryMode,
+    BoundaryNotFoundError,
+    EquilibriumBoundary,
+    find_equilibrium_boundary,
+    find_plasma_boundary_with_status,
+)
 from tokamak_control.geometry.legacy_metrics import legacy_radii_at_angles
 from tokamak_control.io.config_io import LoadedConfig, apply_initial_state, load_config, load_initial_state, require_initial_state
 from tokamak_control.metrics import current_limit_margin, derivative_limit_margin
@@ -63,6 +69,7 @@ class SimulationSession:
         self._boundary_poly: np.ndarray | None = None
         self._boundary_level: float | None = None
         self._boundary_status: str | None = None
+        self._equilibrium_boundary: EquilibriumBoundary | None = None
         self._last_commanded = np.zeros((0,), dtype=float)
         self._last_applied = np.zeros((0,), dtype=float)
         self._terminated = False
@@ -138,34 +145,30 @@ class SimulationSession:
         psi0 = _model_compute_psi_for_boundary(model)
         boundary_found = True
         boundary_reason = None
+        equilibrium_boundary: EquilibriumBoundary | None = None
         try:
-            boundary_poly, boundary_level, boundary_status = find_plasma_boundary_with_status(
-                psi0,
-                model.grid,
-                center,
-                n_levels=80 if cfg.limiter_shape is not None else 10,
-                limiter_shape=cfg.limiter_shape,
-                boundary_mode=cfg.boundary_mode,
-                boundary_base_mode=cfg.boundary_base_mode,
-                legacy_precision_index2=cfg.boundary_legacy_precision_index2,
-                track_level=cfg.boundary_track_level,
-                level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
-                level_search_span_fraction=cfg.boundary_level_search_span_fraction,
-                continuity_weight_radii=cfg.boundary_continuity_weight_radii,
-                continuity_weight_mean_radius=cfg.boundary_continuity_weight_mean_radius,
-                continuity_weight_center=cfg.boundary_continuity_weight_center,
-                continuity_weight_area=cfg.boundary_continuity_weight_area,
-                continuity_weight_level=cfg.boundary_continuity_weight_level,
-                compute_backend=cfg.compute.backend,
-                gpu_device=cfg.compute.gpu_device,
+            boundary_poly, boundary_level, boundary_status, equilibrium_boundary = _extract_session_boundary(
+                cfg=cfg,
+                model=model,
+                psi=psi0,
+                center=center,
+                angles=angles_rad,
+                prev_level=None,
+                prev_poly=None,
+                target_mean_radius=None,
             )
-            base_radii = legacy_radii_at_angles(boundary_poly, center, angles_rad)
-        except BoundaryNotFoundError as exc:
+            base_radii = (
+                np.asarray(equilibrium_boundary.fixed_angle_projection.radii, dtype=float)
+                if equilibrium_boundary is not None
+                else legacy_radii_at_angles(boundary_poly, center, angles_rad)
+            )
+        except (BoundaryNotFoundError, RuntimeError, ValueError) as exc:
             boundary_found = False
             boundary_reason = str(exc)
             boundary_poly = None
             boundary_level = None
             boundary_status = "not_found"
+            equilibrium_boundary = None
             base_radii = np.zeros_like(angles_rad, dtype=float)
         scenario = make_scenario(
             self.scenario_name,
@@ -193,6 +196,7 @@ class SimulationSession:
         self._boundary_poly = None if boundary_poly is None else np.asarray(boundary_poly, dtype=float)
         self._boundary_level = None if boundary_level is None else float(boundary_level)
         self._boundary_status = str(boundary_status)
+        self._equilibrium_boundary = equilibrium_boundary
         self._last_commanded = _active_currents(model).copy()
         self._last_applied = self._last_commanded.copy()
         self._terminated = False
@@ -249,39 +253,27 @@ class SimulationSession:
         boundary_reason = None
         try:
             ref_for_boundary = _reference_frame(scenario, angles_rad, float(state.t))
-            boundary_poly, boundary_level, boundary_status = find_plasma_boundary_with_status(
-                psi_true,
-                model.grid,
-                (model.R0, model.Z0),
+            boundary_poly, boundary_level, boundary_status, equilibrium_boundary = _extract_session_boundary(
+                cfg=cfg,
+                model=model,
+                psi=psi_true,
+                center=(model.R0, model.Z0),
+                angles=angles_rad,
                 prev_level=self._boundary_level,
                 prev_poly=self._boundary_poly,
-                local_n_levels=7,
-                local_span_frac=0.02,
                 target_mean_radius=float(np.nanmean(ref_for_boundary.radii_ref)),
-                limiter_shape=cfg.limiter_shape,
-                boundary_mode=cfg.boundary_mode,
-                boundary_base_mode=cfg.boundary_base_mode,
-                legacy_precision_index2=cfg.boundary_legacy_precision_index2,
-                track_level=cfg.boundary_track_level,
-                level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
-                level_search_span_fraction=cfg.boundary_level_search_span_fraction,
-                continuity_weight_radii=cfg.boundary_continuity_weight_radii,
-                continuity_weight_mean_radius=cfg.boundary_continuity_weight_mean_radius,
-                continuity_weight_center=cfg.boundary_continuity_weight_center,
-                continuity_weight_area=cfg.boundary_continuity_weight_area,
-                continuity_weight_level=cfg.boundary_continuity_weight_level,
-                compute_backend=cfg.compute.backend,
-                gpu_device=cfg.compute.gpu_device,
             )
             self._boundary_poly = np.asarray(boundary_poly, dtype=float)
             self._boundary_level = float(boundary_level)
             self._boundary_status = str(boundary_status)
-        except BoundaryNotFoundError as exc:
+            self._equilibrium_boundary = equilibrium_boundary
+        except (BoundaryNotFoundError, RuntimeError, ValueError) as exc:
             boundary_found = False
             boundary_reason = str(exc)
             self._boundary_poly = None
             self._boundary_level = None
             self._boundary_status = None
+            self._equilibrium_boundary = None
 
         applied = _active_derivatives(model).copy()
         self._last_commanded = active_currents_next.copy()
@@ -318,6 +310,7 @@ class SimulationSession:
         self._boundary_poly = None
         self._boundary_level = None
         self._boundary_status = None
+        self._equilibrium_boundary = None
         self._terminated = False
         self._termination_reason = None
 
@@ -337,8 +330,11 @@ class SimulationSession:
         currents = _active_currents(model)
         applied = _active_derivatives(model)
         boundary_poly = None if self._boundary_poly is None else np.asarray(self._boundary_poly, dtype=float).copy()
+        equilibrium = self._equilibrium_boundary
         radii = None
-        if boundary_poly is not None:
+        if equilibrium is not None:
+            radii = np.asarray(equilibrium.fixed_angle_projection.radii, dtype=float).copy()
+        elif boundary_poly is not None:
             radii = legacy_radii_at_angles(boundary_poly, (model.R0, model.Z0), angles_rad)
         if realism is None:
             measured_ip = float(state.Ip)
@@ -396,6 +392,21 @@ class SimulationSession:
             psi_boundary_value=None if self._boundary_level is None else float(self._boundary_level),
             boundary_found=bool(boundary_found),
             boundary_reason=boundary_reason,
+            boundary_topology=None if equilibrium is None else equilibrium.topology,
+            magnetic_axis=None if equilibrium is None else np.asarray(equilibrium.magnetic_axis.point, dtype=float),
+            x_points=(np.zeros((0, 2), dtype=float) if equilibrium is None else np.asarray([point.point for point in equilibrium.x_points], dtype=float).reshape(-1, 2)),
+            limiter_contacts=(np.zeros((0, 2), dtype=float) if equilibrium is None else np.asarray([contact.point for contact in equilibrium.limiter_contacts], dtype=float).reshape(-1, 2)),
+            separatrix_branches=(() if equilibrium is None else tuple(np.asarray(branch, dtype=float).copy() for branch in equilibrium.separatrix_branches)),
+            fixed_angle_valid=None if equilibrium is None else bool(equilibrium.fixed_angle_projection.valid),
+            fixed_angle_reason=None if equilibrium is None else equilibrium.fixed_angle_projection.reason,
+            boundary_quality=(None if equilibrium is None else {
+                "max_flux_residual": float(equilibrium.quality.max_flux_residual),
+                "normalized_flux_residual": float(equilibrium.quality.normalized_flux_residual),
+                "closure_error": float(equilibrium.quality.closure_error),
+                "minimum_regular_gradient": float(equilibrium.quality.minimum_regular_gradient),
+                "limiter_violation_count": int(equilibrium.quality.limiter_violation_count),
+                "core_component_size": int(equilibrium.quality.core_component_size),
+            }),
             current_limit_margin=current_margin,
             derivative_limit_margin=derivative_margin,
         )
@@ -405,6 +416,62 @@ class SimulationSession:
         if self._cfg is None or self._model is None or self._machine is None or self._scenario is None or self._angles_rad is None:
             raise RuntimeError("SimulationSession.reset() must be called before stepping")
         return self._cfg, self._model, self._machine, self._scenario, self._angles_rad, self._realism
+
+
+def _extract_session_boundary(
+    *,
+    cfg: LoadedConfig,
+    model: PlasmaModel | GpuPlasmaModel,
+    psi: object,
+    center: tuple[float, float],
+    angles: np.ndarray,
+    prev_level: float | None,
+    prev_poly: np.ndarray | None,
+    target_mean_radius: float | None,
+) -> tuple[np.ndarray, float, str, EquilibriumBoundary | None]:
+    """Extract the canonical boundary used by the programmatic session."""
+    if cfg.boundary_mode == "equilibrium_lcfs":
+        if cfg.limiter_shape is None:
+            raise BoundaryNotFoundError("equilibrium_lcfs requires limiter geometry")
+        value = psi.detach().cpu().numpy() if hasattr(psi, "detach") else np.asarray(psi, dtype=float)
+        equilibrium = find_equilibrium_boundary(
+            value,
+            model.grid,
+            center,
+            limiter_shape=np.asarray(cfg.limiter_shape, dtype=float),
+            fixed_angles=np.asarray(angles, dtype=float),
+        )
+        return (
+            np.asarray(equilibrium.core_boundary, dtype=float),
+            float(equilibrium.psi_boundary),
+            f"equilibrium_lcfs_{equilibrium.topology}_success",
+            equilibrium,
+        )
+    poly, level, status = find_plasma_boundary_with_status(
+        psi,
+        model.grid,
+        center,
+        prev_level=prev_level,
+        prev_poly=prev_poly,
+        local_n_levels=7,
+        local_span_frac=0.02,
+        target_mean_radius=target_mean_radius,
+        limiter_shape=cfg.limiter_shape,
+        boundary_mode=cfg.boundary_mode,
+        boundary_base_mode=cfg.boundary_base_mode,
+        legacy_precision_index2=cfg.boundary_legacy_precision_index2,
+        track_level=cfg.boundary_track_level,
+        level_smoothing_alpha=cfg.boundary_level_smoothing_alpha,
+        level_search_span_fraction=cfg.boundary_level_search_span_fraction,
+        continuity_weight_radii=cfg.boundary_continuity_weight_radii,
+        continuity_weight_mean_radius=cfg.boundary_continuity_weight_mean_radius,
+        continuity_weight_center=cfg.boundary_continuity_weight_center,
+        continuity_weight_area=cfg.boundary_continuity_weight_area,
+        continuity_weight_level=cfg.boundary_continuity_weight_level,
+        compute_backend=cfg.compute.backend,
+        gpu_device=cfg.compute.gpu_device,
+    )
+    return np.asarray(poly, dtype=float), float(level), str(status), None
 
 
 def _make_model(cfg: LoadedConfig) -> PlasmaModel | GpuPlasmaModel:

@@ -94,12 +94,12 @@ def _write_replay_boundary_config(
     supported = {
         "legacy_contour_limited",
         "tracked_flux_contour",
-        "suchkov_spline_contour",
+        "equilibrium_lcfs",
     }
     if boundary_mode not in supported:
         raise ValueError(
             "replay boundary mode must be 'legacy_contour_limited', "
-            "'tracked_flux_contour', or 'suchkov_spline_contour', "
+            "'tracked_flux_contour', or 'equilibrium_lcfs', "
             f"got {boundary_mode!r}"
         )
     boundary.update(
@@ -460,13 +460,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--angles", type=int, default=32, help="Boundary radii sample count to store.")
     parser.add_argument(
         "--boundary-mode",
-        choices=("legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"),
-        default="suchkov_spline_contour",
+        choices=("legacy_contour_limited", "tracked_flux_contour", "equilibrium_lcfs"),
+        default="equilibrium_lcfs",
         help=(
-            "Boundary mode for the generated replay config. legacy_contour_limited re-finds a fresh "
-            "limited boundary each step; tracked_flux_contour initializes from legacy_contour_limited "
-            "and then tracks the same flux-surface identity over time; suchkov_spline_contour "
-            "represents the selected closed level by periodic cubic splines R(xi), Z(xi)."
+            "Boundary mode for the generated replay config. equilibrium_lcfs is the physical "
+            "known-equilibrium extractor and automatically distinguishes limiter contact from "
+            "single-null, double-null, and multi-null separatrices. The legacy modes remain "
+            "available only for controlled historical comparisons."
         ),
     )
     parser.add_argument("--legacy-precision-index2", type=float, default=1.0e-3)

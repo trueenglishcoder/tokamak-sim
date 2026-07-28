@@ -13,18 +13,11 @@ from tokamak_control.geometry.boundary_common import (
     BoundaryStatus,
     BoundaryNotFoundError as _SharedBoundaryNotFoundError,
     normalize_boundary_mode,
-)
-from tokamak_control.geometry.boundary_suchkov import (
-    SUCHKOV_CONTROL_COUNT,
-    SUCHKOV_SEARCH_ITERATIONS,
-    SUCHKOV_VALIDATION_COUNT,
-    SuchkovSplinePlan,
-    build_suchkov_spline_plan,
-    interpolate_closed_curve_numpy,
-    uniform_periodic_angles,
+    equilibrium_status_for_topology,
 )
 from tokamak_control.geometry.coordinates import radii_from_polyline_ray_intersections
 from tokamak_control.geometry.xpoints import find_x_points
+from tokamak_control.geometry.lcfs import find_equilibrium_lcfs
 from tokamak_control.io.logger import get_logger
 from tokamak_control.io.profiling import Profiler
 
@@ -81,7 +74,10 @@ def boundary_profiling_snapshot() -> dict[str, object]:
             "legacy_contour_limited_success",
             "tracked_flux_contour_success",
             "tracked_flux_contour_reset",
-            "suchkov_spline_contour_success",
+            "equilibrium_lcfs_limited_success",
+            "equilibrium_lcfs_single_null_success",
+            "equilibrium_lcfs_double_null_success",
+            "equilibrium_lcfs_multi_null_success",
         ),
         title="boundary",
     )
@@ -101,7 +97,10 @@ def log_boundary_profiling_summary() -> None:
             "legacy_contour_limited_success",
             "tracked_flux_contour_success",
             "tracked_flux_contour_reset",
-            "suchkov_spline_contour_success",
+            "equilibrium_lcfs_limited_success",
+            "equilibrium_lcfs_single_null_success",
+            "equilibrium_lcfs_double_null_success",
+            "equilibrium_lcfs_multi_null_success",
         ),
         title="boundary",
     )
@@ -149,23 +148,23 @@ def find_plasma_boundary_cpu_with_status(
         del local_bbox_pad_r, local_bbox_pad_z
         limiter_poly = None
         strict_mode = base_mode if mode == "tracked_flux_contour" else mode
-        if strict_mode in {"legacy_contour_limited", "suchkov_spline_contour"}:
+        if strict_mode in {"legacy_contour_limited", "equilibrium_lcfs"}:
             limiter_poly = _prepare_limiter_shape(limiter_shape)
-            if strict_mode in {"legacy_contour_limited", "suchkov_spline_contour"} and limiter_poly is None:
+            if limiter_poly is None:
                 raise BoundaryNotFoundError(f"{strict_mode} boundary mode requires limiter geometry")
-        if mode == "suchkov_spline_contour":
-            suchkov_boundary = _suchkov_spline_contour_boundary(
-                psi=psi,
-                grid=grid,
-                center=center,
-                limiter_poly=limiter_poly,
-            )
-            if suchkov_boundary is None:
-                raise BoundaryNotFoundError("No suchkov_spline_contour plasma boundary found")
-            poly, level = suchkov_boundary
-            status: BoundaryStatus = "suchkov_spline_contour_success"
+        if mode == "equilibrium_lcfs":
+            try:
+                equilibrium = find_equilibrium_lcfs(
+                    psi=np.asarray(psi, dtype=float),
+                    grid=grid,
+                    center_hint=center,
+                    limiter_shape=limiter_poly,
+                )
+            except (RuntimeError, ValueError) as exc:
+                raise BoundaryNotFoundError(str(exc)) from exc
+            status = equilibrium_status_for_topology(equilibrium.topology)
             _record_path(status)
-            return _close_poly(poly), float(level), status
+            return _close_poly(equilibrium.core_boundary), float(equilibrium.psi_boundary), status
 
         should_track = mode == "tracked_flux_contour" or bool(track_level)
         if should_track and prev_poly is not None and prev_level is not None and np.isfinite(float(prev_level)):
@@ -233,7 +232,10 @@ def boundary_status_is_real(status: BoundaryStatus) -> bool:
         "legacy_contour_limited_success",
         "tracked_flux_contour_success",
         "tracked_flux_contour_reset",
-        "suchkov_spline_contour_success",
+        "equilibrium_lcfs_limited_success",
+        "equilibrium_lcfs_single_null_success",
+        "equilibrium_lcfs_double_null_success",
+        "equilibrium_lcfs_multi_null_success",
     }
 
 
@@ -1096,154 +1098,3 @@ def _point_to_polyline_distance(point: np.ndarray, polyline: np.ndarray) -> floa
         if dist < best:
             best = dist
     return best
-
-
-def _suchkov_spline_contour_boundary(
-    *,
-    psi: np.ndarray,
-    grid: Grid2D,
-    center: tuple[float, float],
-    limiter_poly: np.ndarray | None,
-) -> tuple[np.ndarray, float] | None:
-    """Восстановить LCFS как замкнутые сплайны ``R(xi)`` и ``Z(xi)``.
-
-    Специализация метода Сучкова использует уже рассчитанное поле ``psi``.
-    Среди допустимых замкнутых линий уровня выбирается линия максимальной
-    горизонтальной ширины. Координаты выбранного кандидата независимо
-    интерполируются периодическими кубическими сплайнами по параметру ``xi``.
-    """
-    if limiter_poly is None:
-        raise BoundaryNotFoundError("suchkov_spline_contour requires limiter geometry")
-    psi_array = np.asarray(psi, dtype=np.float64)
-    axis = _find_magnetic_axis(
-        psi=psi_array,
-        grid=grid,
-        center=center,
-        limiter_poly=limiter_poly,
-        limiter_tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
-    )
-    search_limit = _suchkov_search_limit_cpu(
-        psi=psi_array,
-        grid=grid,
-        axis=axis,
-        limiter_poly=limiter_poly,
-    )
-    if search_limit is None:
-        return None
-
-    control_count = SUCHKOV_CONTROL_COUNT
-    output_count = SUCHKOV_VALIDATION_COUNT
-    control_angles = uniform_periodic_angles(control_count)
-    output_angles = uniform_periodic_angles(output_count)
-    plan = build_suchkov_spline_plan(output_angles, control_count=control_count)
-    axis_point = np.asarray(axis.point, dtype=np.float64).reshape(1, 2)
-    directions = np.stack([np.cos(control_angles), np.sin(control_angles)], axis=1)
-    lower_fraction = 0.0
-    upper_fraction = 1.0
-    best: tuple[np.ndarray, float, float] | None = None
-
-    for _ in range(SUCHKOV_SEARCH_ITERATIONS):
-        fraction = 0.5 * (lower_fraction + upper_fraction)
-        level = float(axis.level + fraction * (search_limit - axis.level))
-        candidate = _suchkov_spline_at_level_cpu(
-            psi=psi_array,
-            grid=grid,
-            axis=axis,
-            level=level,
-            limiter_poly=limiter_poly,
-            control_angles=control_angles,
-            directions=directions,
-            axis_point=axis_point,
-            plan=plan,
-        )
-        if candidate is None:
-            upper_fraction = fraction
-            continue
-        closed, width = candidate
-        lower_fraction = fraction
-        if best is None or width > best[2]:
-            best = (closed, level, width)
-
-    if best is None:
-        return None
-
-    return best[0], best[1]
-
-
-def _suchkov_spline_at_level_cpu(
-    *,
-    psi: np.ndarray,
-    grid: Grid2D,
-    axis: _MagneticAxis,
-    level: float,
-    limiter_poly: np.ndarray,
-    control_angles: np.ndarray,
-    directions: np.ndarray,
-    axis_point: np.ndarray,
-    plan: SuchkovSplinePlan,
-) -> tuple[np.ndarray, float] | None:
-    """Построить лучший допустимый сплайн для одного уровня потока."""
-    best: tuple[np.ndarray, float] | None = None
-    for polyline in _contours_at_level(psi, grid, float(level)):
-        if not _is_closed_poly(polyline) or not _encloses_center(polyline, axis.point):
-            continue
-        raw_closed = _close_poly(polyline)
-        if not _poly_fits_limiter(
-            raw_closed,
-            limiter_poly,
-            tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
-        ):
-            continue
-        try:
-            control_radii = radii_from_polyline_ray_intersections(
-                raw_closed,
-                axis.point,
-                control_angles,
-            )
-        except ValueError:
-            continue
-        control_points = axis_point + control_radii[:, None] * directions
-        spline_points = interpolate_closed_curve_numpy(control_points, plan)
-        closed = _close_poly(spline_points)
-        if not _is_closed_poly(closed):
-            continue
-        if not _encloses_center(closed, axis.point):
-            continue
-        if not _poly_fits_limiter(
-            closed,
-            limiter_poly,
-            tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
-        ):
-            continue
-        width = float(np.max(closed[:, 0]) - np.min(closed[:, 0]))
-        if not np.isfinite(width) or width <= 0.0:
-            continue
-        if best is None or width > best[1]:
-            best = (closed, width)
-    return best
-
-
-def _suchkov_search_limit_cpu(
-    *,
-    psi: np.ndarray,
-    grid: Grid2D,
-    axis: _MagneticAxis,
-    limiter_poly: np.ndarray,
-) -> float | None:
-    """Вернуть внешний численный предел поиска уровней ``psi``.
-
-    Значения на ограничителе задают только диапазон поиска. Кандидат не
-    обязан касаться ограничителя и принимается исключительно по замкнутости,
-    охвату магнитной оси и геометрической допустимости внутри лимитера.
-    """
-    limiter_points = _sample_limiter_points(limiter_poly, grid)
-    limiter_values = _sample_psi_bilinear(psi, grid, limiter_points)
-    values = limiter_values[np.isfinite(limiter_values)]
-    if values.size == 0:
-        return None
-    axis_level = float(axis.level)
-    if axis.kind == "maximum":
-        candidates = values[values < axis_level]
-        return None if candidates.size == 0 else float(np.min(candidates))
-    candidates = values[values > axis_level]
-    return None if candidates.size == 0 else float(np.max(candidates))

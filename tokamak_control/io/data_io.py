@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 
-_ARTIFACT_VERSION = 3
+_ARTIFACT_VERSION = 4
 
 
 def _nan_vec(n: int) -> np.ndarray:
@@ -41,6 +41,26 @@ def _stack_list_of_polylines(polylines: Sequence[np.ndarray]) -> np.ndarray:
         out[idx, : arr.shape[0], :] = arr
     return out
 
+
+
+
+def _stack_list_of_polyline_groups(groups: Sequence[Sequence[np.ndarray]]) -> np.ndarray:
+    """Stack per-step groups of variable-length polylines into a NaN-padded array."""
+    if not groups:
+        return np.zeros((0, 0, 0, 2), dtype=float)
+    max_groups = max((len(group) for group in groups), default=0)
+    max_points = max(
+        (int(np.asarray(poly).shape[0]) for group in groups for poly in group),
+        default=0,
+    )
+    out = np.full((len(groups), max_groups, max_points, 2), np.nan, dtype=float)
+    for step_index, group in enumerate(groups):
+        for branch_index, poly in enumerate(group):
+            arr = np.asarray(poly, dtype=float)
+            if arr.ndim != 2 or arr.shape[1] != 2:
+                raise ValueError(f"Boundary branch must have shape (N, 2), got {arr.shape}")
+            out[step_index, branch_index, : arr.shape[0], :] = arr
+    return out
 
 def _csv_cell(value: object) -> str:
     """Convert a Python value into a stable CSV cell string."""
@@ -110,6 +130,7 @@ class RunWriter:
     _track_radii: bool = field(default=False, init=False)
     _track_boundary_poly_true: bool = field(default=False, init=False)
     _track_boundary_poly_meas: bool = field(default=False, init=False)
+    _track_boundary_details: bool = field(default=False, init=False)
     _track_Ip_ref: bool = field(default=False, init=False)
     _track_Ip_meas: bool = field(default=False, init=False)
     _track_pfc_currents_meas: bool = field(default=False, init=False)
@@ -129,6 +150,14 @@ class RunWriter:
     _radii_meas: list[np.ndarray] = field(default_factory=list, init=False)
     _boundary_poly_true: list[np.ndarray] = field(default_factory=list, init=False)
     _boundary_poly_meas: list[np.ndarray] = field(default_factory=list, init=False)
+    _boundary_topology_code: list[int] = field(default_factory=list, init=False)
+    _boundary_axis: list[np.ndarray] = field(default_factory=list, init=False)
+    _boundary_x_points: list[np.ndarray] = field(default_factory=list, init=False)
+    _boundary_limiter_contacts: list[np.ndarray] = field(default_factory=list, init=False)
+    _boundary_separatrix_branches: list[tuple[np.ndarray, ...]] = field(default_factory=list, init=False)
+    _boundary_fixed_angle_valid: list[bool] = field(default_factory=list, init=False)
+    _boundary_fixed_angle_counts: list[np.ndarray] = field(default_factory=list, init=False)
+    _boundary_quality: list[np.ndarray] = field(default_factory=list, init=False)
     _radii_ref: list[np.ndarray] = field(default_factory=list, init=False)
     _Ip_ref: list[float] = field(default_factory=list, init=False)
     _Ip_meas: list[float] = field(default_factory=list, init=False)
@@ -228,6 +257,14 @@ class RunWriter:
         radii_meas = extra.get("radii_meas", None)
         boundary_poly_true = extra.get("boundary_poly_true", None)
         boundary_poly_meas = extra.get("boundary_poly_meas", None)
+        boundary_topology_code = extra.get("boundary_topology_code", None)
+        boundary_axis = extra.get("boundary_axis", None)
+        boundary_x_points = extra.get("boundary_x_points", None)
+        boundary_limiter_contacts = extra.get("boundary_limiter_contacts", None)
+        boundary_separatrix_branches = extra.get("boundary_separatrix_branches", None)
+        boundary_fixed_angle_valid = extra.get("boundary_fixed_angle_valid", None)
+        boundary_fixed_angle_counts = extra.get("boundary_fixed_angle_counts", None)
+        boundary_quality = extra.get("boundary_quality", None)
         psi_latest = extra.get("psi_latest", None)
         radii_ref = extra.get("radii_ref", None)
         Ip_ref = extra.get("Ip_ref", None)
@@ -385,6 +422,50 @@ class RunWriter:
                 if v.ndim != 2 or v.shape[1] != 2:
                     raise ValueError(f"boundary_poly_meas shape {v.shape} must be (N, 2)")
                 self._boundary_poly_meas.append(v)
+
+        detail_values = (
+            boundary_topology_code,
+            boundary_axis,
+            boundary_x_points,
+            boundary_limiter_contacts,
+            boundary_separatrix_branches,
+            boundary_fixed_angle_valid,
+            boundary_fixed_angle_counts,
+            boundary_quality,
+        )
+        if any(value is not None for value in detail_values) and not self._track_boundary_details:
+            self._track_boundary_details = True
+            while len(self._boundary_topology_code) < step_index:
+                self._boundary_topology_code.append(0)
+                self._boundary_axis.append(_nan_vec(2))
+                self._boundary_x_points.append(np.zeros((0, 2), dtype=float))
+                self._boundary_limiter_contacts.append(np.zeros((0, 2), dtype=float))
+                self._boundary_separatrix_branches.append(())
+                self._boundary_fixed_angle_valid.append(False)
+                self._boundary_fixed_angle_counts.append(_nan_vec(self._n_angles or 0))
+                self._boundary_quality.append(_nan_vec(6))
+        if self._track_boundary_details:
+            self._boundary_topology_code.append(int(boundary_topology_code) if boundary_topology_code is not None else 0)
+            axis_arr = _nan_vec(2) if boundary_axis is None else np.asarray(boundary_axis, dtype=float).reshape(2).copy()
+            self._boundary_axis.append(axis_arr)
+            x_arr = np.zeros((0, 2), dtype=float) if boundary_x_points is None else np.asarray(boundary_x_points, dtype=float).reshape(-1, 2).copy()
+            self._boundary_x_points.append(x_arr)
+            contact_arr = np.zeros((0, 2), dtype=float) if boundary_limiter_contacts is None else np.asarray(boundary_limiter_contacts, dtype=float).reshape(-1, 2).copy()
+            self._boundary_limiter_contacts.append(contact_arr)
+            branches: tuple[np.ndarray, ...]
+            if boundary_separatrix_branches is None:
+                branches = ()
+            else:
+                branches = tuple(np.asarray(branch, dtype=float).reshape(-1, 2).copy() for branch in boundary_separatrix_branches)
+            self._boundary_separatrix_branches.append(branches)
+            self._boundary_fixed_angle_valid.append(bool(boundary_fixed_angle_valid) if boundary_fixed_angle_valid is not None else False)
+            count_size = self._n_angles or 0
+            counts = _nan_vec(count_size) if boundary_fixed_angle_counts is None else np.asarray(boundary_fixed_angle_counts, dtype=float).reshape(-1).copy()
+            if count_size and counts.shape != (count_size,):
+                raise ValueError(f"boundary_fixed_angle_counts shape {counts.shape} != ({count_size},)")
+            self._boundary_fixed_angle_counts.append(counts)
+            quality = _nan_vec(6) if boundary_quality is None else np.asarray(boundary_quality, dtype=float).reshape(6).copy()
+            self._boundary_quality.append(quality)
 
         if Ip_ref is not None and not self._track_Ip_ref:
             self._track_Ip_ref = True
@@ -655,6 +736,15 @@ class RunWriter:
             payload["boundary_poly_true"] = _stack_list_of_polylines(self._boundary_poly_true)
         if self._track_boundary_poly_meas:
             payload["boundary_poly_meas"] = _stack_list_of_polylines(self._boundary_poly_meas)
+        if self._track_boundary_details:
+            payload["boundary_topology_code"] = np.asarray(self._boundary_topology_code, dtype=np.int8)
+            payload["boundary_axis"] = _stack_list_of_vectors(self._boundary_axis)
+            payload["boundary_x_points"] = _stack_list_of_polylines(self._boundary_x_points)
+            payload["boundary_limiter_contacts"] = _stack_list_of_polylines(self._boundary_limiter_contacts)
+            payload["boundary_separatrix_branches"] = _stack_list_of_polyline_groups(self._boundary_separatrix_branches)
+            payload["boundary_fixed_angle_valid"] = np.asarray(self._boundary_fixed_angle_valid, dtype=np.bool_)
+            payload["boundary_fixed_angle_counts"] = _stack_list_of_vectors(self._boundary_fixed_angle_counts)
+            payload["boundary_quality"] = _stack_list_of_vectors(self._boundary_quality)
         if self._track_Ip_ref:
             payload["Ip_ref"] = np.asarray(self._Ip_ref, dtype=float)
         if self._track_Ip_meas:
@@ -685,9 +775,9 @@ def load_run(npz_path: str | Path) -> dict[str, object]:
     with np.load(npz_path, allow_pickle=False) as d:
         files = set(d.files)
         version = int(np.asarray(d["version"]).reshape(-1)[0]) if "version" in files else 0
-        if version != _ARTIFACT_VERSION:
+        if version not in {3, _ARTIFACT_VERSION}:
             raise ValueError(
-                f"Unsupported run artifact version {version}; expected {_ARTIFACT_VERSION}"
+                f"Unsupported run artifact version {version}; expected 3 or {_ARTIFACT_VERSION}"
             )
 
         required = {
@@ -741,6 +831,12 @@ def load_run(npz_path: str | Path) -> dict[str, object]:
             "radii_meas",
             "boundary_poly_true",
             "boundary_poly_meas",
+            "boundary_axis",
+            "boundary_x_points",
+            "boundary_limiter_contacts",
+            "boundary_separatrix_branches",
+            "boundary_fixed_angle_counts",
+            "boundary_quality",
             "Ip_ref",
             "Ip_meas",
             "pfc_currents_meas",
@@ -749,5 +845,9 @@ def load_run(npz_path: str | Path) -> dict[str, object]:
         ):
             if key in files:
                 payload[key] = np.asarray(d[key], dtype=float)
+        if "boundary_topology_code" in files:
+            payload["boundary_topology_code"] = np.asarray(d["boundary_topology_code"], dtype=np.int8)
+        if "boundary_fixed_angle_valid" in files:
+            payload["boundary_fixed_angle_valid"] = np.asarray(d["boundary_fixed_angle_valid"], dtype=bool)
 
     return payload

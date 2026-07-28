@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -9,13 +8,16 @@ import numpy as np
 from tokamak_control.core.grid import Grid2D
 
 
-BoundaryMode = Literal["legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"]
+BoundaryMode = Literal["legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "equilibrium_lcfs"]
 BoundaryStatus = Literal[
     "legacy_contour_success",
     "legacy_contour_limited_success",
     "tracked_flux_contour_success",
     "tracked_flux_contour_reset",
-    "suchkov_spline_contour_success",
+    "equilibrium_lcfs_limited_success",
+    "equilibrium_lcfs_single_null_success",
+    "equilibrium_lcfs_double_null_success",
+    "equilibrium_lcfs_multi_null_success",
 ]
 
 
@@ -30,27 +32,49 @@ class MagneticAxis:
     kind: Literal["maximum", "minimum"]
 
 
-def boundary_status_is_real(status: BoundaryStatus) -> bool:
+def boundary_status_is_real(status: BoundaryStatus | str) -> bool:
     """Return True when a boundary status string represents a found boundary."""
-    return status in {
+    return str(status) in {
         "legacy_contour_success",
         "legacy_contour_limited_success",
         "tracked_flux_contour_success",
         "tracked_flux_contour_reset",
-        "suchkov_spline_contour_success",
+        "equilibrium_lcfs_limited_success",
+        "equilibrium_lcfs_single_null_success",
+        "equilibrium_lcfs_double_null_success",
+        "equilibrium_lcfs_multi_null_success",
     }
 
 
 def normalize_boundary_mode(mode: BoundaryMode | str) -> BoundaryMode:
-    """Normalize and validate the old-parity boundary extraction mode."""
+    """Normalize and validate the boundary extraction mode."""
     mode_text = str(mode).strip().lower()
-    if mode_text not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}:
+    if mode_text == "suchkov_spline_contour":
+        raise ValueError(
+            "boundary mode 'suchkov_spline_contour' was removed because it replaced a known flux level set "
+            "with a periodic spline through fixed-angle samples. Use 'equilibrium_lcfs'."
+        )
+    allowed = {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "equilibrium_lcfs"}
+    if mode_text not in allowed:
         raise ValueError(
             "boundary_mode must be 'legacy_contour', 'legacy_contour_limited', "
-            "'tracked_flux_contour', or 'suchkov_spline_contour', "
+            "'tracked_flux_contour', or 'equilibrium_lcfs', "
             f"got {mode!r}"
         )
     return cast(BoundaryMode, mode_text)
+
+
+def equilibrium_status_for_topology(topology: str) -> BoundaryStatus:
+    mapping: dict[str, BoundaryStatus] = {
+        "limited": "equilibrium_lcfs_limited_success",
+        "single_null": "equilibrium_lcfs_single_null_success",
+        "double_null": "equilibrium_lcfs_double_null_success",
+        "multi_null": "equilibrium_lcfs_multi_null_success",
+    }
+    try:
+        return mapping[str(topology)]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported equilibrium boundary topology {topology!r}") from exc
 
 
 def close_poly(poly: np.ndarray) -> np.ndarray:

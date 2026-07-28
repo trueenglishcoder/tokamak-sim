@@ -11,6 +11,7 @@ from tokamak_control.geometry.boundary_common import (
     BoundaryStatus,
     boundary_status_is_real,
 )
+from tokamak_control.geometry.lcfs import EquilibriumBoundary, EquilibriumLcfsSettings, find_equilibrium_lcfs
 from tokamak_control.geometry.boundary_cpu import (
     boundary_profiling_snapshot as boundary_cpu_profiling_snapshot,
     configure_boundary_profiling as configure_boundary_cpu_profiling,
@@ -38,6 +39,26 @@ def _as_cpu_numpy(value: object) -> np.ndarray:
         value = value.cpu()
     return np.asarray(value)
 
+
+
+def find_equilibrium_boundary(
+    psi: np.ndarray,
+    grid: Grid2D,
+    center: tuple[float, float],
+    *,
+    limiter_shape: np.ndarray,
+    fixed_angles: np.ndarray | None = None,
+    settings: EquilibriumLcfsSettings | None = None,
+) -> EquilibriumBoundary:
+    """Return the complete physical LCFS result for a known equilibrium."""
+    return find_equilibrium_lcfs(
+        _as_cpu_numpy(psi),
+        grid,
+        center_hint=center,
+        limiter_shape=np.asarray(limiter_shape, dtype=float),
+        fixed_angles=None if fixed_angles is None else np.asarray(fixed_angles, dtype=float),
+        settings=settings,
+    )
 
 def find_plasma_boundary_with_status(
     psi: np.ndarray,
@@ -102,11 +123,14 @@ __all__ = [
     "BoundaryMode",
     "BoundaryNotFoundError",
     "BoundaryStatus",
+    "EquilibriumBoundary",
+    "EquilibriumLcfsSettings",
     "boundary_cpu_profiling_snapshot",
     "boundary_profiling_snapshot",
     "boundary_status_is_real",
     "configure_boundary_cpu_profiling",
     "configure_boundary_profiling",
+    "find_equilibrium_boundary",
     "find_plasma_boundary_cpu_with_status",
     "find_plasma_boundary_with_status",
     "log_boundary_cpu_profiling_summary",

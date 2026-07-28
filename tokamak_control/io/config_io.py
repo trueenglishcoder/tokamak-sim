@@ -122,9 +122,14 @@ def _coerce_boundary_mode(value: object, name: str) -> BoundaryMode:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
     mode = value.strip().lower()
-    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "suchkov_spline_contour"}:
+    if mode == "suchkov_spline_contour":
         raise ValueError(
-            f"{name} must be 'legacy_contour', 'legacy_contour_limited', 'tracked_flux_contour', or 'suchkov_spline_contour', got {value!r}"
+            f"{name}='suchkov_spline_contour' is no longer supported because it is not a physical LCFS extractor; "
+            "use 'equilibrium_lcfs'"
+        )
+    if mode not in {"legacy_contour", "legacy_contour_limited", "tracked_flux_contour", "equilibrium_lcfs"}:
+        raise ValueError(
+            f"{name} must be 'legacy_contour', 'legacy_contour_limited', 'tracked_flux_contour', or 'equilibrium_lcfs', got {value!r}"
         )
     return cast(BoundaryMode, mode)
 
