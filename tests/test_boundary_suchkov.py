@@ -41,6 +41,14 @@ def _quadratic_psi(grid: Grid2D) -> np.ndarray:
     return (R - 19.5) ** 2 + (Z - 19.5) ** 2
 
 
+def _detached_branch_psi(grid: Grid2D) -> np.ndarray:
+    """Создать несвязанную ветвь того же уровня около правой стенки."""
+    R, Z = grid.mesh()
+    quadratic = (R - 19.5) ** 2 + (Z - 19.5) ** 2
+    branch = 210.0 * np.exp(-((R - 34.0) ** 2 + (Z - 19.5) ** 2) / 4.0)
+    return quadratic - branch
+
+
 def _square_limiter() -> np.ndarray:
     """Создать квадратный лимитер вокруг тестовой плазмы."""
     return np.asarray(
@@ -105,6 +113,21 @@ def test_cpu_suchkov_boundary_returns_closed_spline() -> None:
     assert float(np.max(poly[:, 0])) <= 34.0 + 1.0e-9
     assert float(np.min(poly[:, 1])) >= 5.0 - 1.0e-9
     assert float(np.max(poly[:, 1])) <= 34.0 + 1.0e-9
+
+
+def test_cpu_suchkov_accepts_detached_valid_boundary() -> None:
+    """Касание лимитера не должно быть условием существования границы."""
+    grid = _test_grid()
+    poly, level, status = find_plasma_boundary_with_status(
+        _detached_branch_psi(grid),
+        grid,
+        (19.5, 19.5),
+        limiter_shape=_square_limiter(),
+        boundary_mode="suchkov_spline_contour",
+    )
+
+    assert status == "suchkov_spline_contour_success"
+    assert np.isfinite(level)
     limiter_gap = float(
         np.min(
             np.minimum.reduce(
@@ -117,7 +140,23 @@ def test_cpu_suchkov_boundary_returns_closed_spline() -> None:
             )
         )
     )
-    assert limiter_gap < 1.0e-2
+    assert limiter_gap > 2.0
+
+
+def test_cpu_suchkov_supports_axis_maximum() -> None:
+    """Поиск должен корректно работать и для максимума psi на оси."""
+    grid = _test_grid()
+    poly, level, status = find_plasma_boundary_with_status(
+        -_quadratic_psi(grid),
+        grid,
+        (19.5, 19.5),
+        limiter_shape=_square_limiter(),
+        boundary_mode="suchkov_spline_contour",
+    )
+
+    assert status == "suchkov_spline_contour_success"
+    assert level == pytest.approx(-210.31, abs=1.0)
+    assert poly.shape == (SUCHKOV_VALIDATION_COUNT + 1, 2)
 
 
 def test_cpu_suchkov_boundary_respects_concave_limiter() -> None:
@@ -135,7 +174,6 @@ def test_cpu_suchkov_boundary_respects_concave_limiter() -> None:
     assert level == pytest.approx(6.25, abs=0.25)
     assert float(np.max(poly[:, 0])) <= 22.0 + 1.0e-6
     assert float(np.max(poly[:, 1])) <= 22.0 + 1.0e-6
-    assert min(22.0 - float(np.max(poly[:, 0])), 22.0 - float(np.max(poly[:, 1]))) < 1.0e-2
 
 
 def test_torch_suchkov_search_is_batched_and_finite() -> None:
@@ -180,6 +218,78 @@ def test_torch_suchkov_search_is_batched_and_finite() -> None:
     assert bool(torch.all(torch.isfinite(radii)))
     assert bool(torch.all(torch.isfinite(levels)))
     assert float(torch.max(torch.abs(radii - 14.5))) < 1.0e-2
+
+
+def test_torch_suchkov_accepts_detached_valid_boundary() -> None:
+    """GPU-путь не должен отбрасывать корректную detached-поверхность."""
+    torch = pytest.importorskip("torch")
+    grid = _test_grid()
+    psi = torch.as_tensor(_detached_branch_psi(grid)[None, ...], dtype=torch.float64)
+    centers = torch.tensor([[19.5, 19.5]], dtype=torch.float64)
+    center_level = _sample_points(psi, grid, centers[:, None, :]).reshape(1)
+    measurement_angles = torch.as_tensor(uniform_periodic_angles(32), dtype=torch.float64)
+    limiter = torch.as_tensor(_square_limiter(), dtype=torch.float64)
+    dense_angles = torch.as_tensor(
+        uniform_periodic_angles(SUCHKOV_VALIDATION_COUNT),
+        dtype=torch.float64,
+    )
+    plan = build_suchkov_spline_torch_plan(
+        dense_angles,
+        control_count=SUCHKOV_CONTROL_COUNT,
+    )
+
+    points, radii, found, levels = _suchkov_fixed_angle_search(
+        psi=psi,
+        grid=grid,
+        center_points=centers,
+        center_level=center_level,
+        measurement_angles=measurement_angles,
+        limiter=limiter,
+        ray_samples=256,
+        plan=plan,
+    )
+
+    assert bool(found[0])
+    assert bool(torch.all(torch.isfinite(points[0])))
+    assert bool(torch.all(torch.isfinite(radii[0])))
+    assert bool(torch.isfinite(levels[0]))
+    assert float(torch.min(points[0, :, 0])) > 7.0
+    assert float(torch.max(points[0, :, 0])) < 32.0
+
+
+def test_torch_suchkov_supports_axis_maximum() -> None:
+    """GPU-поиск должен поддерживать максимум psi на оси."""
+    torch = pytest.importorskip("torch")
+    grid = _test_grid()
+    psi_numpy = -_quadratic_psi(grid)
+    psi = torch.as_tensor(psi_numpy[None, ...], dtype=torch.float64)
+    centers = torch.tensor([[19.5, 19.5]], dtype=torch.float64)
+    center_level = _sample_points(psi, grid, centers[:, None, :]).reshape(1)
+    measurement_angles = torch.as_tensor(uniform_periodic_angles(32), dtype=torch.float64)
+    limiter = torch.as_tensor(_square_limiter(), dtype=torch.float64)
+    dense_angles = torch.as_tensor(
+        uniform_periodic_angles(SUCHKOV_VALIDATION_COUNT),
+        dtype=torch.float64,
+    )
+    plan = build_suchkov_spline_torch_plan(
+        dense_angles,
+        control_count=SUCHKOV_CONTROL_COUNT,
+    )
+
+    _points, radii, found, levels = _suchkov_fixed_angle_search(
+        psi=psi,
+        grid=grid,
+        center_points=centers,
+        center_level=center_level,
+        measurement_angles=measurement_angles,
+        limiter=limiter,
+        ray_samples=256,
+        plan=plan,
+    )
+
+    assert bool(found[0])
+    assert bool(torch.all(torch.isfinite(radii[0])))
+    assert float(levels[0]) == pytest.approx(-210.31, abs=1.0)
 
 
 def test_torch_suchkov_respects_concave_limiter() -> None:

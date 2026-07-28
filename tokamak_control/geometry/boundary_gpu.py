@@ -441,14 +441,6 @@ def _suchkov_containment_tolerance(grid: Grid2D) -> float:
     return max(1.0e-7, 1.0e-5 * cell)
 
 
-def _suchkov_contact_tolerance(grid: Grid2D) -> float:
-    """Допуск первого контакта LCFS с лимитером для сеточного поля."""
-    cell = float(max(abs(float(grid.r.step)), abs(float(grid.z.step))))
-    if not np.isfinite(cell) or cell <= 0.0:
-        return 1.0e-4
-    return max(2.0 * cell, 1.0e-6)
-
-
 def _cross2(a, b):
     return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
@@ -864,9 +856,10 @@ def _suchkov_fixed_angle_search(
     """Найти максимальную по ширине допустимую сплайновую линию уровня ``psi``.
 
     Поиск выполняется в нормированной координате между значением потока в
-    центре плазмы и первым уровнем контакта с лимитером. Двоичный поиск
-    находит самую внешнюю допустимую поверхность. Для вложенных магнитных
-    поверхностей она одновременно имеет максимальную горизонтальную ширину.
+    центре плазмы и внешним численным пределом диапазона ``psi`` на лимитере.
+    Двоичный поиск находит самую внешнюю допустимую поверхность. Для вложенных
+    магнитных поверхностей она одновременно имеет максимальную горизонтальную
+    ширину. Касание лимитера не является условием допустимости.
     """
     torch = __import__("torch")
     if limiter is None or int(limiter.shape[0]) < 3:
@@ -917,7 +910,7 @@ def _suchkov_fixed_angle_search(
         grid,
         limiter_samples.reshape(1, -1, 2).expand(batch_size, -1, -1),
     )
-    contact_level, contact_found = _suchkov_contact_levels(
+    search_limit, search_limit_found = _suchkov_search_limits(
         limiter_values=limiter_values,
         center_level=center_level,
         axis_kind=axis_kind,
@@ -949,7 +942,7 @@ def _suchkov_fixed_angle_search(
 
     for _ in range(SUCHKOV_SEARCH_ITERATIONS):
         fraction = 0.5 * (lower_fraction + upper_fraction)
-        level = center_level + fraction * (contact_level - center_level)
+        level = center_level + fraction * (search_limit - center_level)
         control_points, _control_radii, control_found = _center_ray_crossings(
             psi=psi,
             grid=grid,
@@ -981,7 +974,7 @@ def _suchkov_fixed_angle_search(
             dim=1,
         ).values
         accepted = (
-            contact_found
+            search_limit_found
             & control_found
             & inside_limiter
             & axis_inside
@@ -1005,13 +998,7 @@ def _suchkov_fixed_angle_search(
         center_points,
         measurement_angles,
     )
-    contact_gap = _minimum_points_to_polygon_distance_torch(
-        best_polyline,
-        limiter,
-    )
-    contact_tolerance = _suchkov_contact_tolerance(grid)
-    touches_limiter = torch.isfinite(contact_gap) & (contact_gap <= contact_tolerance)
-    found = best_found & measurement_found & touches_limiter
+    found = best_found & measurement_found
     points = torch.where(
         found[:, None, None],
         points,
@@ -1053,29 +1040,33 @@ def _center_extremum_kind(*, psi, grid: Grid2D, center_points, center_level):
     )
 
 
-def _suchkov_contact_levels(*, limiter_values, center_level, axis_kind):
-    """Найти первый достижимый уровень контакта поверхности с лимитером."""
+def _suchkov_search_limits(*, limiter_values, center_level, axis_kind):
+    """Вернуть внешний численный предел поиска уровней ``psi``.
+
+    Значения на ограничителе используются только как диапазон поиска. Они не
+    задают обязательный уровень контакта и не участвуют в приёмке кандидата.
+    """
     torch = __import__("torch")
     finite = torch.isfinite(limiter_values)
     center = center_level[:, None]
     below = finite & (limiter_values < center)
     above = finite & (limiter_values > center)
-    max_below = torch.max(
-        torch.where(below, limiter_values, torch.full_like(limiter_values, -float("inf"))),
+    min_below = torch.min(
+        torch.where(below, limiter_values, torch.full_like(limiter_values, float("inf"))),
         dim=1,
     ).values
-    min_above = torch.min(
-        torch.where(above, limiter_values, torch.full_like(limiter_values, float("inf"))),
+    max_above = torch.max(
+        torch.where(above, limiter_values, torch.full_like(limiter_values, -float("inf"))),
         dim=1,
     ).values
     use_maximum = axis_kind > 0
-    contact = torch.where(use_maximum, max_below, min_above)
+    search_limit = torch.where(use_maximum, min_below, max_above)
     found = torch.where(
         use_maximum,
-        torch.isfinite(max_below),
-        torch.isfinite(min_above),
+        torch.isfinite(min_below),
+        torch.isfinite(max_above),
     )
-    return contact, found
+    return search_limit, found
 
 
 def _sample_closed_polyline_numpy(polyline: np.ndarray, count: int) -> np.ndarray:
@@ -1144,13 +1135,6 @@ def _point_to_polygon_distances_torch(points, polygon):
     nearest = starts[None, None, :, :] + fraction[..., None] * vectors[None, None, :, :]
     squared = torch.sum((points[:, :, None, :] - nearest) ** 2, dim=3)
     return torch.sqrt(torch.clamp(torch.min(squared, dim=2).values, min=0.0))
-
-
-def _minimum_points_to_polygon_distance_torch(points, polygon):
-    """Минимальный зазор каждой batch кривой до границы лимитера."""
-    torch = __import__("torch")
-    distances = _point_to_polygon_distances_torch(points, polygon)
-    return torch.min(distances, dim=1).values
 
 
 def _points_in_or_on_polygon_torch(points, polygon, *, tolerance: float):

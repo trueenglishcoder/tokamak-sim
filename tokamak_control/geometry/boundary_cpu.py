@@ -1122,13 +1122,13 @@ def _suchkov_spline_contour_boundary(
         limiter_poly=limiter_poly,
         limiter_tol=_LEGACY_LIMITER_CONTAINMENT_TOL_M,
     )
-    contact_level = _suchkov_contact_level_cpu(
+    search_limit = _suchkov_search_limit_cpu(
         psi=psi_array,
         grid=grid,
         axis=axis,
         limiter_poly=limiter_poly,
     )
-    if contact_level is None:
+    if search_limit is None:
         return None
 
     control_count = SUCHKOV_CONTROL_COUNT
@@ -1144,7 +1144,7 @@ def _suchkov_spline_contour_boundary(
 
     for _ in range(SUCHKOV_SEARCH_ITERATIONS):
         fraction = 0.5 * (lower_fraction + upper_fraction)
-        level = float(axis.level + fraction * (contact_level - axis.level))
+        level = float(axis.level + fraction * (search_limit - axis.level))
         candidate = _suchkov_spline_at_level_cpu(
             psi=psi_array,
             grid=grid,
@@ -1167,22 +1167,7 @@ def _suchkov_spline_contour_boundary(
     if best is None:
         return None
 
-    contact_tolerance = _suchkov_contact_tolerance(grid)
-    contact_gap = _polyline_to_points_distance(
-        limiter_poly,
-        np.asarray(best[0][:-1], dtype=np.float64),
-    )
-    if not np.isfinite(contact_gap) or contact_gap > contact_tolerance:
-        return None
     return best[0], best[1]
-
-
-def _suchkov_contact_tolerance(grid: Grid2D) -> float:
-    """Допуск касания LCFS с ограничителем для сеточного поля ``psi``."""
-    cell = float(max(abs(float(grid.r.step)), abs(float(grid.z.step))))
-    if not np.isfinite(cell) or cell <= 0.0:
-        return 1.0e-4
-    return max(2.0 * cell, 1.0e-6)
 
 
 def _suchkov_spline_at_level_cpu(
@@ -1238,14 +1223,19 @@ def _suchkov_spline_at_level_cpu(
     return best
 
 
-def _suchkov_contact_level_cpu(
+def _suchkov_search_limit_cpu(
     *,
     psi: np.ndarray,
     grid: Grid2D,
     axis: _MagneticAxis,
     limiter_poly: np.ndarray,
 ) -> float | None:
-    """Найти первый достижимый уровень контакта поверхности с лимитером."""
+    """Вернуть внешний численный предел поиска уровней ``psi``.
+
+    Значения на ограничителе задают только диапазон поиска. Кандидат не
+    обязан касаться ограничителя и принимается исключительно по замкнутости,
+    охвату магнитной оси и геометрической допустимости внутри лимитера.
+    """
     limiter_points = _sample_limiter_points(limiter_poly, grid)
     limiter_values = _sample_psi_bilinear(psi, grid, limiter_points)
     values = limiter_values[np.isfinite(limiter_values)]
@@ -1254,6 +1244,6 @@ def _suchkov_contact_level_cpu(
     axis_level = float(axis.level)
     if axis.kind == "maximum":
         candidates = values[values < axis_level]
-        return None if candidates.size == 0 else float(np.max(candidates))
+        return None if candidates.size == 0 else float(np.min(candidates))
     candidates = values[values > axis_level]
-    return None if candidates.size == 0 else float(np.min(candidates))
+    return None if candidates.size == 0 else float(np.max(candidates))
