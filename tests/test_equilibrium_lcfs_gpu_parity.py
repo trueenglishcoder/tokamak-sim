@@ -136,8 +136,8 @@ def test_full_gpu_lcfs_matches_cpu_reference(name: str) -> None:
         intersection_counts,
         core_boundary,
         core_boundary_count,
-        _contacts,
-        _contact_count,
+        contacts,
+        contact_count,
         quality,
     ) = _gpu_result(
         psi=psi,
@@ -170,9 +170,12 @@ def test_full_gpu_lcfs_matches_cpu_reference(name: str) -> None:
     assert bool(torch.all(torch.isfinite(quality[0])))
     if expected_code == 1:
         assert not bool(torch.isfinite(selected_x[0]).any())
+        assert int(contact_count[0]) == 1
+        assert bool(torch.all(torch.isfinite(contacts[0, 0])))
     else:
         finite_x = torch.all(torch.isfinite(selected_x[0]), dim=1)
         assert int(torch.count_nonzero(finite_x)) == expected_code - 1
+        assert int(contact_count[0]) == 0
 
 
 def test_limited_wall_contact_accepts_machine_precision_endpoint() -> None:

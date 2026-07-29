@@ -907,24 +907,23 @@ def _equilibrium_lcfs_fixed_angle_search(
         wall_chi_candidates,
         torch.full_like(wall_chi_candidates, float("inf")),
     )
-    first_wall_chi, _first_wall_index = torch.min(valid_wall_chi, dim=1)
-    wall_group_tolerance = torch.maximum(
-        1.0e-10 * flux_scale,
-        1.0e-7 * torch.clamp(first_wall_chi, min=1.0e-12),
-    )
-    same_wall_level = wall_candidate_valid & (
-        torch.abs(wall_chi_candidates - first_wall_chi[:, None])
-        <= wall_group_tolerance[:, None]
-    )
-    wall_group_count = torch.sum(same_wall_level.to(torch.int64), dim=1)
-    wall_level_sum = torch.sum(
-        torch.where(same_wall_level, wall_candidate_levels, torch.zeros_like(wall_candidate_levels)),
+    first_wall_chi, first_wall_index = torch.min(valid_wall_chi, dim=1)
+    has_wall = torch.isfinite(first_wall_chi)
+    first_wall_level = torch.gather(
+        wall_candidate_levels,
         dim=1,
+        index=first_wall_index[:, None],
+    ).reshape(B)
+    wall_level = torch.where(
+        has_wall,
+        first_wall_level,
+        torch.full_like(first_wall_level, float("nan")),
     )
-    wall_level = wall_level_sum / torch.clamp(wall_group_count.to(dtype), min=1.0)
-    wall_chi = orientation * (wall_level - axis_level)
-    has_wall = wall_group_count > 0
-    wall_chi = torch.where(has_wall, wall_chi, torch.full_like(wall_chi, float("inf")))
+    wall_chi = torch.where(
+        has_wall,
+        first_wall_chi,
+        torch.full_like(first_wall_chi, float("inf")),
+    )
 
     x_points, x_levels, x_valid = _xpoint_candidates_gpu(
         psi,
@@ -1016,19 +1015,18 @@ def _equilibrium_lcfs_fixed_angle_search(
             selected_x,
         )
 
-    selected_contacts = torch.full(
-        (B, wall_candidate_count, 2),
-        float("nan"),
-        dtype=dtype,
-        device=device,
-    )
-    selected_contact_mask = (~use_x[:, None]) & same_wall_level
-    selected_contacts = torch.where(
-        selected_contact_mask[:, :, None],
+    first_wall_point = torch.gather(
         wall_points,
-        selected_contacts,
+        dim=1,
+        index=first_wall_index[:, None, None].expand(-1, 1, 2),
     )
-    selected_contact_count = torch.sum(selected_contact_mask.to(torch.int64), dim=1)
+    limited_selected = (~use_x) & has_wall
+    selected_contacts = torch.where(
+        limited_selected[:, None, None],
+        first_wall_point,
+        torch.full_like(first_wall_point, float("nan")),
+    )
+    selected_contact_count = limited_selected.to(torch.int64)
 
     points, radii, measurement_found, measurement_counts = _ray_crossings_with_counts(
         psi=psi,
