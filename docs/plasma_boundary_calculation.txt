@@ -105,9 +105,11 @@ The CPU implementation is an independent reference used for development and
 parity tests. It is not executed inside a GPU replay or training step.
 
 The production GPU implementation performs the complete primary-core LCFS
-selection. It returns the boundary level, topology, axis, selected X-points,
-fixed-angle radii, contacts, quality metrics, and, when requested, a dense closed
-core contour. All of these outputs come from one selected GPU result.
+selection. It builds marching-squares segments for each tested level, promotes
+selected X-points to graph nodes, traces the cycle containing the primary axis,
+and projects fixed-angle radii from that graph. Boundary level, topology, axis,
+X-points, contacts, quality metrics, and the optional dense contour therefore
+come from one selected GPU result.
 
 Large RL batches disable only dense-contour materialization because the policy
 does not consume that array. Single-lane replay enables it for artifacts and
@@ -140,15 +142,16 @@ Batched GPU execution
 ---------------------
 
 The batched GPU path orders limiter and X-point candidates outward from the
-magnetic axis, validates the primary-core first exit, selects one physical LCFS
-level, and derives every production output from that level. Configured-angle
-radii are always computed. A 256-angle closed core contour is additionally
-materialized only when artifact output requests it.
+magnetic axis. Each tested candidate is converted to a marching-squares segment
+graph. A candidate is accepted only when the graph surrounds the primary axis,
+remains inside the limiter, and reaches its defining limiter contact or X-point.
+The first valid outward candidate becomes the LCFS.
 
-The GPU contour is not reconstructed from previously saved 32 radii and is not
-smoothed by a spline. It is evaluated independently at a denser angular grid
-from the same selected equilibrium level. Exact selected X-points and limiter
-contacts are snapped into their nearest dense contour nodes.
+Configured-angle radii are projected from the accepted graph. Artifact runs also
+trace the graph cycle, choose the branches directed toward the primary axis at
+X-points, resample that ordered cycle, and snap exact X-points and limiter
+contacts into it. The contour is not reconstructed from the 32 radii and is not
+smoothed by a spline.
 
 CPU/GPU parity tests require equal topology, boundary level within tolerance,
 fixed-angle radii within grid-scale error, and bidirectional dense-contour error

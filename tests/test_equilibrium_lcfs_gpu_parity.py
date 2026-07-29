@@ -239,3 +239,93 @@ def test_limited_wall_contact_accepts_machine_precision_endpoint() -> None:
         atol=3.0e-3,
         rtol=0.0,
     )
+
+
+def test_batched_single_null_topology_sweep_matches_cpu_reference() -> None:
+    """Keep the full GPU level-set graph valid across a diverted transition sweep."""
+    n = 121
+    low = -2.5
+    high = 2.5
+    step = (high - low) / float(n - 1)
+    center = (0.0, 1.0)
+    grid = Grid2D(
+        r=Grid1D(start=low, step=step, size=n, center=center[0]),
+        z=Grid1D(start=low, step=step, size=n, center=center[1]),
+    )
+    R, Z = grid.mesh()
+    limiter = _limiter()
+    angles = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=float)
+    tilts = np.linspace(-0.08, 0.08, 9, dtype=float)
+    psi_batch = np.stack(
+        [R * R + (Z * Z - 1.0) ** 2 + float(tilt) * Z for tilt in tilts],
+        axis=0,
+    )
+
+    field = torch.as_tensor(psi_batch, dtype=torch.float64)
+    limiter_t = torch.as_tensor(limiter, dtype=torch.float64)
+    axis_points, axis_level, axis_kind, axis_valid = _axis_search(
+        field,
+        grid,
+        center,
+        limiter_t,
+    )
+    gpu = _equilibrium_lcfs_fixed_angle_search(
+        psi=field,
+        grid=grid,
+        axis_points=axis_points,
+        projection_center=torch.as_tensor([center], dtype=torch.float64).expand(len(tilts), -1),
+        axis_level=axis_level,
+        axis_kind=axis_kind,
+        axis_valid=axis_valid,
+        measurement_angles=torch.as_tensor(angles, dtype=torch.float64),
+        validation_angles=torch.as_tensor(angles, dtype=torch.float64),
+        dense_angles=torch.linspace(-float(np.pi), float(np.pi), 257, dtype=torch.float64)[:-1],
+        limiter=limiter_t,
+        limiter_samples=torch.as_tensor(
+            _sample_closed_polyline_numpy(limiter, 512),
+            dtype=torch.float64,
+        ),
+        ray_samples=512,
+        return_dense_boundary=True,
+    )
+    signal, topology, selected_x, counts, boundary, boundary_count, _contacts, contact_count, quality = gpu
+    _points, radii, found, levels = signal
+
+    assert bool(torch.all(found))
+    assert bool(torch.all(topology == 2))
+    assert bool(torch.all(boundary_count == 257))
+    assert bool(torch.all(torch.isfinite(radii)))
+    assert bool(torch.all(counts == 1))
+    assert bool(torch.all(torch.isfinite(quality)))
+    assert bool(torch.all(contact_count == 0))
+    assert bool(torch.all(torch.sum(torch.all(torch.isfinite(selected_x), dim=2), dim=1) == 1))
+    assert bool(torch.allclose(boundary[:, 0, :], boundary[:, -1, :], atol=1.0e-12, rtol=0.0))
+
+    for index, psi in enumerate(psi_batch):
+        cpu = find_equilibrium_lcfs(
+            psi,
+            grid,
+            center_hint=center,
+            limiter_shape=limiter,
+            fixed_angles=angles,
+        )
+        assert cpu.topology == "single_null"
+        assert float(levels[index]) == pytest.approx(cpu.psi_boundary, abs=5.0e-3)
+        assert np.allclose(
+            np.asarray(radii[index]),
+            cpu.fixed_angle_projection.radii,
+            atol=2.0e-2,
+            rtol=0.0,
+        )
+
+
+def test_gpu_lcfs_uses_level_set_graph_not_radial_candidate_definition() -> None:
+    """Guard the production GPU path against reverting to radial LCFS selection."""
+    import inspect
+
+    source = inspect.getsource(_equilibrium_lcfs_fixed_angle_search)
+
+    assert "_marching_squares_segments_gpu" in source
+    assert "_trace_core_cycle_gpu" in source
+    assert "_target_level_contact_gpu" not in source
+    assert "_ray_crossings_with_counts" not in source

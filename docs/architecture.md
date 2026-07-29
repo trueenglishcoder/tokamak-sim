@@ -77,11 +77,12 @@ The CPU reference implementation is split into explicit components:
 - `boundary_projection.py`: dense-boundary projection to fixed-angle RL radii
 
 The production batched implementation in `boundary_gpu.py` evaluates the same
-physical wall-versus-X-point rule directly on tensors. It returns the selected
-boundary level, magnetic axis, X-points, topology, fixed-angle radii, and an
-optional dense closed core contour. The dense contour and the 32 RL radii are
-materializations of one selected GPU LCFS result. They are never mixed with a
-second CPU result.
+physical wall-versus-X-point rule directly on tensors. Candidate levels are
+converted to marching-squares segment graphs on the GPU. Selected X-points are
+explicit graph nodes, and the cycle containing the primary axis is traced before
+fixed-angle projection. The selected boundary level, topology, dense contour,
+and 32 RL radii therefore belong to one GPU LCFS result and are never mixed with
+a second CPU result.
 
 Training keeps dense-contour materialization disabled because the policy only
 consumes fixed-angle radii. Single-lane replay and artifact runs enable it, so
@@ -162,14 +163,13 @@ Plotting helpers in `tokamak_control/viz/plotting.py` consume saved artifacts ra
 ## Batched GPU boundary contract
 
 `equilibrium_lcfs` has one physical definition and one production GPU result.
-The GPU implementation selects wall- or X-point-limited topology, returns the
-magnetic axis and selected X-points, computes the configured fixed-angle
-projection, and can materialize a 256-sample closed core contour from the same
-selected level. No CPU boundary call occurs inside the batched GPU replay or
-training loop.
+The GPU implementation orders wall and X-point candidates, extracts their
+marching-squares level-set segments, represents X-points as graph nodes, and
+traces the primary-core cycle. Fixed-angle radii are projected from that graph.
+No CPU boundary call occurs inside the batched GPU replay or training loop.
 
-Dense materialization is enabled for single-lane artifact runs and disabled for
-large training batches. This changes only which output is stored, not the
-selected LCFS level or the radii consumed by RL. CPU/GPU parity tests compare
-level, topology, fixed-angle radii, and the dense contour against the independent
-CPU reference on limited, single-null, and double-null equilibria.
+Single-lane artifact runs additionally resample the traced cycle to a fixed-size
+closed contour. Large training batches skip only this stored sequence. CPU/GPU
+parity tests compare level, topology, fixed-angle radii, and the dense contour
+against the independent CPU reference on limited, single-null, double-null, and
+batched diverted-transition equilibria.
