@@ -22,7 +22,6 @@ from tokamak_control.geometry.boundary_projection import (
 )
 from tokamak_control.geometry.critical_points import (
     CriticalPoint,
-    CriticalPointSet,
     find_critical_points,
 )
 from tokamak_control.geometry.equilibrium_field import EquilibriumField
@@ -70,8 +69,8 @@ class EquilibriumBoundary:
 class EquilibriumLcfsSettings:
     critical_level_relative_tolerance: float = 2.0e-4
     flux_residual_relative_tolerance: float = 2.0e-5
-    limiter_contact_grid_tolerance: float = 2.5
-    xpoint_core_grid_tolerance: float = 2.5
+    limiter_contact_grid_tolerance: float = 0.75
+    xpoint_core_grid_tolerance: float = 1.5
     minimum_positive_flux_fraction: float = 1.0e-9
 
 
@@ -109,7 +108,7 @@ def find_equilibrium_lcfs(
         flux_floor=flux_floor,
     )
     x_groups = _group_xpoint_candidates(
-        critical,
+        critical.x_points,
         psi_axis=float(axis.level),
         orientation=orientation,
         relative_tolerance=float(options.critical_level_relative_tolerance),
@@ -249,60 +248,73 @@ def _limiter_flux_candidates(
     orientation: float,
     flux_floor: float,
 ) -> list[tuple[float, float, tuple[tuple[np.ndarray, int], ...]]]:
+    """Find local outward-flux minima along the physical limiter."""
     raw: list[tuple[float, float, np.ndarray, int]] = []
     for segment_index, (a, b) in enumerate(zip(limiter[:-1], limiter[1:], strict=True)):
         a_arr = np.asarray(a, dtype=float)
         b_arr = np.asarray(b, dtype=float)
-        length = float(np.linalg.norm(b_arr - a_arr))
-        sample_count = max(int(np.ceil(length / max(0.25 * field.grid_scale, 1.0e-12))), 8)
+        vector = b_arr - a_arr
+        length = float(np.linalg.norm(vector))
+        sample_count = max(int(np.ceil(length / max(0.25 * field.grid_scale, 1.0e-12))), 12)
         t_grid = np.linspace(0.0, 1.0, sample_count + 1, dtype=float)
+        points = a_arr[None, :] + t_grid[:, None] * vector[None, :]
+        levels = field.value(points)
+        chi = _oriented_flux(levels, psi_axis=psi_axis, orientation=orientation)
+
+        candidate_indices: list[int] = []
+        for index in range(1, sample_count):
+            if chi[index] <= chi[index - 1] and chi[index] <= chi[index + 1]:
+                candidate_indices.append(index)
+        if chi[0] <= chi[1]:
+            candidate_indices.append(0)
+        if chi[-1] <= chi[-2]:
+            candidate_indices.append(sample_count)
 
         def chi_at(t_value: float) -> float:
-            point = a_arr + float(t_value) * (b_arr - a_arr)
-            return float(_oriented_flux(field.value(point)[0], psi_axis=psi_axis, orientation=orientation))
+            point = a_arr + float(t_value) * vector
+            value = float(field.value(point)[0])
+            return float(_oriented_flux(value, psi_axis=psi_axis, orientation=orientation))
 
-        sampled = np.asarray([chi_at(t) for t in t_grid], dtype=float)
-        candidate_intervals: list[tuple[float, float]] = []
-        for index in range(1, sample_count):
-            if sampled[index] <= sampled[index - 1] and sampled[index] <= sampled[index + 1]:
-                candidate_intervals.append((float(t_grid[index - 1]), float(t_grid[index + 1])))
-        for endpoint in (0.0, 1.0):
-            chi = chi_at(endpoint)
-            if np.isfinite(chi) and chi > float(flux_floor):
-                point = a_arr + endpoint * (b_arr - a_arr)
-                level = float(field.value(point)[0])
-                raw.append((chi, level, point, segment_index))
-        for lo, hi in candidate_intervals:
-            result = minimize_scalar(chi_at, bounds=(lo, hi), method="bounded", options={"xatol": 1.0e-12})
-            if not result.success:
-                continue
-            t_value = float(np.clip(result.x, 0.0, 1.0))
-            point = a_arr + t_value * (b_arr - a_arr)
-            chi = chi_at(t_value)
-            if not np.isfinite(chi) or chi <= float(flux_floor):
+        for index in candidate_indices:
+            if index == 0 or index == sample_count:
+                t_value = float(t_grid[index])
+            else:
+                result = minimize_scalar(
+                    chi_at,
+                    bounds=(float(t_grid[index - 1]), float(t_grid[index + 1])),
+                    method="bounded",
+                    options={"xatol": 1.0e-13, "maxiter": 64},
+                )
+                if not result.success:
+                    continue
+                t_value = float(np.clip(result.x, 0.0, 1.0))
+            point = a_arr + t_value * vector
+            chi_value = chi_at(t_value)
+            if not np.isfinite(chi_value) or chi_value <= float(flux_floor):
                 continue
             level = float(field.value(point)[0])
-            raw.append((chi, level, point, segment_index))
+            raw.append((chi_value, level, point, segment_index))
 
     raw.sort(key=lambda item: item[0])
     groups: list[list[tuple[float, float, np.ndarray, int]]] = []
-    flux_tol = max(1.0e-10 * field.flux_scale, 1.0e-7 * max((raw[0][0] if raw else 1.0), 1.0e-12))
+    flux_tolerance = max(1.0e-10 * field.flux_scale, 1.0e-7 * max(raw[0][0] if raw else 1.0, 1.0e-12))
     for candidate in raw:
-        if groups and abs(candidate[0] - groups[-1][0][0]) <= flux_tol:
+        if groups and abs(candidate[0] - groups[-1][0][0]) <= flux_tolerance:
             groups[-1].append(candidate)
         else:
             groups.append([candidate])
-    out: list[tuple[float, float, tuple[tuple[np.ndarray, int], ...]]] = []
-    for group in groups:
-        chi = float(np.mean([item[0] for item in group]))
-        level = float(np.mean([item[1] for item in group]))
-        points = tuple((np.asarray(item[2], dtype=float).copy(), int(item[3])) for item in group)
-        out.append((chi, level, points))
-    return out
+    return [
+        (
+            float(np.mean([item[0] for item in group])),
+            float(np.mean([item[1] for item in group])),
+            tuple((np.asarray(item[2], dtype=float).copy(), int(item[3])) for item in group),
+        )
+        for group in groups
+    ]
 
 
 def _group_xpoint_candidates(
-    critical: CriticalPointSet,
+    x_points: tuple[CriticalPoint, ...],
     *,
     psi_axis: float,
     orientation: float,
@@ -311,7 +323,7 @@ def _group_xpoint_candidates(
     flux_floor: float,
 ) -> list[tuple[float, tuple[CriticalPoint, ...]]]:
     values: list[tuple[float, CriticalPoint]] = []
-    for point in critical.x_points:
+    for point in x_points:
         chi = float(_oriented_flux(point.level, psi_axis=psi_axis, orientation=orientation))
         if np.isfinite(chi) and chi > float(flux_floor):
             values.append((chi, point))
@@ -357,7 +369,7 @@ def _branch_limiter_contacts(
     limiter: np.ndarray,
 ) -> tuple[LimiterContact, ...]:
     contacts: list[LimiterContact] = []
-    tolerance = 2.5 * field.grid_scale
+    tolerance = 0.75 * field.grid_scale
     for branch in branches:
         if branch.shape[0] == 0:
             continue
@@ -413,10 +425,6 @@ def _core_component_valid(
         tol=0.0,
     ).reshape(field.grid.shape)
     mask = np.asarray((chi < chi_boundary) & inside_domain, dtype=bool)
-    for x_point in x_points:
-        i = field.grid.r.nearest_index(float(x_point.point[0]))
-        j = field.grid.z.nearest_index(float(x_point.point[1]))
-        mask[max(j - 1, 0) : min(j + 2, mask.shape[0]), max(i - 1, 0) : min(i + 2, mask.shape[1])] = False
     labels, _count = label(mask, structure=np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=int))
     axis_i = field.grid.r.nearest_index(float(axis.point[0]))
     axis_j = field.grid.z.nearest_index(float(axis.point[1]))
@@ -435,7 +443,7 @@ def _core_component_valid(
         distance = float(np.min(np.linalg.norm(grid_points - np.asarray(x_point.point)[None, :], axis=1)))
         if distance > float(xpoint_tolerance):
             return False
-    boundary_inside = points_in_or_on_polygon(boundary[:-1], limiter, tol=1.5 * field.grid_scale)
+    boundary_inside = points_in_or_on_polygon(boundary[:-1], limiter, tol=0.35 * field.grid_scale)
     return bool(np.all(boundary_inside))
 
 
@@ -503,10 +511,15 @@ def _quality_metrics(
     axis: CriticalPoint,
     orientation: float,
 ) -> BoundaryQuality:
-    residual = np.abs(field.value(boundary[:-1]) - float(level))
+    vertices = np.asarray(boundary[:-1], dtype=float)
+    residual = np.abs(field.value(vertices) - float(level))
     max_residual = float(np.max(residual)) if residual.size else float("inf")
     flux_span = abs(float(level) - float(axis.level))
-    normalized = max_residual / max(flux_span, 1.0e-30)
+    r_span = abs(float(field.grid.r.coords()[-1] - field.grid.r.coords()[0]))
+    z_span = abs(float(field.grid.z.coords()[-1] - field.grid.z.coords()[0]))
+    domain_diagonal = max(float(np.hypot(r_span, z_span)), field.grid_scale)
+    interpolation_floor = (field.grid_scale / domain_diagonal) ** 4
+    normalized = max(max_residual / max(flux_span, 1.0e-30), interpolation_floor)
     closure = float(np.linalg.norm(boundary[0] - boundary[-1]))
     regular = boundary[:-1]
     if x_points and regular.shape[0]:
@@ -515,7 +528,7 @@ def _quality_metrics(
         regular = regular[distance > 1.5 * field.grid_scale]
     gradients = np.linalg.norm(field.gradient(regular), axis=1) if regular.shape[0] else np.zeros((0,), dtype=float)
     min_gradient = float(np.min(gradients)) if gradients.size else 0.0
-    inside = points_in_or_on_polygon(boundary[:-1], limiter, tol=1.5 * field.grid_scale)
+    inside = points_in_or_on_polygon(boundary[:-1], limiter, tol=0.35 * field.grid_scale)
     violation_count = int(np.count_nonzero(~inside))
     chi = _oriented_flux(field.psi, psi_axis=float(axis.level), orientation=orientation)
     chi_boundary = float(_oriented_flux(level, psi_axis=float(axis.level), orientation=orientation))

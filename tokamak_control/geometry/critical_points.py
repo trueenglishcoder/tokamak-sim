@@ -80,7 +80,9 @@ def find_critical_points(
     hint = np.asarray(center_hint, dtype=float)
     o_points.sort(key=lambda p: float(np.linalg.norm(np.asarray(p.point) - hint)))
     primary = o_points[0]
-    x_points = _filter_x_points_by_axis_connection(field, primary, x_points)
+    # Relevance is a topological property of the complete level-set graph.
+    # A straight axis-to-saddle line test rejects valid diverted equilibria, so
+    # all in-limiter saddles are retained and ordered by outward flux distance.
     x_points.sort(key=lambda p: abs(float(p.level) - float(primary.level)))
     return CriticalPointSet(
         o_points=tuple(o_points[: max(int(max_o_points), 1)]),
@@ -203,32 +205,3 @@ def _is_duplicate(candidate: CriticalPoint, existing: list[CriticalPoint], *, to
         if float(np.linalg.norm(p - np.asarray(old.point, dtype=float))) <= float(tolerance):
             return True
     return False
-
-
-def _filter_x_points_by_axis_connection(
-    field: EquilibriumField,
-    axis: CriticalPoint,
-    x_points: list[CriticalPoint],
-) -> list[CriticalPoint]:
-    axis_point = np.asarray(axis.point, dtype=float)
-    kept: list[CriticalPoint] = []
-    for x_point in x_points:
-        delta = float(x_point.level - axis.level)
-        if not np.isfinite(delta) or abs(delta) <= 1.0e-12 * field.flux_scale:
-            continue
-        samples = np.linspace(0.0, 1.0, 96, dtype=float)
-        target = np.asarray(x_point.point, dtype=float)
-        line = axis_point[None, :] + samples[:, None] * (target - axis_point)[None, :]
-        normalized = (field.value(line) - float(axis.level)) / delta
-        if not np.all(np.isfinite(normalized)):
-            continue
-        # The direct path from the primary axis to a primary separatrix saddle
-        # must stay within the same flux interval. Small interpolation ripple is
-        # tolerated, but a separate extremum along the path rejects the saddle.
-        if float(np.min(normalized)) < -0.02 or float(np.max(normalized)) > 1.02:
-            continue
-        adverse = np.diff(normalized) < -0.02
-        if int(np.count_nonzero(adverse)) > 2:
-            continue
-        kept.append(x_point)
-    return kept

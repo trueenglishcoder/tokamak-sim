@@ -220,6 +220,22 @@ def fixed_angle_boundary_gpu(
         )
     if use_limiter and (limiter_t is None or int(limiter_t.shape[0]) < 3):
         raise BoundaryNotFoundError(f"{mode} requires limiter geometry")
+    if mode == "equilibrium_lcfs":
+        # Topology must not be selected by a second radial-ray heuristic. Until
+        # the canonical FLUSH-style graph is ported to tensor kernels, route
+        # every batch lane through the same extractor as the CPU dispatcher.
+        from tokamak_control.geometry.boundary_gpu_canonical import (
+            fixed_angle_boundary_gpu_canonical,
+        )
+
+        return fixed_angle_boundary_gpu_canonical(
+            field=field,
+            grid=grid,
+            center=center,
+            angles=angles,
+            limiter=limiter_t,
+            return_dense_boundary=bool(return_dense_boundary),
+        )
     center_level = _sample_points(field, grid, center_t[:, None, :]).reshape(B)
     axis_points = center_t
     axis_level = center_level

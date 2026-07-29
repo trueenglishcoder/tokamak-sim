@@ -1,11 +1,20 @@
-"""Topology-preserving extraction of level sets from a known equilibrium field."""
+"""FLUSH-style flux-surface graph on the same spline used for critical points.
+
+The equilibrium is represented by one bicubic ``EquilibriumField``.  A tailored
+rectangular topology grid is built for every requested surface.  The magnetic
+axis is inserted on grid lines and every selected X-point is placed near the
+centre of one element.  Surface intersections are solved on element edges from
+the bicubic field itself.  Four-intersection X-point elements are split into
+four branches meeting at the explicit saddle node before the global graph is
+assembled.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
-from contourpy import contour_generator
+from scipy.optimize import brentq
 
 from tokamak_control.geometry.boundary_common import (
     close_poly,
@@ -39,6 +48,13 @@ class LevelSetGraphResult:
     all_edges: tuple[LevelSetEdge, ...]
 
 
+@dataclass(frozen=True, slots=True, repr=True)
+class TopologyGrid:
+    r: np.ndarray
+    z: np.ndarray
+    psi: np.ndarray
+
+
 def extract_core_level_set(
     field: EquilibriumField,
     *,
@@ -47,352 +63,564 @@ def extract_core_level_set(
     limiter_poly: np.ndarray,
     x_points: tuple[CriticalPoint, ...] = (),
     require_x_cycle: bool = False,
+    refinement: int = 2,
 ) -> LevelSetGraphResult | None:
-    """Extract the cycle of ``psi=level`` bounding the primary core.
+    """Extract the axis-enclosing cycle of ``psi = level``.
 
-    X-points are explicit graph nodes. A contour passing through a saddle is
-    split into branches at every occurrence of that node, and the graph cycle
-    enclosing the primary magnetic axis is selected without imposing a smooth
-    tangent through the saddle.
+    ``refinement=2`` gives a topology grid with half the native R and Z spacing.
+    Selected X-points are centred in local cells, which is the key robustness
+    condition used by FLUSH near a separatrix.
     """
-    raw = _contours_at_level(field, float(level))
-    if not raw:
+    topology_grid = _build_topology_grid(
+        field,
+        axis=axis,
+        x_points=x_points,
+        refinement=max(int(refinement), 1),
+        limiter_poly=limiter_poly,
+    )
+    segments, node_points = _surface_segments(
+        field,
+        topology_grid,
+        float(level),
+        x_points=x_points,
+    )
+    if not segments:
         return None
-    x_coords = np.asarray([point.point for point in x_points], dtype=float).reshape(-1, 2)
-    snap_tolerance = 1.75 * field.grid_scale
-    edges: list[LevelSetEdge] = []
-    regular_cycles: list[LevelSetCycle] = []
+    edges = _compress_segments(segments, node_points)
+    if not edges:
+        return None
 
-    for polyline in raw:
-        closed = _is_closed(polyline, tolerance=1.5 * field.grid_scale)
-        refined = _refine_level_polyline(
-            field,
-            polyline,
-            float(level),
-            x_coords=x_coords,
-            x_exclusion_radius=snap_tolerance,
-        )
-        if refined.shape[0] < 2:
-            continue
-        markers = _xpoint_markers_on_polyline(
-            refined,
-            x_coords,
-            closed=closed,
-            snap_tolerance=snap_tolerance,
-        )
-        if closed and not markers:
-            loop = close_poly(refined)
-            regular_cycles.append(LevelSetCycle(points=loop, edge_indices=(), node_indices=()))
-            continue
-        split_edges = _split_polyline_at_markers(refined, markers, closed=closed)
-        edges.extend(split_edges)
-
-    cycles = list(regular_cycles)
+    cycles: list[LevelSetCycle] = []
+    for index, edge in enumerate(edges):
+        closed_regular = edge.start_node is None and edge.end_node is None and _is_closed(edge.points)
+        if closed_regular:
+            cycles.append(LevelSetCycle(close_poly(edge.points), (index,), ()))
+        elif edge.start_node is not None and edge.start_node == edge.end_node:
+            cycles.append(
+                LevelSetCycle(
+                    close_poly(edge.points),
+                    (index,),
+                    (int(edge.start_node),),
+                )
+            )
     cycles.extend(_enumerate_graph_cycles(edges))
-    valid_cycles: list[LevelSetCycle] = []
+
+    valid: list[LevelSetCycle] = []
+    limiter_tolerance = 0.35 * field.grid_scale
     for cycle in cycles:
-        if cycle.points.shape[0] < 4:
+        points = close_poly(np.asarray(cycle.points, dtype=float))
+        if points.shape[0] < 4:
             continue
         if require_x_cycle and not cycle.node_indices:
             continue
-        if not encloses_center(cycle.points, axis):
+        if not encloses_center(points, axis):
             continue
-        inside = points_in_or_on_polygon(cycle.points[:-1], limiter_poly, tol=1.5 * field.grid_scale)
-        if not bool(np.all(inside)):
+        if not bool(np.all(points_in_or_on_polygon(points[:-1], limiter_poly, tol=limiter_tolerance))):
             continue
-        area = abs(poly_area(cycle.points))
-        if not np.isfinite(area) or area <= 0.0:
-            continue
-        valid_cycles.append(cycle)
-
-    if not valid_cycles:
+        area = abs(poly_area(points))
+        if np.isfinite(area) and area > 0.0:
+            valid.append(LevelSetCycle(points, cycle.edge_indices, cycle.node_indices))
+    if not valid:
         return None
-    # A single equilibrium level can contain islands and secondary lobes. The
-    # primary core cycle is the largest cycle that contains the selected axis.
-    selected = max(valid_cycles, key=lambda cycle: abs(poly_area(cycle.points)))
-    used = set(selected.edge_indices)
+
+    selected = max(valid, key=lambda cycle: abs(poly_area(cycle.points)))
+    selected_boundary = close_poly(np.asarray(selected.points, dtype=float))
+    used_edges = set(selected.edge_indices)
     branches = tuple(
         np.asarray(edge.points, dtype=float).copy()
         for index, edge in enumerate(edges)
-        if index not in used and edge.points.shape[0] >= 2
+        if index not in used_edges and edge.points.shape[0] >= 2
     )
     return LevelSetGraphResult(
-        core_boundary=close_poly(np.asarray(selected.points, dtype=float)),
+        core_boundary=selected_boundary,
         separatrix_branches=branches,
         used_x_points=tuple(sorted(set(selected.node_indices))),
         all_edges=tuple(edges),
     )
 
 
-def _contours_at_level(field: EquilibriumField, level: float) -> list[np.ndarray]:
-    generator = contour_generator(
-        x=np.asarray(field.grid.r.coords(), dtype=float),
-        y=np.asarray(field.grid.z.coords(), dtype=float),
-        z=np.asarray(field.psi, dtype=float),
-        name="serial",
-        line_type="Separate",
-    )
-    out: list[np.ndarray] = []
-    for line in generator.lines(float(level)):
-        arr = np.asarray(line, dtype=float)
-        if arr.ndim == 2 and arr.shape[0] >= 2 and arr.shape[1] == 2:
-            out.append(arr)
-    return out
-
-
-def _refine_level_polyline(
+def _build_topology_grid(
     field: EquilibriumField,
-    points: np.ndarray,
+    *,
+    axis: tuple[float, float],
+    x_points: tuple[CriticalPoint, ...],
+    refinement: int,
+    limiter_poly: np.ndarray | None = None,
+) -> TopologyGrid:
+    native_r = np.asarray(field.grid.r.coords(), dtype=float)
+    native_z = np.asarray(field.grid.z.coords(), dtype=float)
+    r_step = abs(float(field.grid.r.step)) / float(refinement)
+    z_step = abs(float(field.grid.z.step)) / float(refinement)
+    r_lower = float(native_r[0])
+    r_upper = float(native_r[-1])
+    z_lower = float(native_z[0])
+    z_upper = float(native_z[-1])
+    if limiter_poly is not None:
+        limiter = np.asarray(limiter_poly, dtype=float).reshape(-1, 2)
+        padding = 1.25 * field.grid_scale
+        r_lower = max(r_lower, float(np.min(limiter[:, 0])) - padding)
+        r_upper = min(r_upper, float(np.max(limiter[:, 0])) + padding)
+        z_lower = max(z_lower, float(np.min(limiter[:, 1])) - padding)
+        z_upper = min(z_upper, float(np.max(limiter[:, 1])) + padding)
+    r = _tailored_coordinates(
+        r_lower,
+        r_upper,
+        r_step,
+        nodes=(float(axis[0]),),
+        centers=tuple(float(point.point[0]) for point in x_points),
+    )
+    z = _tailored_coordinates(
+        z_lower,
+        z_upper,
+        z_step,
+        nodes=(float(axis[1]),),
+        centers=tuple(float(point.point[1]) for point in x_points),
+    )
+    R, Z = np.meshgrid(r, z, indexing="xy")
+    points = np.column_stack((R.reshape(-1), Z.reshape(-1)))
+    psi = field.value(points).reshape(z.size, r.size)
+    return TopologyGrid(r=r, z=z, psi=psi)
+
+
+def _tailored_coordinates(
+    lower: float,
+    upper: float,
+    step: float,
+    *,
+    nodes: tuple[float, ...],
+    centers: tuple[float, ...],
+) -> np.ndarray:
+    if upper <= lower or step <= 0.0:
+        raise ValueError("invalid topology-grid bounds or step")
+    # A fixed irrational-like phase prevents ordinary tangencies from landing
+    # exactly on topology-grid vertices.  The physical domain endpoints remain
+    # exact, while interior spacing never exceeds the requested step.
+    phase = 0.3819660112501051
+    values = [float(lower), float(upper)]
+    coordinate = float(lower) + phase * float(step)
+    while coordinate < float(upper):
+        values.append(float(coordinate))
+        coordinate += float(step)
+
+    # Reserve one full local element around each X-point.  Processing points in
+    # coordinate order keeps disjoint X-point cells stable for double-null cases.
+    for center in sorted(centers):
+        if not (lower < center < upper):
+            continue
+        half = 0.5 * step
+        left = max(lower, center - half)
+        right = min(upper, center + half)
+        if right - left < 0.5 * step:
+            continue
+        values = [value for value in values if not (left < value < right)]
+        values.extend((left, right))
+
+    for node in nodes:
+        if lower < node < upper:
+            # Do not split a deliberately centred X-point cell.
+            in_reserved = any(abs(node - center) < 0.49 * step for center in centers)
+            if not in_reserved:
+                values.append(float(node))
+
+    ordered = sorted(values)
+    unique: list[float] = []
+    tolerance = 1.0e-12 * max(abs(lower), abs(upper), 1.0)
+    for value in ordered:
+        clipped = float(np.clip(value, lower, upper))
+        if not unique or abs(clipped - unique[-1]) > tolerance:
+            unique.append(clipped)
+    return np.asarray(unique, dtype=float)
+
+
+def _surface_segments(
+    field: EquilibriumField,
+    topology_grid: TopologyGrid,
     level: float,
     *,
-    x_coords: np.ndarray,
-    x_exclusion_radius: float,
-) -> np.ndarray:
-    arr = _remove_consecutive_duplicates(np.asarray(points, dtype=float), tolerance=1.0e-12)
-    if arr.shape[0] < 2:
-        return arr
-    project_mask = np.ones((arr.shape[0],), dtype=bool)
-    if x_coords.size:
-        distances = np.min(np.linalg.norm(arr[:, None, :] - x_coords[None, :, :], axis=2), axis=1)
-        project_mask = distances > float(x_exclusion_radius)
-    if bool(np.any(project_mask)):
-        projected, converged = field.project_to_level(arr[project_mask], float(level))
-        successful_indices = np.flatnonzero(project_mask)[converged]
-        arr[successful_indices] = projected[converged]
-    return _remove_consecutive_duplicates(arr, tolerance=1.0e-10)
-
-
-def _xpoint_markers_on_polyline(
-    points: np.ndarray,
-    x_coords: np.ndarray,
-    *,
-    closed: bool,
-    snap_tolerance: float,
-) -> list[tuple[float, int, np.ndarray]]:
-    if x_coords.size == 0 or points.shape[0] < 2:
-        return []
-    work = close_poly(points) if closed else np.asarray(points, dtype=float)
-    seg_start = work[:-1]
-    seg_end = work[1:]
-    seg_vec = seg_end - seg_start
-    seg_len = np.linalg.norm(seg_vec, axis=1)
-    cumulative = np.concatenate(([0.0], np.cumsum(seg_len)))
-    total = float(cumulative[-1])
-    markers: list[tuple[float, int, np.ndarray]] = []
-
-    for node_index, x_point in enumerate(x_coords):
-        denom = np.sum(seg_vec * seg_vec, axis=1)
-        u = np.zeros_like(denom)
-        valid = denom > 0.0
-        u[valid] = np.clip(np.sum((x_point[None, :] - seg_start[valid]) * seg_vec[valid], axis=1) / denom[valid], 0.0, 1.0)
-        nearest = seg_start + u[:, None] * seg_vec
-        distance = np.linalg.norm(nearest - x_point[None, :], axis=1)
-        eligible = distance <= float(snap_tolerance)
-        clusters = _cyclic_true_clusters(eligible) if closed else _linear_true_clusters(eligible)
-        for cluster in clusters:
-            best_index = min(cluster, key=lambda index: float(distance[index]))
-            s = float(cumulative[best_index] + u[best_index] * seg_len[best_index])
-            if closed and total > 0.0:
-                s %= total
-            markers.append((s, int(node_index), np.asarray(x_point, dtype=float).copy()))
-
-    markers.sort(key=lambda item: item[0])
-    deduped: list[tuple[float, int, np.ndarray]] = []
-    arclength_tol = 0.25 * float(snap_tolerance)
-    for marker in markers:
-        if deduped and marker[1] == deduped[-1][1] and abs(marker[0] - deduped[-1][0]) <= arclength_tol:
-            continue
-        deduped.append(marker)
-    if closed and len(deduped) >= 2 and total > 0.0:
-        first = deduped[0]
-        last = deduped[-1]
-        if first[1] == last[1] and (first[0] + total - last[0]) <= arclength_tol:
-            deduped = deduped[:-1]
-    return deduped
-
-
-def _split_polyline_at_markers(
-    points: np.ndarray,
-    markers: list[tuple[float, int, np.ndarray]],
-    *,
-    closed: bool,
-) -> list[LevelSetEdge]:
-    work = close_poly(points) if closed else np.asarray(points, dtype=float)
-    lengths = np.linalg.norm(np.diff(work, axis=0), axis=1)
-    cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
-    total = float(cumulative[-1])
-    if not markers:
-        return [LevelSetEdge(None, None, work.copy())]
-
-    out: list[LevelSetEdge] = []
-    if closed:
-        for index, start in enumerate(markers):
-            end = markers[(index + 1) % len(markers)]
-            path = _polyline_interval(work, cumulative, start, end, total=total, wrap=end[0] <= start[0])
-            if path.shape[0] >= 2:
-                out.append(LevelSetEdge(start[1], end[1], path))
-    else:
-        first = markers[0]
-        prefix = _polyline_interval(
-            work,
-            cumulative,
-            (0.0, -1, work[0]),
-            first,
-            total=total,
-            wrap=False,
-        )
-        if prefix.shape[0] >= 2:
-            out.append(LevelSetEdge(None, first[1], prefix))
-        for start, end in zip(markers[:-1], markers[1:], strict=True):
-            path = _polyline_interval(work, cumulative, start, end, total=total, wrap=False)
-            if path.shape[0] >= 2:
-                out.append(LevelSetEdge(start[1], end[1], path))
-        last = markers[-1]
-        suffix = _polyline_interval(
-            work,
-            cumulative,
-            last,
-            (total, -1, work[-1]),
-            total=total,
-            wrap=False,
-        )
-        if suffix.shape[0] >= 2:
-            out.append(LevelSetEdge(last[1], None, suffix))
-    return out
-
-
-def _polyline_interval(
-    work: np.ndarray,
-    cumulative: np.ndarray,
-    start: tuple[float, int, np.ndarray],
-    end: tuple[float, int, np.ndarray],
-    *,
-    total: float,
-    wrap: bool,
-) -> np.ndarray:
-    s0 = float(start[0])
-    s1 = float(end[0])
-    if not wrap:
-        mids = work[(cumulative > s0 + 1.0e-12) & (cumulative < s1 - 1.0e-12)]
-        return _remove_consecutive_duplicates(
-            np.vstack((np.asarray(start[2], dtype=float), mids, np.asarray(end[2], dtype=float))),
-            tolerance=1.0e-12,
-        )
-    tail = work[cumulative > s0 + 1.0e-12]
-    head = work[cumulative < s1 - 1.0e-12]
-    return _remove_consecutive_duplicates(
-        np.vstack((np.asarray(start[2], dtype=float), tail, head, np.asarray(end[2], dtype=float))),
-        tolerance=1.0e-12,
+    x_points: tuple[CriticalPoint, ...],
+) -> tuple[list[tuple[tuple, tuple]], dict[tuple, np.ndarray]]:
+    r = topology_grid.r
+    z = topology_grid.z
+    psi = topology_grid.psi
+    flux_tolerance = max(
+        2.0e-12 * field.flux_scale,
+        128.0 * np.finfo(float).eps * max(abs(float(level)), 1.0),
     )
+
+    x_by_cell: dict[tuple[int, int], tuple[int, CriticalPoint]] = {}
+    for index, point in enumerate(x_points):
+        i = int(np.clip(np.searchsorted(r, float(point.point[0]), side="right") - 1, 0, r.size - 2))
+        j = int(np.clip(np.searchsorted(z, float(point.point[1]), side="right") - 1, 0, z.size - 2))
+        if abs(float(point.level) - float(level)) <= 8.0 * flux_tolerance:
+            x_by_cell[(j, i)] = (index, point)
+
+    x_halo: set[tuple[int, int]] = set()
+    for x_j, x_i in x_by_cell:
+        for delta_j in (-1, 0, 1):
+            for delta_i in (-1, 0, 1):
+                candidate = (x_j + delta_j, x_i + delta_i)
+                if 0 <= candidate[0] < z.size - 1 and 0 <= candidate[1] < r.size - 1:
+                    x_halo.add(candidate)
+
+    segments: list[tuple[tuple, tuple]] = []
+    node_points: dict[tuple, np.ndarray] = {}
+    edge_root_cache: dict[tuple[float, float, float, float], tuple[np.ndarray, ...]] = {}
+    for j in range(z.size - 1):
+        for i in range(r.size - 1):
+            corners = np.array(
+                [psi[j, i], psi[j, i + 1], psi[j + 1, i + 1], psi[j + 1, i]],
+                dtype=float,
+            )
+            exact_x = x_by_cell.get((j, i))
+            if exact_x is None and (j, i) not in x_halo:
+                if float(level) < float(np.min(corners)) - flux_tolerance:
+                    continue
+                if float(level) > float(np.max(corners)) + flux_tolerance:
+                    continue
+
+            roots = _cell_perimeter_roots(
+                field,
+                r,
+                z,
+                i,
+                j,
+                float(level),
+                flux_tolerance,
+                exhaustive=((j, i) in x_halo),
+                root_cache=edge_root_cache,
+            )
+            if exact_x is not None:
+                x_index, x_point = exact_x
+                x_key = ("x", int(x_index))
+                x_coord = np.asarray(x_point.point, dtype=float)
+                node_points[x_key] = x_coord
+                # A well-resolved saddle has four perimeter exits.  More roots
+                # indicate that this topology grid is too coarse for the cell.
+                if len(roots) != 4:
+                    continue
+                for key, point in roots:
+                    node_points[key] = point
+                    if float(np.linalg.norm(point - x_coord)) > 1.0e-13:
+                        segments.append((key, x_key))
+                continue
+
+            if len(roots) == 2:
+                (key_a, point_a), (key_b, point_b) = roots
+                node_points[key_a] = point_a
+                node_points[key_b] = point_b
+                if key_a != key_b:
+                    segments.append((key_a, key_b))
+                continue
+            if len(roots) == 4:
+                for key, point in roots:
+                    node_points[key] = point
+                for first, second in _pair_four_roots(field, roots, r, z, i, j, float(level)):
+                    segments.append((first[0], second[0]))
+                continue
+            # Degenerate and unresolved cells are rejected rather than joined by
+            # a distance heuristic.  Refinement can then be increased explicitly.
+    return segments, node_points
+
+
+def _cell_perimeter_roots(
+    field: EquilibriumField,
+    r: np.ndarray,
+    z: np.ndarray,
+    i: int,
+    j: int,
+    level: float,
+    tolerance: float,
+    *,
+    exhaustive: bool,
+    root_cache: dict[tuple[float, float, float, float], tuple[np.ndarray, ...]],
+) -> list[tuple[tuple, np.ndarray]]:
+    # Counter-clockwise perimeter: bottom, right, top reversed, left reversed.
+    edges = (
+        (np.array([r[i], z[j]]), np.array([r[i + 1], z[j]]), ("h", j, i)),
+        (np.array([r[i + 1], z[j]]), np.array([r[i + 1], z[j + 1]]), ("v", j, i + 1)),
+        (np.array([r[i + 1], z[j + 1]]), np.array([r[i], z[j + 1]]), ("h", j + 1, i)),
+        (np.array([r[i], z[j + 1]]), np.array([r[i], z[j]]), ("v", j, i)),
+    )
+    roots: list[tuple[tuple, np.ndarray, float]] = []
+    perimeter_position = 0.0
+    for edge_index, (a, b, _base_key) in enumerate(edges):
+        cache_key = _canonical_edge_key(a, b)
+        cached = root_cache.get(cache_key)
+        if cached is None:
+            cached = tuple(
+                point
+                for _t_value, point in _edge_roots(
+                    field,
+                    a,
+                    b,
+                    level,
+                    tolerance,
+                    exhaustive=exhaustive,
+                )
+            )
+            root_cache[cache_key] = cached
+        vector = np.asarray(b, dtype=float) - np.asarray(a, dtype=float)
+        denominator = float(np.dot(vector, vector))
+        for point in cached:
+            t_value = (
+                0.0
+                if denominator <= 0.0
+                else float(np.clip(np.dot(point - np.asarray(a, dtype=float), vector) / denominator, 0.0, 1.0))
+            )
+            # Coordinate quantisation makes the same physical root from adjacent
+            # cells share a graph node even if Brent iterations differ by ulps.
+            key = (
+                "p",
+                round(float(point[0]), 12),
+                round(float(point[1]), 12),
+            )
+            roots.append((key, point, perimeter_position + t_value))
+        perimeter_position += 1.0
+
+    roots.sort(key=lambda item: item[2])
+    deduplicated: list[tuple[tuple, np.ndarray, float]] = []
+    spatial_tolerance = 2.0e-10 * max(field.grid_scale, 1.0)
+    for item in roots:
+        if deduplicated and float(np.linalg.norm(item[1] - deduplicated[-1][1])) <= spatial_tolerance:
+            continue
+        deduplicated.append(item)
+    if len(deduplicated) > 1 and float(np.linalg.norm(deduplicated[0][1] - deduplicated[-1][1])) <= spatial_tolerance:
+        deduplicated.pop()
+    return [(item[0], item[1]) for item in deduplicated]
+
+
+def _canonical_edge_key(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float, float]:
+    first = (round(float(a[0]), 14), round(float(a[1]), 14))
+    second = (round(float(b[0]), 14), round(float(b[1]), 14))
+    if second < first:
+        first, second = second, first
+    return first[0], first[1], second[0], second[1]
+
+
+def _edge_roots(
+    field: EquilibriumField,
+    a: np.ndarray,
+    b: np.ndarray,
+    level: float,
+    tolerance: float,
+    *,
+    exhaustive: bool,
+) -> list[tuple[float, np.ndarray]]:
+    vector = np.asarray(b, dtype=float) - np.asarray(a, dtype=float)
+    if exhaustive:
+        samples = np.linspace(0.0, 1.0, 9, dtype=float)
+    else:
+        samples = np.asarray([0.0, 1.0], dtype=float)
+    points = np.asarray(a, dtype=float)[None, :] + samples[:, None] * vector[None, :]
+    values = field.value(points) - float(level)
+    roots: list[float] = []
+    for index, value in enumerate(values):
+        if abs(float(value)) <= tolerance:
+            roots.append(float(samples[index]))
+    for index in range(samples.size - 1):
+        left = float(values[index])
+        right = float(values[index + 1])
+        if not np.isfinite(left) or not np.isfinite(right) or left * right >= 0.0:
+            continue
+
+        def residual(t_value: float) -> float:
+            point = np.asarray(a, dtype=float) + float(t_value) * vector
+            return float(field.value(point)[0] - float(level))
+
+        try:
+            root = brentq(
+                residual,
+                float(samples[index]),
+                float(samples[index + 1]),
+                xtol=1.0e-13,
+                rtol=4.0 * np.finfo(float).eps,
+                maxiter=64,
+            )
+        except ValueError:
+            continue
+        roots.append(float(root))
+    roots.sort()
+    unique: list[float] = []
+    for value in roots:
+        if not unique or abs(value - unique[-1]) > 1.0e-9:
+            unique.append(float(np.clip(value, 0.0, 1.0)))
+    return [(value, np.asarray(a, dtype=float) + value * vector) for value in unique]
+
+
+def _pair_four_roots(
+    field: EquilibriumField,
+    roots: list[tuple[tuple, np.ndarray]],
+    r: np.ndarray,
+    z: np.ndarray,
+    i: int,
+    j: int,
+    level: float,
+) -> tuple[tuple[tuple[tuple, np.ndarray], tuple[tuple, np.ndarray]], ...]:
+    # The four roots are in perimeter order.  There are two non-crossing
+    # pairings.  Test a point just inside the corner between roots 0 and 1.
+    center = np.array([0.5 * (r[i] + r[i + 1]), 0.5 * (z[j] + z[j + 1])], dtype=float)
+    center_positive = float(field.value(center)[0]) > float(level)
+    corner = np.array([r[i], z[j]], dtype=float)
+    corner_positive = float(field.value(corner)[0]) > float(level)
+    if center_positive == corner_positive:
+        return ((roots[0], roots[1]), (roots[2], roots[3]))
+    return ((roots[1], roots[2]), (roots[3], roots[0]))
+
+
+def _compress_segments(
+    segments: list[tuple[tuple, tuple]],
+    node_points: dict[tuple, np.ndarray],
+) -> list[LevelSetEdge]:
+    adjacency: dict[tuple, list[int]] = {}
+    for index, (a, b) in enumerate(segments):
+        adjacency.setdefault(a, []).append(index)
+        adjacency.setdefault(b, []).append(index)
+    visited: set[int] = set()
+    out: list[LevelSetEdge] = []
+
+    def is_junction(key: tuple) -> bool:
+        return key[0] == "x" or len(adjacency.get(key, ())) != 2
+
+    ordered = sorted(
+        range(len(segments)),
+        key=lambda idx: not (is_junction(segments[idx][0]) or is_junction(segments[idx][1])),
+    )
+    for first_edge in ordered:
+        if first_edge in visited:
+            continue
+        a0, b0 = segments[first_edge]
+        if is_junction(a0):
+            start = a0
+        elif is_junction(b0):
+            start = b0
+        else:
+            start = a0
+        points = [np.asarray(node_points[start], dtype=float)]
+        current = start
+        edge_index = first_edge
+        end = start
+        while True:
+            if edge_index in visited:
+                break
+            visited.add(edge_index)
+            a, b = segments[edge_index]
+            nxt = b if a == current else a
+            points.append(np.asarray(node_points[nxt], dtype=float))
+            end = nxt
+            if nxt == start:
+                break
+            if is_junction(nxt):
+                break
+            candidates = [candidate for candidate in adjacency[nxt] if candidate != edge_index and candidate not in visited]
+            if not candidates:
+                break
+            current = nxt
+            edge_index = candidates[0]
+        array = _remove_consecutive_duplicates(np.asarray(points, dtype=float), tolerance=1.0e-13)
+        if array.shape[0] < 2:
+            continue
+        start_node = int(start[1]) if start[0] == "x" else None
+        end_node = int(end[1]) if end[0] == "x" else None
+        if start == end and start_node is None:
+            array = close_poly(array)
+        out.append(LevelSetEdge(start_node=start_node, end_node=end_node, points=array))
+    return out
 
 
 def _enumerate_graph_cycles(edges: list[LevelSetEdge]) -> list[LevelSetCycle]:
-    cycles: list[LevelSetCycle] = []
-    for index, edge in enumerate(edges):
-        if edge.start_node is not None and edge.start_node == edge.end_node:
-            cycles.append(
-                LevelSetCycle(
-                    points=close_poly(edge.points),
-                    edge_indices=(index,),
-                    node_indices=(int(edge.start_node),),
-                )
-            )
-
     adjacency: dict[int, list[int]] = {}
     for index, edge in enumerate(edges):
         if edge.start_node is None or edge.end_node is None or edge.start_node == edge.end_node:
             continue
         adjacency.setdefault(int(edge.start_node), []).append(index)
         adjacency.setdefault(int(edge.end_node), []).append(index)
-
+    cycles: list[LevelSetCycle] = []
     signatures: set[tuple[int, ...]] = set()
-    for start_node in adjacency:
+    for start in adjacency:
         _dfs_cycles(
-            start_node=start_node,
-            current_node=start_node,
+            start=start,
+            current=start,
             adjacency=adjacency,
             edges=edges,
-            path_edges=[],
-            path_nodes=[start_node],
-            used_edges=set(),
-            cycles=cycles,
+            path=[],
+            nodes=[start],
+            used=set(),
             signatures=signatures,
-            max_depth=max(len(adjacency) + 1, 3),
+            out=cycles,
+            max_depth=max(len(edges), 3),
         )
     return cycles
 
 
 def _dfs_cycles(
     *,
-    start_node: int,
-    current_node: int,
+    start: int,
+    current: int,
     adjacency: dict[int, list[int]],
     edges: list[LevelSetEdge],
-    path_edges: list[tuple[int, bool]],
-    path_nodes: list[int],
-    used_edges: set[int],
-    cycles: list[LevelSetCycle],
+    path: list[tuple[int, bool]],
+    nodes: list[int],
+    used: set[int],
     signatures: set[tuple[int, ...]],
+    out: list[LevelSetCycle],
     max_depth: int,
 ) -> None:
-    if len(path_edges) >= max_depth:
+    if len(path) >= max_depth:
         return
-    for edge_index in adjacency.get(current_node, []):
-        if edge_index in used_edges:
+    for edge_index in adjacency.get(current, []):
+        if edge_index in used:
             continue
         edge = edges[edge_index]
-        if edge.start_node == current_node:
-            next_node = int(edge.end_node)  # type: ignore[arg-type]
+        if edge.start_node == current:
+            nxt = int(edge.end_node)  # type: ignore[arg-type]
             forward = True
-        elif edge.end_node == current_node:
-            next_node = int(edge.start_node)  # type: ignore[arg-type]
+        elif edge.end_node == current:
+            nxt = int(edge.start_node)  # type: ignore[arg-type]
             forward = False
         else:
             continue
-        next_edges = path_edges + [(edge_index, forward)]
-        if next_node == start_node and len(next_edges) >= 2:
-            signature = tuple(sorted(index for index, _forward in next_edges))
+        new_path = path + [(edge_index, forward)]
+        if nxt == start and len(new_path) >= 2:
+            signature = tuple(sorted(index for index, _ in new_path))
             if signature in signatures:
                 continue
             signatures.add(signature)
-            points = _concatenate_oriented_edges(edges, next_edges)
-            node_indices = tuple(sorted(set(path_nodes)))
-            cycles.append(
+            out.append(
                 LevelSetCycle(
-                    points=close_poly(points),
-                    edge_indices=tuple(index for index, _forward in next_edges),
-                    node_indices=node_indices,
+                    points=close_poly(_concatenate_edges(edges, new_path)),
+                    edge_indices=tuple(index for index, _ in new_path),
+                    node_indices=tuple(sorted(set(nodes))),
                 )
             )
             continue
-        if next_node in path_nodes:
+        if nxt in nodes:
             continue
         _dfs_cycles(
-            start_node=start_node,
-            current_node=next_node,
+            start=start,
+            current=nxt,
             adjacency=adjacency,
             edges=edges,
-            path_edges=next_edges,
-            path_nodes=path_nodes + [next_node],
-            used_edges=used_edges | {edge_index},
-            cycles=cycles,
+            path=new_path,
+            nodes=nodes + [nxt],
+            used=used | {edge_index},
             signatures=signatures,
+            out=out,
             max_depth=max_depth,
         )
 
 
-def _concatenate_oriented_edges(edges: list[LevelSetEdge], path: list[tuple[int, bool]]) -> np.ndarray:
+def _concatenate_edges(edges: list[LevelSetEdge], path: list[tuple[int, bool]]) -> np.ndarray:
     chunks: list[np.ndarray] = []
     for edge_index, forward in path:
-        pts = np.asarray(edges[edge_index].points, dtype=float)
+        points = np.asarray(edges[edge_index].points, dtype=float)
         if not forward:
-            pts = pts[::-1]
-        chunks.append(pts if not chunks else pts[1:])
-    return _remove_consecutive_duplicates(np.vstack(chunks), tolerance=1.0e-12)
+            points = points[::-1]
+        chunks.append(points if not chunks else points[1:])
+    return _remove_consecutive_duplicates(np.vstack(chunks), tolerance=1.0e-13)
 
 
-def _is_closed(points: np.ndarray, *, tolerance: float) -> bool:
-    return points.shape[0] >= 3 and float(np.linalg.norm(points[0] - points[-1])) <= float(tolerance)
+def _is_closed(points: np.ndarray) -> bool:
+    return points.shape[0] >= 4 and float(np.linalg.norm(points[0] - points[-1])) <= 1.0e-10
 
 
 def _remove_consecutive_duplicates(points: np.ndarray, *, tolerance: float) -> np.ndarray:
@@ -402,24 +630,3 @@ def _remove_consecutive_duplicates(points: np.ndarray, *, tolerance: float) -> n
     keep = np.ones((arr.shape[0],), dtype=bool)
     keep[1:] = np.linalg.norm(np.diff(arr, axis=0), axis=1) > float(tolerance)
     return arr[keep]
-
-
-def _linear_true_clusters(mask: np.ndarray) -> list[list[int]]:
-    indices = np.flatnonzero(mask)
-    if indices.size == 0:
-        return []
-    clusters: list[list[int]] = [[int(indices[0])]]
-    for index in indices[1:]:
-        if int(index) == clusters[-1][-1] + 1:
-            clusters[-1].append(int(index))
-        else:
-            clusters.append([int(index)])
-    return clusters
-
-
-def _cyclic_true_clusters(mask: np.ndarray) -> list[list[int]]:
-    clusters = _linear_true_clusters(mask)
-    if len(clusters) >= 2 and clusters[0][0] == 0 and clusters[-1][-1] == int(mask.size) - 1:
-        clusters[0] = clusters[-1] + clusters[0]
-        clusters.pop()
-    return clusters
