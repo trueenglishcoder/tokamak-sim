@@ -94,16 +94,11 @@ def extract_core_level_set(
     for index, edge in enumerate(edges):
         closed_regular = edge.start_node is None and edge.end_node is None and _is_closed(edge.points)
         if closed_regular:
-            cycles.append(LevelSetCycle(close_poly(edge.points), (index,), ()))
-        elif edge.start_node is not None and edge.start_node == edge.end_node:
-            cycles.append(
-                LevelSetCycle(
-                    close_poly(edge.points),
-                    (index,),
-                    (int(edge.start_node),),
-                )
-            )
-    cycles.extend(_enumerate_graph_cycles(edges))
+            points = close_poly(edge.points)
+            if poly_area(points) < 0.0:
+                points = close_poly(points[-2::-1])
+            cycles.append(LevelSetCycle(points, (index,), ()))
+    cycles.extend(_enumerate_graph_faces(edges))
 
     valid: list[LevelSetCycle] = []
     limiter_tolerance = 0.35 * field.grid_scale
@@ -117,8 +112,12 @@ def extract_core_level_set(
             continue
         if not bool(np.all(points_in_or_on_polygon(points[:-1], limiter_poly, tol=limiter_tolerance))):
             continue
-        area = abs(poly_area(points))
-        if np.isfinite(area) and area > 0.0:
+        signed_area = poly_area(points)
+        # ``_enumerate_graph_faces`` follows the face on the left of every
+        # directed edge.  Bounded faces are counter-clockwise and therefore
+        # positive.  The unbounded exterior face is clockwise and must never be
+        # accepted merely because its polygon also encloses the magnetic axis.
+        if np.isfinite(signed_area) and signed_area > 0.0:
             valid.append(LevelSetCycle(points, cycle.edge_indices, cycle.node_indices))
     if not valid:
         return None
@@ -343,7 +342,7 @@ def _cell_perimeter_roots(
     )
     roots: list[tuple[tuple, np.ndarray, float]] = []
     perimeter_position = 0.0
-    for edge_index, (a, b, _base_key) in enumerate(edges):
+    for a, b, _base_key in edges:
         cache_key = _canonical_edge_key(a, b)
         cached = root_cache.get(cache_key)
         if cached is None:
@@ -527,96 +526,130 @@ def _compress_segments(
     return out
 
 
-def _enumerate_graph_cycles(edges: list[LevelSetEdge]) -> list[LevelSetCycle]:
-    adjacency: dict[int, list[int]] = {}
-    for index, edge in enumerate(edges):
-        if edge.start_node is None or edge.end_node is None or edge.start_node == edge.end_node:
+
+def _enumerate_graph_faces(edges: list[LevelSetEdge]) -> list[LevelSetCycle]:
+    """Enumerate bounded faces of the embedded X-point graph.
+
+    Every compressed edge is represented by two directed half-edges.  At an
+    X-point the outgoing half-edges are ordered by their exact one-sided
+    tangent.  Following the clockwise predecessor of the incoming twin keeps
+    the same face on the left.  The resulting successor map is a permutation
+    on closed graph portions, so each face is traced once without DFS or cycle
+    subset enumeration.
+
+    Open separatrix branches participate in the angular order but terminate at
+    ``None``.  They therefore prevent an exterior walk from being mistaken for
+    a closed plasma-core face.
+    """
+    halfedge_count = 2 * len(edges)
+    source: list[int | None] = [None] * halfedge_count
+    target: list[int | None] = [None] * halfedge_count
+    angle: list[float] = [float("nan")] * halfedge_count
+    outgoing: dict[int, list[int]] = {}
+
+    for edge_index, edge in enumerate(edges):
+        points = np.asarray(edge.points, dtype=float)
+        if points.shape[0] < 2:
             continue
-        adjacency.setdefault(int(edge.start_node), []).append(index)
-        adjacency.setdefault(int(edge.end_node), []).append(index)
-    cycles: list[LevelSetCycle] = []
-    signatures: set[tuple[int, ...]] = set()
-    for start in adjacency:
-        _dfs_cycles(
-            start=start,
-            current=start,
-            adjacency=adjacency,
-            edges=edges,
-            path=[],
-            nodes=[start],
-            used=set(),
-            signatures=signatures,
-            out=cycles,
-            max_depth=max(len(edges), 3),
+        forward = 2 * edge_index
+        reverse = forward + 1
+        source[forward] = edge.start_node
+        target[forward] = edge.end_node
+        source[reverse] = edge.end_node
+        target[reverse] = edge.start_node
+
+        if edge.start_node is not None:
+            tangent = _first_nonzero_tangent(points, forward=True)
+            if tangent is not None:
+                angle[forward] = float(np.arctan2(tangent[1], tangent[0]))
+                outgoing.setdefault(int(edge.start_node), []).append(forward)
+        if edge.end_node is not None:
+            tangent = _first_nonzero_tangent(points, forward=False)
+            if tangent is not None:
+                angle[reverse] = float(np.arctan2(tangent[1], tangent[0]))
+                outgoing.setdefault(int(edge.end_node), []).append(reverse)
+
+    for node_halfedges in outgoing.values():
+        node_halfedges.sort(
+            key=lambda halfedge: (
+                angle[halfedge],
+                halfedge // 2,
+                halfedge % 2,
+            )
         )
+
+    successor: list[int | None] = [None] * halfedge_count
+    for halfedge in range(halfedge_count):
+        node = target[halfedge]
+        if node is None:
+            continue
+        node_halfedges = outgoing.get(int(node), ())
+        twin = halfedge ^ 1
+        try:
+            twin_index = node_halfedges.index(twin)
+        except ValueError:
+            continue
+        # Outgoing half-edges are counter-clockwise.  The clockwise predecessor
+        # of the incoming twin follows the boundary with the face on the left.
+        successor[halfedge] = node_halfedges[(twin_index - 1) % len(node_halfedges)]
+
+    cycles: list[LevelSetCycle] = []
+    visited: set[int] = set()
+    for start in range(halfedge_count):
+        if source[start] is None or target[start] is None or start in visited:
+            continue
+        path: list[int] = []
+        position: dict[int, int] = {}
+        current: int | None = start
+        while current is not None and current not in position and current not in visited:
+            position[current] = len(path)
+            path.append(current)
+            current = successor[current]
+        visited.update(path)
+        if current is None or current not in position:
+            continue
+        cycle_halfedges = path[position[current] :]
+        if not cycle_halfedges or successor[cycle_halfedges[-1]] != cycle_halfedges[0]:
+            continue
+
+        chunks: list[np.ndarray] = []
+        edge_indices: list[int] = []
+        node_indices: set[int] = set()
+        for halfedge in cycle_halfedges:
+            edge_index = halfedge // 2
+            points = np.asarray(edges[edge_index].points, dtype=float)
+            if halfedge % 2:
+                points = points[::-1]
+            chunks.append(points if not chunks else points[1:])
+            edge_indices.append(edge_index)
+            node = source[halfedge]
+            if node is not None:
+                node_indices.add(int(node))
+        points = close_poly(
+            _remove_consecutive_duplicates(
+                np.vstack(chunks),
+                tolerance=1.0e-13,
+            )
+        )
+        if points.shape[0] >= 4:
+            cycles.append(
+                LevelSetCycle(
+                    points=points,
+                    edge_indices=tuple(edge_indices),
+                    node_indices=tuple(sorted(node_indices)),
+                )
+            )
     return cycles
 
 
-def _dfs_cycles(
-    *,
-    start: int,
-    current: int,
-    adjacency: dict[int, list[int]],
-    edges: list[LevelSetEdge],
-    path: list[tuple[int, bool]],
-    nodes: list[int],
-    used: set[int],
-    signatures: set[tuple[int, ...]],
-    out: list[LevelSetCycle],
-    max_depth: int,
-) -> None:
-    if len(path) >= max_depth:
-        return
-    for edge_index in adjacency.get(current, []):
-        if edge_index in used:
-            continue
-        edge = edges[edge_index]
-        if edge.start_node == current:
-            nxt = int(edge.end_node)  # type: ignore[arg-type]
-            forward = True
-        elif edge.end_node == current:
-            nxt = int(edge.start_node)  # type: ignore[arg-type]
-            forward = False
-        else:
-            continue
-        new_path = path + [(edge_index, forward)]
-        if nxt == start and len(new_path) >= 2:
-            signature = tuple(sorted(index for index, _ in new_path))
-            if signature in signatures:
-                continue
-            signatures.add(signature)
-            out.append(
-                LevelSetCycle(
-                    points=close_poly(_concatenate_edges(edges, new_path)),
-                    edge_indices=tuple(index for index, _ in new_path),
-                    node_indices=tuple(sorted(set(nodes))),
-                )
-            )
-            continue
-        if nxt in nodes:
-            continue
-        _dfs_cycles(
-            start=start,
-            current=nxt,
-            adjacency=adjacency,
-            edges=edges,
-            path=new_path,
-            nodes=nodes + [nxt],
-            used=used | {edge_index},
-            signatures=signatures,
-            out=out,
-            max_depth=max_depth,
-        )
-
-
-def _concatenate_edges(edges: list[LevelSetEdge], path: list[tuple[int, bool]]) -> np.ndarray:
-    chunks: list[np.ndarray] = []
-    for edge_index, forward in path:
-        points = np.asarray(edges[edge_index].points, dtype=float)
-        if not forward:
-            points = points[::-1]
-        chunks.append(points if not chunks else points[1:])
-    return _remove_consecutive_duplicates(np.vstack(chunks), tolerance=1.0e-13)
+def _first_nonzero_tangent(points: np.ndarray, *, forward: bool) -> np.ndarray | None:
+    ordered = np.asarray(points, dtype=float) if forward else np.asarray(points, dtype=float)[::-1]
+    origin = ordered[0]
+    for point in ordered[1:]:
+        tangent = point - origin
+        if float(np.linalg.norm(tangent)) > 1.0e-13:
+            return tangent
+    return None
 
 
 def _is_closed(points: np.ndarray) -> bool:

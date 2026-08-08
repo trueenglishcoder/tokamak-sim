@@ -79,6 +79,8 @@ def test_gpu_artifact_payload_uses_single_gpu_boundary_result() -> None:
     result = SimpleNamespace(
         boundary=SimpleNamespace(
             found=torch.as_tensor([True]),
+            projection_valid=torch.as_tensor([True]),
+            projection_error_code=torch.as_tensor([0]),
             topology_code=torch.as_tensor([2]),
             axis_points=torch.as_tensor([[0.5, 0.5]], dtype=torch.float64),
             x_points=torch.as_tensor(
@@ -111,6 +113,46 @@ def test_gpu_artifact_payload_uses_single_gpu_boundary_result() -> None:
     assert np.allclose(
         payload["boundary_quality"],
         np.asarray([1.0e-9, 2.0e-8, 0.0, 0.1, 0.0, 12.0]),
+    )
+
+
+def test_gpu_artifact_payload_keeps_physical_found_separate_from_projection_valid() -> None:
+    """A physical LCFS may exist even when the 32-ray readout is incomplete."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    import torch
+
+    try:
+        import tomli_w  # noqa: F401
+    except ModuleNotFoundError:
+        stub = ModuleType("tomli_w")
+        stub.dumps = lambda _value: ""  # type: ignore[attr-defined]
+        sys.modules["tomli_w"] = stub
+
+    from tokamak_control.cli.run_simulation import _gpu_boundary_detail_payload
+
+    result = SimpleNamespace(
+        boundary=SimpleNamespace(
+            found=torch.as_tensor([True]),
+            projection_valid=torch.as_tensor([False]),
+            projection_error_code=torch.as_tensor([2]),
+            topology_code=torch.as_tensor([2]),
+            axis_points=torch.as_tensor([[0.5, 0.5]], dtype=torch.float64),
+            x_points=torch.full((1, 1, 2), float("nan"), dtype=torch.float64),
+            limiter_contacts=torch.empty((1, 0, 2), dtype=torch.float64),
+            limiter_contact_count=torch.as_tensor([0]),
+            intersection_counts=torch.as_tensor([[1, 2, 1, 0]], dtype=torch.int64),
+            quality=torch.zeros((1, 6), dtype=torch.float64),
+        )
+    )
+
+    payload = _gpu_boundary_detail_payload(result)
+
+    assert not bool(payload["boundary_fixed_angle_valid"])
+    assert np.array_equal(
+        payload["boundary_fixed_angle_counts"],
+        np.asarray([1.0, 2.0, 1.0, 0.0]),
     )
 
 

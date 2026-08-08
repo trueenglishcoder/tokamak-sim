@@ -67,8 +67,24 @@ def _fixed_angle_boundary(
     elif not torch.cuda.is_available():
         raise RuntimeError(f"requested {device}, but torch.cuda.is_available() is false")
 
+    field = torch.as_tensor(psi_batch, dtype=torch.float64, device=device)
+    prepared_geometry = boundary_gpu.prepare_fixed_angle_boundary_gpu_geometry(
+        grid=grid,
+        center=center,
+        angles_rad=angles,
+        limiter_shape=limiter,
+        boundary_mode=boundary_mode,
+        gpu_device=device,
+        dtype=field.dtype,
+        basis_fields=np.asarray(psi_batch, dtype=np.float64),
+    )
+    basis_amplitudes = torch.eye(
+        int(field.shape[0]),
+        dtype=field.dtype,
+        device=field.device,
+    )
     result = boundary_gpu.fixed_angle_boundary_gpu(
-        psi=psi_batch,
+        psi=field,
         grid=grid,
         center=center,
         angles_rad=angles,
@@ -76,6 +92,8 @@ def _fixed_angle_boundary(
         boundary_mode=boundary_mode,
         gpu_device=device,
         ray_samples=256,
+        prepared_geometry=prepared_geometry,
+        amplitudes=basis_amplitudes,
         return_dense_boundary=(boundary_mode == "equilibrium_lcfs"),
     )
     return (

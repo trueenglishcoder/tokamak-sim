@@ -107,9 +107,20 @@ class BatchedGpuTokamakSimulator:
         self.boundary_return_dense = bool(boundary_return_dense)
         self.center = (float(settings.R0), float(settings.Z0))
         R, Z = grid.mesh()
-        self.G_pfc = torch.as_tensor(build_green_for_coils(R, Z, pfc.element_positions, pfc.element_weights) if pfc.n_coils else np.zeros((0, *grid.shape)), dtype=self.dtype, device=self.device)
-        self.G_sol = torch.as_tensor(build_green_for_coils(R, Z, sol.element_positions, sol.element_weights) if sol.n_coils else np.zeros((0, *grid.shape)), dtype=self.dtype, device=self.device)
-        self.G_plasma = torch.as_tensor(build_green_for_plasma_center(R, Z, settings.R0, settings.Z0), dtype=self.dtype, device=self.device)
+        G_pfc_np = build_green_for_coils(R, Z, pfc.element_positions, pfc.element_weights) if pfc.n_coils else np.zeros((0, *grid.shape))
+        G_sol_np = build_green_for_coils(R, Z, sol.element_positions, sol.element_weights) if sol.n_coils else np.zeros((0, *grid.shape))
+        G_plasma_np = build_green_for_plasma_center(R, Z, settings.R0, settings.Z0)
+        self.G_pfc = torch.as_tensor(G_pfc_np, dtype=self.dtype, device=self.device)
+        self.G_sol = torch.as_tensor(G_sol_np, dtype=self.dtype, device=self.device)
+        self.G_plasma = torch.as_tensor(G_plasma_np, dtype=self.dtype, device=self.device)
+        boundary_basis = np.concatenate(
+            (
+                (float(settings.mu0) * float(getattr(settings, "plasma_psi_sign", 1.0)) * G_plasma_np)[None, :, :],
+                float(settings.mu0) * G_pfc_np,
+                float(settings.mu0) * G_sol_np,
+            ),
+            axis=0,
+        )
         gp = build_green_for_eind(settings.R0, settings.Z0, pfc.element_positions, pfc.element_weights) if pfc.n_coils else np.zeros((0,), dtype=float)
         gs = build_green_for_eind(settings.R0, settings.Z0, sol.element_positions, sol.element_weights) if sol.n_coils else np.zeros((0,), dtype=float)
         if settings.ip_coupling_pfc is not None:
@@ -119,6 +130,17 @@ class BatchedGpuTokamakSimulator:
         self.g_pfc = torch.as_tensor(gp, dtype=self.dtype, device=self.device)
         self.g_sol = torch.as_tensor(gs, dtype=self.dtype, device=self.device)
         self.angles_t = torch.as_tensor(self.angles_rad, dtype=self.dtype, device=self.device)
+        expected_boundary_basis_count = 1 + int(self.pfc.n_coils) + int(self.sol.n_coils)
+        if int(boundary_basis.shape[0]) != expected_boundary_basis_count:
+            raise RuntimeError(
+                "equilibrium LCFS basis order/count mismatch: "
+                f"expected {expected_boundary_basis_count}, got {boundary_basis.shape[0]}"
+            )
+        if tuple(boundary_basis.shape[1:]) != tuple(self.grid.shape):
+            raise RuntimeError(
+                "equilibrium LCFS basis grid mismatch: "
+                f"expected {self.grid.shape}, got {boundary_basis.shape[1:]}"
+            )
         self._boundary_gpu_geometry = prepare_fixed_angle_boundary_gpu_geometry(
             grid=self.grid,
             center=self.center,
@@ -127,6 +149,7 @@ class BatchedGpuTokamakSimulator:
             boundary_mode=self.boundary_mode,
             gpu_device=str(self.device),
             dtype=self.dtype,
+            basis_fields=boundary_basis,
         )
         self.profile_enabled = str(os.environ.get("TOKAMAK_PROFILE", "")).lower() not in {"", "0", "false", "no"}
         self.last_profile: dict[str, float] = {}
@@ -235,6 +258,10 @@ class BatchedGpuTokamakSimulator:
         if self.profile_enabled and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             t0 = time.perf_counter()
+        basis_amplitudes = torch.cat(
+            (self.Ip[:, None], self.pfc_currents, self.sol_currents),
+            dim=1,
+        )
         boundary = fixed_angle_boundary_gpu(
             psi=self.psi,
             grid=self.grid,
@@ -260,6 +287,7 @@ class BatchedGpuTokamakSimulator:
             continuity_weight_mean_radius=self.boundary_continuity_weight_mean_radius,
             continuity_weight_level=self.boundary_continuity_weight_level,
             prepared_geometry=self._boundary_gpu_geometry,
+            amplitudes=basis_amplitudes,
             return_dense_boundary=self.boundary_return_dense,
         )
         if self.profile_enabled and self.device.type == "cuda":
